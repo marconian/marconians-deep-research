@@ -39,7 +39,7 @@ This architecture allows for massive parallelism, resilience, and specialization
 - **Platform:** .NET 8+ Console Application
 - **Language:** C#
 - **LLM:** Azure OpenAI Service
-    - **Model:** `gpt-5` (multimodal, as specified, pending availability)
+    - **Model:** `gpt-5` (multimodal, as specified, pending availability); `text-embedding-3-large` (embedding generation)
     - **SDK:** `Azure.AI.OpenAI`
 - **Long-Term Memory:** Azure Cosmos DB for NoSQL
     - **SDK:** `Microsoft.Azure.Cosmos`
