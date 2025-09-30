@@ -42,7 +42,6 @@ You are to follow these instructions sequentially and precisely, while adhering 
     - `COGNITIVE_SERVICES_ENDPOINT`
     - `COGNITIVE_SERVICES_API_KEY`
     - `GOOGLE_API_KEY`
-    - `GOOGLE_SEARCH_ENGINE_ID`
 3.  **Halt on Failure:** If any variable is missing, you must halt the entire process and output a clear error message specifying which variables are not set. **Do not proceed with a partial configuration.**
 
 ### Step 3.3: Code Generation & Implementation
