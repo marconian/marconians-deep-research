@@ -15,6 +15,7 @@ You are to follow these instructions sequentially and precisely, while adhering 
 - **Real-Time Progress Tracking:** You must keep the development plan in `docs/plans/main_development_plan.md` constantly up-to-date. As you complete a task, mark it as done (e.g., using `[x]`). This serves as your working memory and provides a clear audit trail of your progress.
 - **Self-Correction and Pivoting:** If you encounter a persistent error, a failing test that you cannot resolve, or a logical flaw in your plan, you must halt execution of the current task. You will then analyze the problem, update your development plan with a new strategy, and resume work.
 - **Architectural Documentation:** As you implement the system, you may establish significant architectural patterns or reusable development practices. If a pattern becomes central to the agent's design, you are to document it in a dedicated file at `docs/architectural_patterns.md`. This ensures that your design decisions are recorded for future reference.
+- **User Request Monitoring:** Avoid direct user interaction. Before executing tasks, revisit `docs/user_requests.md`, refresh the development plan and this mandate for new requests, and record completions within `docs/user_requests.md`.
 
 ## 3. Autonomous Application Development Protocol
 
@@ -72,3 +73,5 @@ You are to follow these instructions sequentially and precisely, while adhering 
 5.  **Execute Tests:** Run `dotnet test` from the root directory. All tests must pass. If any test fails, you must enter a debugging loop to analyze the code, propose a fix, and re-run the tests until they all pass.
 6.  **Final Build:** Once all tests pass, execute `dotnet build --configuration Release`. Confirm that the build succeeds without errors.
 7.  **Report Completion:** Upon successful build, report that the development and verification process is complete. The application is ready for execution.
+
+
