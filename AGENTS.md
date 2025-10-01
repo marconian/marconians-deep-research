@@ -25,7 +25,7 @@ You are to follow these instructions sequentially and precisely, while adhering 
 3.  **Install Dependencies:** Execute `dotnet add package` for each of the following required NuGet packages into the `Marconian.ResearchAgent` project:
     - `Azure.AI.OpenAI`
     - `Microsoft.Azure.Cosmos`
-    - `Microsoft.Extensions.Caching.StackExchangeRedis`
+    - `Microsoft.Extensions.Caching.Memory`
     - `Azure.AI.DocumentIntelligence`
     - `Microsoft.Playwright`
     - `HtmlAgilityPack`
@@ -39,7 +39,6 @@ You are to follow these instructions sequentially and precisely, while adhering 
     - `AZURE_OPENAI_ENDPOINT`
     - `AZURE_OPENAI_API_KEY`
     - `COSMOS_CONN_STRING`
-    - `AZURE_REDIS_CACHE_CONN_STRING`
     - `COGNITIVE_SERVICES_ENDPOINT`
     - `COGNITIVE_SERVICES_API_KEY`
     - `GOOGLE_API_KEY`
@@ -47,7 +46,7 @@ You are to follow these instructions sequentially and precisely, while adhering 
 
 ### Step 3.3: Code Generation & Implementation
 1.  **Create Development Plan:** Based on `docs/specs.md`, create the initial `docs/plans/main_development_plan.md` file. This plan must be your guide for all subsequent steps.
-2.  **Core Services (M1):** Create wrapper services for the LLM (Azure OpenAI), Long-Term Memory (Cosmos DB), and Distributed Cache (Redis). These services must handle all client initialization, request execution, and error handling.
+2.  **Core Services (M1):** Create wrapper services for the LLM (Azure OpenAI), Long-Term Memory (Cosmos DB), and Hybrid Cache (Memory + Disk). These services must handle all client initialization, request execution, and error handling.
 3.  **Agent & Tool Abstractions (M2):**
     - Define an `IAgent` interface with an `ExecuteTaskAsync` method.
     - Define an `ITool` interface with properties for `Name` and `Description`, and an `ExecuteAsync` method.
@@ -64,7 +63,7 @@ You are to follow these instructions sequentially and precisely, while adhering 
 1.  **Create Test Project:** Create a new NUnit test project named `Marconian.ResearchAgent.Tests`.
 2.  **Install Test Dependencies:** Add `NUnit`, `NUnit3TestAdapter`, `Microsoft.NET.Test.Sdk`, and `Moq` NuGet packages to the test project.
 3.  **Write Unit Tests:**
-    - For core services (e.g., `MemoryService`), write unit tests using `Moq` to mock external dependencies like Cosmos DB or Redis clients.
+    - For core services (e.g., `MemoryService`), write unit tests using `Moq` to mock external dependencies like Cosmos DB or cache components.
     - Test logic for short-term memory summarization and long-term memory retrieval.
     - Test the `OrchestratorAgent`'s state machine logic in isolation.
 4.  **Write Integration Tests:**
@@ -73,5 +72,7 @@ You are to follow these instructions sequentially and precisely, while adhering 
 5.  **Execute Tests:** Run `dotnet test` from the root directory. All tests must pass. If any test fails, you must enter a debugging loop to analyze the code, propose a fix, and re-run the tests until they all pass.
 6.  **Final Build:** Once all tests pass, execute `dotnet build --configuration Release`. Confirm that the build succeeds without errors.
 7.  **Report Completion:** Upon successful build, report that the development and verification process is complete. The application is ready for execution.
+
+
 
 

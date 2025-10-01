@@ -19,7 +19,7 @@ public sealed class ShortTermMemoryManagerTests
             .Setup(service => service.GenerateTextAsync(It.IsAny<OpenAiChatRequest>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync("summary payload");
 
-        var cacheMock = new Mock<IRedisCacheService>();
+        var cacheMock = new Mock<ICacheService>();
         cacheMock
             .Setup(service => service.SetAsync(It.IsAny<string>(), It.IsAny<List<ShortTermMemoryEntry>>(), It.IsAny<TimeSpan?>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
@@ -45,3 +45,4 @@ public sealed class ShortTermMemoryManagerTests
         cacheMock.Verify(service => service.SetAsync(It.IsAny<string>(), It.IsAny<List<ShortTermMemoryEntry>>(), It.IsAny<TimeSpan?>(), It.IsAny<CancellationToken>()), Times.AtLeastOnce);
     }
 }
+

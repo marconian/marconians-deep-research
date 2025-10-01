@@ -34,7 +34,7 @@ public sealed class OrchestratorAgent : IAgent
     private readonly MarkdownReportBuilder _reportBuilder = new();
     private readonly ILogger<OrchestratorAgent> _logger;
     private readonly ILoggerFactory _loggerFactory;
-    private readonly IRedisCacheService? _cacheService;
+    private readonly ICacheService? _cacheService;
     private readonly int _maxRevisionPasses;
     private readonly JsonSerializerOptions _revisionOptions = new(JsonSerializerDefaults.Web)
     {
@@ -50,7 +50,7 @@ public sealed class OrchestratorAgent : IAgent
         string chatDeploymentName,
         ILogger<OrchestratorAgent>? logger = null,
         ILoggerFactory? loggerFactory = null,
-        IRedisCacheService? cacheService = null,
+        ICacheService? cacheService = null,
         string? reportsDirectory = null,
         int maxReportRevisionPasses = 2)
     {
@@ -540,3 +540,4 @@ public sealed class OrchestratorAgent : IAgent
         public string Content { get; set; } = string.Empty;
     }
 }
+

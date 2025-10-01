@@ -1,6 +1,6 @@
 namespace Marconian.ResearchAgent.Services.Caching;
 
-public interface IRedisCacheService : IAsyncDisposable
+public interface ICacheService : IAsyncDisposable
 {
     Task<T?> GetAsync<T>(string key, CancellationToken cancellationToken = default);
 

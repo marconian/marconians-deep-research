@@ -49,3 +49,5 @@
 [x] make sure the final report that is written is written in markdown. also that the agent should be able to iterate over it mutiple times whenever the agent deems that is necessary and should be able read specific lines and insert or edit text at specific lines
 [x] connection to Cosmos DB sometimes failes in our corporate environments. make sure it is in gateway mode.
 [ ] analyse "LLM Autonomous Research Application Best Practices.md" again and reflect on the current state of the project
+[x] remove redis cache and implement a strategy based on disk caching and IMemoryCache (completed 2025-10-01)
+

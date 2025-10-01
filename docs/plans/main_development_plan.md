@@ -75,3 +75,11 @@
 - [x] Capture architectural patterns in `docs/architectural_patterns.md` when stabilized
 
 - [x] Review `docs/user_requests.md` at each working session and update plans/instructions as needed
+
+## M10 - Cache Strategy Migration
+- [x] Remove Redis dependency from codebase and packages
+- [x] Introduce hybrid caching service using IMemoryCache and disk persistence
+- [x] Update memory and tool components to use the new cache abstraction
+- [x] Adjust configuration, documentation, and tests for disk-backed cache
+
+

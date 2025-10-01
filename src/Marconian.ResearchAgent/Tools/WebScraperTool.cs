@@ -16,13 +16,13 @@ public sealed class WebScraperTool : ITool, IAsyncDisposable
 {
     private readonly HttpClient _httpClient;
     private readonly bool _ownsHttpClient;
-    private readonly IRedisCacheService? _cacheService;
+    private readonly ICacheService? _cacheService;
     private readonly IFileRegistryService? _fileRegistryService;
     private readonly ILogger<WebScraperTool> _logger;
     private const string DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
     private const int CacheSizeThreshold = 200_000;
 
-    public WebScraperTool(IRedisCacheService? cacheService = null, HttpClient? httpClient = null, ILogger<WebScraperTool>? logger = null, IFileRegistryService? fileRegistryService = null)
+    public WebScraperTool(ICacheService? cacheService = null, HttpClient? httpClient = null, ILogger<WebScraperTool>? logger = null, IFileRegistryService? fileRegistryService = null)
     {
         _cacheService = cacheService;
         _logger = logger ?? NullLogger<WebScraperTool>.Instance;
@@ -367,3 +367,4 @@ public sealed class WebScraperTool : ITool, IAsyncDisposable
         }
     }
 }
+

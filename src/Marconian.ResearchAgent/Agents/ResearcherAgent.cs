@@ -21,7 +21,7 @@ public sealed class ResearcherAgent : IAgent
     private readonly LongTermMemoryManager _longTermMemoryManager;
     private readonly IReadOnlyList<ITool> _tools;
     private readonly string _chatDeploymentName;
-    private readonly IRedisCacheService? _cacheService;
+    private readonly ICacheService? _cacheService;
     private readonly ILogger<ResearcherAgent> _logger;
     private readonly ILogger<ShortTermMemoryManager> _shortTermLogger;
 
@@ -30,7 +30,7 @@ public sealed class ResearcherAgent : IAgent
         LongTermMemoryManager longTermMemoryManager,
         IEnumerable<ITool> tools,
         string chatDeploymentName,
-        IRedisCacheService? cacheService = null,
+        ICacheService? cacheService = null,
         ILogger<ResearcherAgent>? logger = null,
         ILogger<ShortTermMemoryManager>? shortTermLogger = null)
     {
@@ -343,4 +343,5 @@ public sealed class ResearcherAgent : IAgent
         return 0.6d;
     }
 }
+
 

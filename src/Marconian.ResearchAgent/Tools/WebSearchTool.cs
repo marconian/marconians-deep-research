@@ -14,7 +14,7 @@ public sealed class WebSearchTool : ITool, IDisposable
 {
     private readonly HttpClient _httpClient;
     private readonly bool _ownsHttpClient;
-    private readonly IRedisCacheService? _cacheService;
+    private readonly ICacheService? _cacheService;
     private readonly string _apiKey;
     private readonly string _searchEngineId;
     private readonly ILogger<WebSearchTool> _logger;
@@ -22,7 +22,7 @@ public sealed class WebSearchTool : ITool, IDisposable
     public WebSearchTool(
         string apiKey,
         string searchEngineId,
-        IRedisCacheService? cacheService = null,
+        ICacheService? cacheService = null,
         HttpClient? httpClient = null,
         ILogger<WebSearchTool>? logger = null)
     {
@@ -163,3 +163,4 @@ public sealed class WebSearchTool : ITool, IDisposable
         }
     }
 }
+

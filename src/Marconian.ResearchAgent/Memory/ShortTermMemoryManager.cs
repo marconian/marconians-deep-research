@@ -13,7 +13,7 @@ public sealed class ShortTermMemoryManager
 {
     private readonly List<ShortTermMemoryEntry> _entries = new();
     private readonly IAzureOpenAiService _openAiService;
-    private readonly IRedisCacheService? _cacheService;
+    private readonly ICacheService? _cacheService;
     private readonly string _deploymentName;
     private readonly string _cacheKey;
     private readonly int _maxEntries;
@@ -25,7 +25,7 @@ public sealed class ShortTermMemoryManager
         string researchSessionId,
         IAzureOpenAiService openAiService,
         string deploymentName,
-        IRedisCacheService? cacheService = null,
+        ICacheService? cacheService = null,
         int maxEntries = 40,
         int summaryBatchSize = 6,
         ILogger<ShortTermMemoryManager>? logger = null)
@@ -58,7 +58,7 @@ public sealed class ShortTermMemoryManager
         {
             _entries.Clear();
             _entries.AddRange(cached.OrderBy(entry => entry.TimestampUtc));
-            _logger.LogDebug("Loaded {Count} short-term memory entries for key {Key} from Redis cache.", _entries.Count, _cacheKey);
+            _logger.LogDebug("Loaded {Count} short-term memory entries for key {Key} from hybrid cache.", _entries.Count, _cacheKey);
         }
     }
 
@@ -146,7 +146,9 @@ public sealed class ShortTermMemoryManager
         }
 
         await _cacheService.SetAsync(_cacheKey, _entries, TimeSpan.FromHours(6), cancellationToken).ConfigureAwait(false);
-        _logger.LogTrace("Persisted {Count} short-term memory entries to Redis with TTL 6h.", _entries.Count);
+        _logger.LogTrace("Persisted {Count} short-term memory entries to the hybrid cache with TTL 6h.", _entries.Count);
     }
 }
+
+
 

@@ -1,7 +1,7 @@
 # Development Plan: Autonomous Deep Research Agent
 
 This document outlines the development plan for creating 1.  **File Storage:** When the agent gathers files (images, PDFs, etc.), they will be saved to this directory with a manifest file (`manifest.json`) that tracks the original source URL, download timestamp, and a local file ID.
-2.  **File Processing:** The `FileReaderTool` and `ImageReaderTool` will operate on files within this local registry. The extracted text and analysis will be stored in the long-term memory, linked back to the source file. The raw content of frequently accessed files can be cached in Redis to reduce disk I/O.
+2.  **File Processing:** The `FileReaderTool` and `ImageReaderTool` will operate on files within this local registry. The extracted text and analysis will be stored in the long-term memory, linked back to the source file. The raw content of frequently accessed files should be captured by the hybrid disk + memory cache to reduce disk I/O and share results across agent runs.
 
 ### 4.8. Report Generation
 1.  **Final Synthesis:** This is the last stage of the Orchestrator's pipeline.
@@ -44,9 +44,9 @@ This architecture allows for massive parallelism, resilience, and specialization
 - **Long-Term Memory:** Azure Cosmos DB for NoSQL
     - **SDK:** `Microsoft.Azure.Cosmos`
     - **Usage:** Storing agent memories, retrieved documents, analysis, and relationship graphs between information entities.
-- **Distributed Cache:** Azure Cache for Redis
-    - **SDK:** `Microsoft.Extensions.Caching.StackExchangeRedis`
-    - **Usage:** Caching short-term memory context, frequently accessed documents, and search results to improve performance.
+- **Caching Layer:** Hybrid disk + in-memory cache
+    - **Runtime:** `Microsoft.Extensions.Caching.Memory` for fast in-process reads
+    - **Persistence:** Local disk snapshot store for reuse across sessions
 - **Web Interaction:**
     - **Search:** Google Custom Search API. While not entirely free, it provides a stable and powerful way to search. Free alternatives often rely on web scraping which can be unstable.
     - **Scraping:** Libraries like `HtmlAgilityPack` for HTML parsing and `Playwright` for dynamic sites.
@@ -60,7 +60,7 @@ This architecture allows for massive parallelism, resilience, and specialization
 
 ### 4.1. Project Setup & Configuration
 1.  **Create .NET Console Project:** Initialize a new .NET console application.
-2.  **Dependency Management:** Add NuGet packages for Azure OpenAI, Azure Cosmos DB, Azure AI Document Intelligence, Azure Redis Cache, Playwright, and configuration management.
+2.  **Dependency Management:** Add NuGet packages for Azure OpenAI, Azure Cosmos DB, Azure AI Document Intelligence, Playwright, hybrid caching (memory+disk), and configuration management.
 3.  **Configuration Service:** Implement a service to load configuration from JSON (`appsettings.json`, `appsettings.local.json`) with environment variables overriding values. Required keys:
     - `AZURE_OPENAI_ENDPOINT`
     - `AZURE_OPENAI_API_KEY`
@@ -68,7 +68,6 @@ This architecture allows for massive parallelism, resilience, and specialization
     - `AZURE_OPENAI_EMBEDDING_DEPLOYMENT`
     - `AZURE_OPENAI_VISION_DEPLOYMENT`
     - `COSMOS_CONN_STRING`
-    - `AZURE_REDIS_CACHE_CONN_STRING`
     - `COGNITIVE_SERVICES_ENDPOINT`
     - `COGNITIVE_SERVICES_API_KEY`
     - `GOOGLE_API_KEY`
@@ -91,7 +90,7 @@ This architecture allows for massive parallelism, resilience, and specialization
     - Each agent instance will have its own short-term memory manager.
     - This manager will hold the agent's profile, the current task, recent conversation history, and intermediate results.
     - To prevent context overflow, a summarization strategy will be implemented. Before a new turn, the oldest parts of the conversation history will be summarized by the LLM and replaced with the summary.
-    - **Redis Caching:** The `IDistributedCache` (backed by Redis) will be used to cache the agent's working context, allowing it to be shared and persisted across different processes if needed.
+    - **Hybrid Cache:** Combine `IMemoryCache` for low-latency lookup with a disk-backed store so cached context survives process restarts without needing external infrastructure.
 2.  **Long-Term Memory (Cosmos DB):**
     - **Schema Design:** Design a flexible Cosmos DB schema. A single container could store different document types (e.g., `type: "memory"`, `type: "document_chunk"`, `type: "source"`).
     - **Vector Storage:** Cosmos DB for NoSQL now provides native vector indexing. Store Azure OpenAI embeddings alongside the text chunks and configure DiskANN indexes with cosine distance for efficient recall.
@@ -140,4 +139,9 @@ This architecture allows for massive parallelism, resilience, and specialization
 - **M5: Orchestrator & Branching.** Implement the Orchestrator and the logic for spawning and managing parallel `ResearcherAgent` tasks.
 - **M6: Synthesis & Reporting.** Develop the final report generation and citation capabilities.
 - **M7: Testing & Refinement.** End-to-end testing, performance tuning, and prompt engineering refinement.
+
+
+
+
+
 

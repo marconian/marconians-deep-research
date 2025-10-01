@@ -95,8 +95,8 @@ internal static class Program
             await using var cosmosService = new CosmosMemoryService(settings, logger: loggerFactory.CreateLogger<CosmosMemoryService>());
             await cosmosService.InitializeAsync(cts.Token).ConfigureAwait(false);
 
-            logger.LogInformation("Initializing Redis cache client.");
-            await using var redisCache = new RedisCacheService(settings, loggerFactory.CreateLogger<RedisCacheService>());
+            logger.LogInformation("Initializing hybrid cache (memory + disk).");
+            await using var cacheService = new HybridCacheService(settings.CacheDirectory, loggerFactory.CreateLogger<HybridCacheService>());
 
             var openAiService = new AzureOpenAiService(settings, loggerFactory.CreateLogger<AzureOpenAiService>());
             var longTermMemory = new LongTermMemoryManager(
@@ -110,8 +110,8 @@ internal static class Program
 
             Func<IEnumerable<ITool>> toolFactory = () => new ITool[]
             {
-                new WebSearchTool(settings.GoogleApiKey, settings.GoogleSearchEngineId, redisCache, sharedHttpClient, loggerFactory.CreateLogger<WebSearchTool>()),
-                new WebScraperTool(redisCache, sharedHttpClient, loggerFactory.CreateLogger<WebScraperTool>()),
+                new WebSearchTool(settings.GoogleApiKey, settings.GoogleSearchEngineId, cacheService, sharedHttpClient, loggerFactory.CreateLogger<WebSearchTool>()),
+                new WebScraperTool(cacheService, sharedHttpClient, loggerFactory.CreateLogger<WebScraperTool>()),
                 new FileReaderTool(fileRegistryService, documentService, sharedHttpClient, loggerFactory.CreateLogger<FileReaderTool>()),
                 new ImageReaderTool(fileRegistryService, openAiService, settings.AzureOpenAiVisionDeployment, sharedHttpClient, loggerFactory.CreateLogger<ImageReaderTool>())
             };
@@ -129,7 +129,7 @@ internal static class Program
                 settings.AzureOpenAiChatDeployment,
                 loggerFactory.CreateLogger<OrchestratorAgent>(),
                 loggerFactory,
-                redisCache,
+                cacheService,
                 reportsDirectory: reportDirectory);
 
             logger.LogInformation("Loading existing research sessions from Cosmos DB.");
@@ -686,3 +686,4 @@ internal static class Program
         return DateTimeOffset.MinValue;
     }
 }
+
