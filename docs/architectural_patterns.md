@@ -24,3 +24,4 @@
 - The final Markdown reporter template ensures every claim references a `MemoryRecord` identifier, maintaining an auditable trail from output back to raw evidence.
 - After the first draft is emitted, an iterative revision loop asks the LLM for JSON-formatted line edits. A lightweight `MarkdownReportEditor` applies `replace`/`insert` operations so the agent can rework specific lines without regenerating the entire document.
 
+

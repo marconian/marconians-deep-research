@@ -18,6 +18,7 @@ using System.Text.Json;
 using Microsoft.Azure.Cosmos;
 using System.Collections.ObjectModel;
 using Marconian.ResearchAgent.Logging;
+using Marconian.ResearchAgent.Tracking;
 
 namespace Marconian.ResearchAgent;
 
@@ -99,6 +100,8 @@ internal static class Program
 
             logger.LogInformation("Initializing hybrid cache (memory + disk).");
             await using var cacheService = new HybridCacheService(settings.CacheDirectory, loggerFactory.CreateLogger<HybridCacheService>());
+
+            var flowTracker = new ResearchFlowTracker(loggerFactory.CreateLogger<ResearchFlowTracker>());
 
             var openAiService = new AzureOpenAiService(settings, loggerFactory.CreateLogger<AzureOpenAiService>());
             var longTermMemory = new LongTermMemoryManager(
@@ -689,5 +692,8 @@ internal static class Program
         return DateTimeOffset.MinValue;
     }
 }
+
+
+
 
 
