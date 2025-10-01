@@ -5,7 +5,7 @@ public sealed record OpenAiChatRequest(
     IReadOnlyList<OpenAiChatMessage> Messages,
     string DeploymentName,
     int MaxOutputTokens = 800,
-    float Temperature = 0.2f,
+    float? Temperature = null,
     float? TopP = null);
 
 public sealed record OpenAiChatMessage(string Role, string Content);

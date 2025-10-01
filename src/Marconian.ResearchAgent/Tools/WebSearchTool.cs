@@ -5,6 +5,8 @@ using System.Text.Json;
 using Marconian.ResearchAgent.Models.Reporting;
 using Marconian.ResearchAgent.Models.Tools;
 using Marconian.ResearchAgent.Services.Caching;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Marconian.ResearchAgent.Tools;
 
@@ -15,8 +17,14 @@ public sealed class WebSearchTool : ITool, IDisposable
     private readonly IRedisCacheService? _cacheService;
     private readonly string _apiKey;
     private readonly string _searchEngineId;
+    private readonly ILogger<WebSearchTool> _logger;
 
-    public WebSearchTool(string apiKey, string searchEngineId, IRedisCacheService? cacheService = null, HttpClient? httpClient = null)
+    public WebSearchTool(
+        string apiKey,
+        string searchEngineId,
+        IRedisCacheService? cacheService = null,
+        HttpClient? httpClient = null,
+        ILogger<WebSearchTool>? logger = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(apiKey);
         ArgumentException.ThrowIfNullOrWhiteSpace(searchEngineId);
@@ -24,6 +32,7 @@ public sealed class WebSearchTool : ITool, IDisposable
         _apiKey = apiKey;
         _searchEngineId = searchEngineId;
         _cacheService = cacheService;
+        _logger = logger ?? NullLogger<WebSearchTool>.Instance;
         if (httpClient is null)
         {
             _httpClient = new HttpClient
@@ -69,6 +78,7 @@ public sealed class WebSearchTool : ITool, IDisposable
             var cached = await _cacheService.GetAsync<ToolExecutionResult>(cacheKey, cancellationToken).ConfigureAwait(false);
             if (cached is not null && cached.Success)
             {
+                _logger.LogDebug("Returning cached web search result for query '{Query}'.", query);
                 return cached;
             }
         }
@@ -77,6 +87,7 @@ public sealed class WebSearchTool : ITool, IDisposable
 
         try
         {
+            _logger.LogInformation("Issuing Google Custom Search request for query '{Query}'.", query);
             using HttpResponseMessage response = await _httpClient.GetAsync(requestUri, cancellationToken).ConfigureAwait(false);
             string body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
             response.EnsureSuccessStatusCode();
@@ -123,12 +134,14 @@ public sealed class WebSearchTool : ITool, IDisposable
             if (_cacheService is not null && result.Success)
             {
                 await _cacheService.SetAsync(cacheKey, result, TimeSpan.FromMinutes(30), cancellationToken).ConfigureAwait(false);
+                _logger.LogDebug("Cached web search result for query '{Query}'.", query);
             }
 
             return result;
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
         {
+            _logger.LogWarning(ex, "Web search failed for query '{Query}'.", query);
             return new ToolExecutionResult
             {
                 ToolName = Name,

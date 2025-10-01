@@ -17,7 +17,8 @@ public sealed class MemoryRecord
     public required string Content { get; init; }
 
     [JsonPropertyName("embedding")]
-    public List<float> Embedding { get; init; } = new();
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float[]? Embedding { get; init; }
 
     [JsonPropertyName("createdAtUtc")]
     public DateTimeOffset CreatedAtUtc { get; init; } = DateTimeOffset.UtcNow;

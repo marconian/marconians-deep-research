@@ -61,14 +61,21 @@ This architecture allows for massive parallelism, resilience, and specialization
 ### 4.1. Project Setup & Configuration
 1.  **Create .NET Console Project:** Initialize a new .NET console application.
 2.  **Dependency Management:** Add NuGet packages for Azure OpenAI, Azure Cosmos DB, Azure AI Document Intelligence, Azure Redis Cache, Playwright, and configuration management.
-3.  **Configuration Service:** Implement a service to securely load the following from environment variables:
+3.  **Configuration Service:** Implement a service to load configuration from JSON (`appsettings.json`, `appsettings.local.json`) with environment variables overriding values. Required keys:
     - `AZURE_OPENAI_ENDPOINT`
     - `AZURE_OPENAI_API_KEY`
+    - `AZURE_OPENAI_CHAT_DEPLOYMENT`
+    - `AZURE_OPENAI_EMBEDDING_DEPLOYMENT`
+    - `AZURE_OPENAI_VISION_DEPLOYMENT`
     - `COSMOS_CONN_STRING`
     - `AZURE_REDIS_CACHE_CONN_STRING`
     - `COGNITIVE_SERVICES_ENDPOINT`
     - `COGNITIVE_SERVICES_API_KEY`
-    - `GOOGLE_API_KEY` & `GOOGLE_SEARCH_ENGINE_ID`
+    - `GOOGLE_API_KEY`
+    - `GOOGLE_SEARCH_ENGINE_ID`
+    - `[Optional] PRIMARY_RESEARCH_OBJECTIVE` (default question when CLI args are omitted)
+
+    Explicit deployment names keep the Azure OpenAI wrapper configuration-driven instead of hardcoding resource IDs.
 
 ### 4.2. The LLM "Brain" & Profiling Module
 1.  **LLM Service:** Create a wrapper service around the `Azure.AI.OpenAI` client. This service will handle request/response logic, token counting, and error handling.
@@ -87,13 +94,13 @@ This architecture allows for massive parallelism, resilience, and specialization
     - **Redis Caching:** The `IDistributedCache` (backed by Redis) will be used to cache the agent's working context, allowing it to be shared and persisted across different processes if needed.
 2.  **Long-Term Memory (Cosmos DB):**
     - **Schema Design:** Design a flexible Cosmos DB schema. A single container could store different document types (e.g., `type: "memory"`, `type: "document_chunk"`, `type: "source"`).
-    - **Vector Storage:** While Cosmos DB for NoSQL doesn't have a native vector search (like the MongoDB vCore or PostgreSQL extensions do), we will store vector embeddings (generated via Azure OpenAI) alongside the text chunks.
+    - **Vector Storage:** Cosmos DB for NoSQL now provides native vector indexing. Store Azure OpenAI embeddings alongside the text chunks and configure DiskANN indexes with cosine distance for efficient recall.
     - **Vector Retrieval:** Implement a retrieval mechanism:
         1.  Generate an embedding for the current query/task.
-        2.  Query Cosmos DB to retrieve all documents.
-        3.  Perform a cosine similarity calculation in-memory against all stored vectors.
-        4.  Return the top-k most relevant documents. This process can be accelerated by caching vectors in Redis.
-    - **Memory Service:** Create a `MemoryService` that abstracts all interactions with Cosmos DB (saving memories, retrieving relevant information).
+        2.  Execute a Cosmos SQL query that orders results via `VectorDistance` inside the partition for the active research session.
+        3.  Fall back to in-memory cosine similarity only if the vector query encounters an error.
+        4.  Return the top-k most relevant documents, annotating each with the computed similarity score.
+    - **Memory Service:** Create a `MemoryService` that abstracts all interactions with Cosmos DB (saving memories, retrieving relevant information) and persists orchestrator session state (session metadata, branch progress, tool telemetry) for resumability.
 
 ### 4.5. Perception & Tool Use Module
 1.  **Tool Abstraction:** Define a common `ITool` interface with an `ExecuteAsync` method. Each tool will be a separate class implementing this interface.
@@ -133,3 +140,4 @@ This architecture allows for massive parallelism, resilience, and specialization
 - **M5: Orchestrator & Branching.** Implement the Orchestrator and the logic for spawning and managing parallel `ResearcherAgent` tasks.
 - **M6: Synthesis & Reporting.** Develop the final report generation and citation capabilities.
 - **M7: Testing & Refinement.** End-to-end testing, performance tuning, and prompt engineering refinement.
+

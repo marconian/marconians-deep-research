@@ -7,6 +7,8 @@ using Marconian.ResearchAgent.Models.Tools;
 using Marconian.ResearchAgent.Services.Files;
 using Marconian.ResearchAgent.Services.OpenAI;
 using Marconian.ResearchAgent.Services.OpenAI.Models;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Marconian.ResearchAgent.Tools;
 
@@ -17,14 +19,21 @@ public sealed class ImageReaderTool : ITool, IDisposable
     private readonly string _visionDeploymentName;
     private readonly HttpClient _httpClient;
     private readonly bool _ownsHttpClient;
+    private readonly ILogger<ImageReaderTool> _logger;
 
-    public ImageReaderTool(IFileRegistryService fileRegistry, IAzureOpenAiService openAiService, string visionDeploymentName, HttpClient? httpClient = null)
+    public ImageReaderTool(
+        IFileRegistryService fileRegistry,
+        IAzureOpenAiService openAiService,
+        string visionDeploymentName,
+        HttpClient? httpClient = null,
+        ILogger<ImageReaderTool>? logger = null)
     {
         _fileRegistry = fileRegistry ?? throw new ArgumentNullException(nameof(fileRegistry));
         _openAiService = openAiService ?? throw new ArgumentNullException(nameof(openAiService));
         _visionDeploymentName = string.IsNullOrWhiteSpace(visionDeploymentName)
             ? throw new ArgumentException("Vision deployment name must be provided.", nameof(visionDeploymentName))
             : visionDeploymentName;
+        _logger = logger ?? NullLogger<ImageReaderTool>.Instance;
 
         if (httpClient is null)
         {
@@ -69,12 +78,14 @@ public sealed class ImageReaderTool : ITool, IDisposable
                 var entry = await _fileRegistry.GetEntryAsync(context.ResearchSessionId, fileId, cancellationToken).ConfigureAwait(false);
                 if (entry is null)
                 {
+                    _logger.LogWarning("Image {FileId} not found in registry for session {SessionId}.", fileId, context.ResearchSessionId);
                     return Failure($"Image with id '{fileId}' was not found.");
                 }
 
                 imageStream = await _fileRegistry.OpenFileAsync(context.ResearchSessionId, fileId, cancellationToken).ConfigureAwait(false);
                 if (imageStream is null)
                 {
+                    _logger.LogWarning("Image entry {FileId} existed but file stream unavailable.", fileId);
                     return Failure("Image entry existed but the file could not be opened.");
                 }
 
@@ -85,6 +96,7 @@ public sealed class ImageReaderTool : ITool, IDisposable
             }
             else if (!string.IsNullOrWhiteSpace(url))
             {
+                _logger.LogInformation("Downloading image from {Url} for session {SessionId}.", url, context.ResearchSessionId);
                 var downloadResult = await DownloadAndRegisterAsync(url, context.ResearchSessionId, cancellationToken).ConfigureAwait(false);
                 imageStream = downloadResult.Stream;
                 fileName = downloadResult.Entry.FileName;
@@ -94,6 +106,7 @@ public sealed class ImageReaderTool : ITool, IDisposable
             }
             else
             {
+                _logger.LogWarning("ImageReader invoked without fileId or url.");
                 return Failure("Provide either a fileId or url parameter for image analysis.");
             }
 
@@ -102,6 +115,7 @@ public sealed class ImageReaderTool : ITool, IDisposable
                 var metadata = ExtractMetadata(imageStream);
                 imageStream.Position = 0;
                 string analysis = await DescribeImageAsync(imageStream, metadata, contentType, cancellationToken).ConfigureAwait(false);
+                _logger.LogInformation("Image analysis produced {Length} characters for session {SessionId}.", analysis.Length, context.ResearchSessionId);
 
                 var result = new ToolExecutionResult
                 {
@@ -126,6 +140,7 @@ public sealed class ImageReaderTool : ITool, IDisposable
         }
         catch (Exception ex) when (ex is IOException or HttpRequestException)
         {
+            _logger.LogError(ex, "Image analysis failed for session {SessionId}.", context.ResearchSessionId);
             return Failure($"Image analysis failed: {ex.Message}");
         }
     }
@@ -143,16 +158,19 @@ public sealed class ImageReaderTool : ITool, IDisposable
         buffer.Position = 0;
 
         var entry = await _fileRegistry.SaveFileAsync(researchSessionId, fileName, buffer, contentType, url, cancellationToken).ConfigureAwait(false);
+        _logger.LogDebug("Downloaded image {FileName} stored with id {FileId}.", fileName, entry.FileId);
         buffer.Position = 0;
         return (entry, buffer);
     }
 
     private static string ExtractMetadata(Stream stream)
     {
+#pragma warning disable CA1416
         stream.Position = 0;
         using var image = Image.FromStream(stream, useEmbeddedColorManagement: false, validateImageData: false);
         string format = image.RawFormat?.ToString() ?? "unknown";
         return $"{image.Width}x{image.Height} ({format})";
+#pragma warning restore CA1416
     }
 
     private async Task<string> DescribeImageAsync(Stream stream, string metadata, string contentType, CancellationToken cancellationToken)
@@ -170,9 +188,7 @@ public sealed class ImageReaderTool : ITool, IDisposable
                 new OpenAiChatMessage("user", $"The image has metadata {metadata} and content type {contentType}. Analyze the scene and describe key details. The image data is provided as base64 below.\nBASE64:{base64}")
             },
             DeploymentName: _visionDeploymentName,
-            MaxOutputTokens: 300,
-            Temperature: 0.2f
-        );
+            MaxOutputTokens: 300);
 
         try
         {
@@ -180,6 +196,7 @@ public sealed class ImageReaderTool : ITool, IDisposable
         }
         catch (Exception ex)
         {
+            _logger.LogWarning(ex, "Vision model unavailable; returning metadata summary.");
             return $"Vision model unavailable. Metadata: {metadata}. Error: {ex.Message}";
         }
     }
@@ -219,3 +236,4 @@ public sealed class ImageReaderTool : ITool, IDisposable
         }
     }
 }
+

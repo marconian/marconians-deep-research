@@ -5,6 +5,8 @@ using Marconian.ResearchAgent.Models.Files;
 using Marconian.ResearchAgent.Models.Reporting;
 using Marconian.ResearchAgent.Models.Tools;
 using Marconian.ResearchAgent.Services.Files;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Marconian.ResearchAgent.Tools;
 
@@ -14,11 +16,17 @@ public sealed class FileReaderTool : ITool, IDisposable
     private readonly IDocumentIntelligenceService _documentService;
     private readonly HttpClient _httpClient;
     private readonly bool _ownsHttpClient;
+    private readonly ILogger<FileReaderTool> _logger;
 
-    public FileReaderTool(IFileRegistryService fileRegistry, IDocumentIntelligenceService documentService, HttpClient? httpClient = null)
+    public FileReaderTool(
+        IFileRegistryService fileRegistry,
+        IDocumentIntelligenceService documentService,
+        HttpClient? httpClient = null,
+        ILogger<FileReaderTool>? logger = null)
     {
         _fileRegistry = fileRegistry ?? throw new ArgumentNullException(nameof(fileRegistry));
         _documentService = documentService ?? throw new ArgumentNullException(nameof(documentService));
+        _logger = logger ?? NullLogger<FileReaderTool>.Instance;
 
         if (httpClient is null)
         {
@@ -65,12 +73,14 @@ public sealed class FileReaderTool : ITool, IDisposable
                 var entry = await _fileRegistry.GetEntryAsync(context.ResearchSessionId, fileId, cancellationToken).ConfigureAwait(false);
                 if (entry is null)
                 {
+                    _logger.LogWarning("File {FileId} not found in registry for session {SessionId}.", fileId, context.ResearchSessionId);
                     return Failure($"File with id '{fileId}' was not found in the registry.");
                 }
 
                 dataStream = await _fileRegistry.OpenFileAsync(context.ResearchSessionId, fileId, cancellationToken).ConfigureAwait(false);
                 if (dataStream is null)
                 {
+                    _logger.LogWarning("File entry {FileId} existed but stream could not be opened.", fileId);
                     return Failure("File entry existed but the underlying file could not be opened.");
                 }
 
@@ -81,6 +91,7 @@ public sealed class FileReaderTool : ITool, IDisposable
             }
             else if (!string.IsNullOrWhiteSpace(url))
             {
+                _logger.LogInformation("Downloading file from {Url} for session {SessionId}.", url, context.ResearchSessionId);
                 var downloadResult = await DownloadAndRegisterAsync(url, context.ResearchSessionId, cancellationToken).ConfigureAwait(false);
                 dataStream = downloadResult.Stream;
                 fileName = downloadResult.Entry.FileName;
@@ -93,6 +104,7 @@ public sealed class FileReaderTool : ITool, IDisposable
                 string absolutePath = Path.GetFullPath(path);
                 if (!File.Exists(absolutePath))
                 {
+                    _logger.LogWarning("Local file {Path} not found.", path);
                     return Failure($"Local file '{path}' does not exist.");
                 }
 
@@ -102,6 +114,7 @@ public sealed class FileReaderTool : ITool, IDisposable
             }
             else
             {
+                _logger.LogWarning("FileReader invoked without any source identifiers.");
                 return Failure("Provide either a fileId, url, or path parameter.");
             }
 
@@ -111,6 +124,7 @@ public sealed class FileReaderTool : ITool, IDisposable
                 if (string.IsNullOrWhiteSpace(extractedText))
                 {
                     extractedText = "Document contained no readable text.";
+                    _logger.LogInformation("FileReader produced empty text for {FileName}.", fileName);
                 }
 
                 string snippet = extractedText.Length > 400 ? extractedText[..400] + "…" : extractedText;
@@ -137,6 +151,7 @@ public sealed class FileReaderTool : ITool, IDisposable
         }
         catch (Exception ex) when (ex is IOException or HttpRequestException)
         {
+            _logger.LogError(ex, "File processing failed for session {SessionId}.", context.ResearchSessionId);
             return Failure($"File processing failed: {ex.Message}");
         }
     }
@@ -154,6 +169,7 @@ public sealed class FileReaderTool : ITool, IDisposable
         buffer.Position = 0;
 
         var entry = await _fileRegistry.SaveFileAsync(researchSessionId, fileName, buffer, contentType, url, cancellationToken).ConfigureAwait(false);
+        _logger.LogDebug("Downloaded file {FileName} and stored with id {FileId} for session {SessionId}.", fileName, entry.FileId, researchSessionId);
         buffer.Position = 0;
         return (entry, buffer);
     }

@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Text;
 using Marconian.ResearchAgent.Memory;
@@ -5,9 +6,12 @@ using Marconian.ResearchAgent.Models.Agents;
 using Marconian.ResearchAgent.Models.Memory;
 using Marconian.ResearchAgent.Models.Reporting;
 using Marconian.ResearchAgent.Models.Tools;
+using Marconian.ResearchAgent.Services.Caching;
 using Marconian.ResearchAgent.Services.OpenAI;
 using Marconian.ResearchAgent.Services.OpenAI.Models;
 using Marconian.ResearchAgent.Tools;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Marconian.ResearchAgent.Agents;
 
@@ -17,12 +21,18 @@ public sealed class ResearcherAgent : IAgent
     private readonly LongTermMemoryManager _longTermMemoryManager;
     private readonly IReadOnlyList<ITool> _tools;
     private readonly string _chatDeploymentName;
+    private readonly IRedisCacheService? _cacheService;
+    private readonly ILogger<ResearcherAgent> _logger;
+    private readonly ILogger<ShortTermMemoryManager> _shortTermLogger;
 
     public ResearcherAgent(
         IAzureOpenAiService openAiService,
         LongTermMemoryManager longTermMemoryManager,
         IEnumerable<ITool> tools,
-        string chatDeploymentName)
+        string chatDeploymentName,
+        IRedisCacheService? cacheService = null,
+        ILogger<ResearcherAgent>? logger = null,
+        ILogger<ShortTermMemoryManager>? shortTermLogger = null)
     {
         _openAiService = openAiService ?? throw new ArgumentNullException(nameof(openAiService));
         _longTermMemoryManager = longTermMemoryManager ?? throw new ArgumentNullException(nameof(longTermMemoryManager));
@@ -30,17 +40,24 @@ public sealed class ResearcherAgent : IAgent
         _chatDeploymentName = string.IsNullOrWhiteSpace(chatDeploymentName)
             ? throw new ArgumentException("Chat deployment name must be provided.", nameof(chatDeploymentName))
             : chatDeploymentName;
+        _cacheService = cacheService;
+        _logger = logger ?? NullLogger<ResearcherAgent>.Instance;
+        _shortTermLogger = shortTermLogger ?? NullLogger<ShortTermMemoryManager>.Instance;
     }
 
     public async Task<AgentExecutionResult> ExecuteTaskAsync(AgentTask task, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(task);
 
+        _logger.LogInformation("Researcher {TaskId} starting objective '{Objective}'.", task.TaskId, task.Objective);
+
         var shortTermMemory = new ShortTermMemoryManager(
             agentId: task.TaskId,
             researchSessionId: task.ResearchSessionId,
             _openAiService,
-            _chatDeploymentName);
+            _chatDeploymentName,
+            _cacheService,
+            logger: _shortTermLogger);
 
         await shortTermMemory.InitializeAsync(cancellationToken).ConfigureAwait(false);
         await shortTermMemory.AppendAsync("user", task.Objective, cancellationToken).ConfigureAwait(false);
@@ -56,6 +73,7 @@ public sealed class ResearcherAgent : IAgent
         {
             string memorySummary = string.Join('\n', relatedMemories.Select(m => $"- {m.Record.Content}"));
             await shortTermMemory.AppendAsync("memory", memorySummary, cancellationToken).ConfigureAwait(false);
+            _logger.LogDebug("Loaded {Count} related memories into short-term context for task {TaskId}.", relatedMemories.Count, task.TaskId);
         }
 
         ToolExecutionResult? searchResult = null;
@@ -148,9 +166,7 @@ public sealed class ResearcherAgent : IAgent
                 new OpenAiChatMessage("user", $"Research question: {task.Objective}\n\nEvidence:\n{aggregatedEvidence}\n\nWrite a 3-4 sentence answer summarizing factual findings and note confidence level (High/Medium/Low)."),
             },
             DeploymentName: _chatDeploymentName,
-            MaxOutputTokens: 400,
-            Temperature: 0.3f
-        );
+            MaxOutputTokens: 400);
 
         string summary = await _openAiService.GenerateTextAsync(synthesisRequest, cancellationToken).ConfigureAwait(false);
         await shortTermMemory.AppendAsync("assistant", summary, cancellationToken).ConfigureAwait(false);
@@ -165,12 +181,13 @@ public sealed class ResearcherAgent : IAgent
         };
 
         await _longTermMemoryManager.StoreFindingAsync(task.ResearchSessionId, finding, cancellationToken: cancellationToken).ConfigureAwait(false);
+        _logger.LogInformation("Researcher {TaskId} completed with confidence {Confidence:F2}.", task.TaskId, confidence);
 
         return new AgentExecutionResult
         {
             Success = true,
             Summary = summary,
-            Findings = { finding },
+            Findings = new List<ResearchFinding> { finding },
             ToolOutputs = toolOutputs,
             Errors = errors
         };
@@ -206,6 +223,7 @@ public sealed class ResearcherAgent : IAgent
         {
             try
             {
+                _logger.LogDebug("Executing tool {Tool} for task {TaskId}, attempt {Attempt}.", tool.Name, task.TaskId, attempt);
                 result = await tool.ExecuteAsync(context, cancellationToken).ConfigureAwait(false);
             }
             catch (Exception ex)
@@ -216,6 +234,7 @@ public sealed class ResearcherAgent : IAgent
                     Success = false,
                     ErrorMessage = ex.Message
                 };
+                _logger.LogWarning(ex, "Tool {Tool} threw an exception on task {TaskId}.", tool.Name, task.TaskId);
             }
 
             if (result.Success || attempt == maxAttempts)
@@ -243,18 +262,24 @@ public sealed class ResearcherAgent : IAgent
                     ["instruction"] = context.Instruction
                 },
                 cancellationToken).ConfigureAwait(false);
+            _logger.LogDebug("Persisted output from tool {Tool} for task {TaskId}.", tool.Name, task.TaskId);
         }
 
         await shortTermMemory.AppendAsync("tool", $"{tool.Name} => {(result.Success ? "success" : "failure")}", cancellationToken).ConfigureAwait(false);
         if (!result.Success && result.ErrorMessage is not null)
         {
             errors.Add($"{tool.Name}: {result.ErrorMessage}");
+            _logger.LogWarning("Tool {Tool} failed for task {TaskId}: {Error}.", tool.Name, task.TaskId, result.ErrorMessage);
+        }
+        else
+        {
+            _logger.LogInformation("Tool {Tool} completed for task {TaskId} (success={Success}).", tool.Name, task.TaskId, result.Success);
         }
 
         return result;
     }
 
-    private bool TryGetTool<TTool>(out TTool tool)
+    private bool TryGetTool<TTool>([NotNullWhen(true)] out TTool? tool)
         where TTool : class, ITool
     {
         tool = _tools.OfType<TTool>().FirstOrDefault();
@@ -318,3 +343,4 @@ public sealed class ResearcherAgent : IAgent
         return 0.6d;
     }
 }
+

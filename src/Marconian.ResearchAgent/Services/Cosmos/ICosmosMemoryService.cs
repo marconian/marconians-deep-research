@@ -6,6 +6,8 @@ public interface ICosmosMemoryService : IAsyncDisposable
 {
     Task InitializeAsync(CancellationToken cancellationToken = default);
 
+    int VectorDimensions { get; }
+
     Task UpsertRecordAsync(MemoryRecord record, CancellationToken cancellationToken = default);
 
     Task<IReadOnlyList<MemoryRecord>> QueryBySessionAsync(string researchSessionId, int limit, CancellationToken cancellationToken = default);

@@ -1,10 +1,9 @@
+using System.Collections.Generic;
+using System.IO;
 using Microsoft.Extensions.Configuration;
 
 namespace Marconian.ResearchAgent.Configuration;
 
-/// <summary>
-/// Centralized configuration loader that reads required secrets from environment variables.
-/// </summary>
 public static class Settings
 {
     private static readonly string[] RequiredEnvironmentVariables =
@@ -17,26 +16,29 @@ public static class Settings
         "COSMOS_CONN_STRING",
         "AZURE_REDIS_CACHE_CONN_STRING",
         "COGNITIVE_SERVICES_ENDPOINT",
-        "PRIMARY_RESEARCH_OBJECTIVE",
         "COGNITIVE_SERVICES_API_KEY",
         "GOOGLE_API_KEY",
-        "GOOGLE_SEARCH_ENGINE_ID"
+        "GOOGLE_SEARCH_ENGINE_ID",
+        "PRIMARY_RESEARCH_OBJECTIVE"
     ];
 
     public static AppSettings LoadAndValidate()
     {
         IConfigurationRoot configuration = new ConfigurationBuilder()
+            .SetBasePath(Directory.GetCurrentDirectory())
+            .AddJsonFile("appsettings.json", optional: true, reloadOnChange: false)
+            .AddJsonFile("appsettings.local.json", optional: true, reloadOnChange: false)
             .AddEnvironmentVariables()
             .Build();
 
-        var missingVariables = new List<string>();
+        var missing = new List<string>();
 
         string ReadRequired(string key)
         {
             string? value = configuration[key];
             if (string.IsNullOrWhiteSpace(value))
             {
-                missingVariables.Add(key);
+                missing.Add(key);
                 return string.Empty;
             }
 
@@ -56,12 +58,12 @@ public static class Settings
             CognitiveServicesApiKey = ReadRequired("COGNITIVE_SERVICES_API_KEY"),
             GoogleApiKey = ReadRequired("GOOGLE_API_KEY"),
             GoogleSearchEngineId = ReadRequired("GOOGLE_SEARCH_ENGINE_ID"),
-            PrimaryResearchObjective = configuration["PRIMARY_RESEARCH_OBJECTIVE"]?.Trim();
+            PrimaryResearchObjective = configuration["PRIMARY_RESEARCH_OBJECTIVE"]?.Trim()
         };
 
-        if (missingVariables.Count > 0)
+        if (missing.Count > 0)
         {
-            string message = $"Missing required environment variables: {string.Join(", ", missingVariables)}";
+            string message = $"Missing required environment variables: {string.Join(", ", missing)}";
             throw new InvalidOperationException(message);
         }
 
@@ -71,9 +73,6 @@ public static class Settings
     public static IReadOnlyList<string> RequiredVariables => RequiredEnvironmentVariables;
 
     public sealed record AppSettings
-        public string? PrimaryResearchObjective { get; init; }
-        public string? PrimaryResearchObjective { get; init; }
-        public string? PrimaryResearchObjective { get; init; }
     {
         public required string AzureOpenAiEndpoint { get; init; }
         public required string AzureOpenAiApiKey { get; init; }
@@ -86,5 +85,7 @@ public static class Settings
         public required string CognitiveServicesApiKey { get; init; }
         public required string GoogleApiKey { get; init; }
         public required string GoogleSearchEngineId { get; init; }
+        public string? PrimaryResearchObjective { get; init; }
     }
 }
+

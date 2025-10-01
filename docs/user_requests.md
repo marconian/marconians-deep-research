@@ -1,5 +1,51 @@
 [x] establish autonomous monitoring of `docs/user_requests.md`, avoid direct user interaction, and update internal mandates (completed 2025-09-30)
 [x] add instruction for the development agent to perform git management and creating valuable commits and so on (completed 2025-09-30)
 [x] keep track of a specific research query in the db. upon start of the app the user should be able to choose to continue an in progress research query or start a new one. The app should also be startable by providing command line args. (completed 2025-09-30)
-[ ] actively use the app you are developing to gather information for yourself too to further improve the app iterativly. So start your own research. This way you can test the app and if it works you will be able to gather information with it.
-
+[x] actively use the app you are developing to gather information for yourself too to further improve the app iterativly. So start your own research. This way you can test the app and if it works you will be able to gather information with it.
+[x] build in ILogger for correctly capturing information and issues during runtime
+[x] setup a database plan for keeping the state of research and all activity that should persist on shutdown. Also setup a vector index in Cosmos instead of realing on in memory similarity searches. Here is an example I copied from another application:
+  ```cs
+  private static ContainerSpec Assets()
+  {
+      var included = new[] { new IncludedPath { Path = "/*" } };
+      var excluded = new[]
+      {
+          new ExcludedPath { Path = $"/{nameof(Snippet.Embedding)}/*" },
+          new ExcludedPath { Path = $"/{nameof(SnippetDetailed.Embedding2)}/*" }
+      };
+      var composite = new[]
+      {
+          new List<CompositePath>
+          {
+              new() { Path = $"/{nameof(Asset.QueuedOn)}", Order = CompositePathSortOrder.Ascending },
+              new() { Path = $"/{nameof(Asset.LastAttemptOn)}", Order = CompositePathSortOrder.Ascending }
+          }.AsReadOnly()
+      };
+      var vectorIndexes = new[]
+      {
+          new VectorIndexPath { Path = $"/{nameof(Snippet.Embedding)}", Type = VectorIndexType.DiskANN },
+          new VectorIndexPath { Path = $"/{nameof(SnippetDetailed.Embedding2)}", Type = VectorIndexType.QuantizedFlat }
+      };
+      var embeddings = new[]
+      {
+          new Embedding
+          {
+              Path = $"/{nameof(Snippet.Embedding)}",
+              Dimensions = Constants.OpenAIEmbeddingSize,
+              DataType = VectorDataType.Float32,
+              DistanceFunction = DistanceFunction.Cosine
+          },
+          new Embedding
+          {
+              Path = $"/{nameof(SnippetDetailed.Embedding2)}",
+              Dimensions = Constants.OpenAIEmbedding2Size,
+              DataType = VectorDataType.Float32,
+              DistanceFunction = DistanceFunction.Cosine
+          }
+      };
+      return new ContainerSpec(Containers.Assets, "/assetId", included, excluded, composite, vectorIndexes, embeddings);
+  }
+  ```
+[x] make sure the final report that is written is written in markdown. also that the agent should be able to iterate over it mutiple times whenever the agent deems that is necessary and should be able read specific lines and insert or edit text at specific lines
+[x] connection to Cosmos DB sometimes failes in our corporate environments. make sure it is in gateway mode.
+[ ] analyse "LLM Autonomous Research Application Best Practices.md" again and reflect on the current state of the project

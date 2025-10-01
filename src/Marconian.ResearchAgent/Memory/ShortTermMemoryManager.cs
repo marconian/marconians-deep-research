@@ -4,6 +4,8 @@ using Marconian.ResearchAgent.Models.Memory;
 using Marconian.ResearchAgent.Services.Caching;
 using Marconian.ResearchAgent.Services.OpenAI;
 using Marconian.ResearchAgent.Services.OpenAI.Models;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Marconian.ResearchAgent.Memory;
 
@@ -16,6 +18,7 @@ public sealed class ShortTermMemoryManager
     private readonly string _cacheKey;
     private readonly int _maxEntries;
     private readonly int _summaryBatchSize;
+    private readonly ILogger<ShortTermMemoryManager> _logger;
 
     public ShortTermMemoryManager(
         string agentId,
@@ -24,7 +27,8 @@ public sealed class ShortTermMemoryManager
         string deploymentName,
         IRedisCacheService? cacheService = null,
         int maxEntries = 40,
-        int summaryBatchSize = 6)
+        int summaryBatchSize = 6,
+        ILogger<ShortTermMemoryManager>? logger = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(agentId);
         ArgumentException.ThrowIfNullOrWhiteSpace(researchSessionId);
@@ -37,6 +41,7 @@ public sealed class ShortTermMemoryManager
         _cacheKey = $"stm:{researchSessionId}:{agentId}";
         _maxEntries = Math.Max(summaryBatchSize + 2, maxEntries);
         _summaryBatchSize = Math.Clamp(summaryBatchSize, 3, Math.Max(3, maxEntries / 2));
+        _logger = logger ?? NullLogger<ShortTermMemoryManager>.Instance;
     }
 
     public IReadOnlyList<ShortTermMemoryEntry> Entries => _entries.AsReadOnly();
@@ -53,6 +58,7 @@ public sealed class ShortTermMemoryManager
         {
             _entries.Clear();
             _entries.AddRange(cached.OrderBy(entry => entry.TimestampUtc));
+            _logger.LogDebug("Loaded {Count} short-term memory entries for key {Key} from Redis cache.", _entries.Count, _cacheKey);
         }
     }
 
@@ -75,6 +81,7 @@ public sealed class ShortTermMemoryManager
         }
 
         await PersistAsync(cancellationToken).ConfigureAwait(false);
+        _logger.LogTrace("Appended short-term memory entry for role {Role}. Current count: {Count}.", role, _entries.Count);
     }
 
     public string BuildPromptContext()
@@ -98,6 +105,7 @@ public sealed class ShortTermMemoryManager
         }
 
         var itemsToSummarize = _entries.Take(batchCount).ToList();
+        _logger.LogDebug("Summarizing {Count} short-term memory entries to control context length.", itemsToSummarize.Count);
         var summaryPrompt = new StringBuilder();
         summaryPrompt.AppendLine("Summarize the following agent interaction history into key bullet points that maintain factual accuracy.");
         summaryPrompt.AppendLine("Focus on decisions, context, and follow-up questions.");
@@ -116,9 +124,7 @@ public sealed class ShortTermMemoryManager
                 new OpenAiChatMessage("user", summaryPrompt.ToString())
             },
             DeploymentName: _deploymentName,
-            MaxOutputTokens: 256,
-            Temperature: 0.1f
-        );
+            MaxOutputTokens: 256);
 
         string summary = await _openAiService.GenerateTextAsync(request, cancellationToken).ConfigureAwait(false);
         _entries.RemoveRange(0, batchCount);
@@ -129,6 +135,7 @@ public sealed class ShortTermMemoryManager
             TimestampUtc = DateTimeOffset.UtcNow,
             IsSummary = true
         });
+        _logger.LogDebug("Short-term memory summarized into {Length} characters.", summary.Length);
     }
 
     private async Task PersistAsync(CancellationToken cancellationToken)
@@ -139,5 +146,7 @@ public sealed class ShortTermMemoryManager
         }
 
         await _cacheService.SetAsync(_cacheKey, _entries, TimeSpan.FromHours(6), cancellationToken).ConfigureAwait(false);
+        _logger.LogTrace("Persisted {Count} short-term memory entries to Redis with TTL 6h.", _entries.Count);
     }
 }
+
