@@ -30,7 +30,7 @@ internal static class Program
     private static async Task<int> Main(string[] args)
     {
         bool cosmosDiagnostics = args.Any(argument => string.Equals(argument, "--cosmos-diagnostics", StringComparison.OrdinalIgnoreCase));
-        string defaultReportDirectory = Path.Combine(Directory.GetCurrentDirectory(), "debug", "reports");
+        string defaultReportDirectory;
         string fileLoggerPath = Path.Combine(Directory.GetCurrentDirectory(), "debug", "marconian.log");
 
         using ILoggerFactory loggerFactory = LoggerFactory.Create(builder =>
@@ -76,6 +76,8 @@ internal static class Program
             try
             {
                 settings = Settings.LoadAndValidate();
+                defaultReportDirectory = settings.ReportsDirectory;
+                Directory.CreateDirectory(defaultReportDirectory);
                 logger.LogInformation("Configuration loaded successfully.");
             }
             catch (InvalidOperationException ex)
@@ -121,6 +123,7 @@ internal static class Program
             string reportDirectory = string.IsNullOrWhiteSpace(reportDirectoryArgument)
                 ? defaultReportDirectory
                 : Path.GetFullPath(reportDirectoryArgument);
+            Directory.CreateDirectory(reportDirectory);
 
             var orchestrator = new OrchestratorAgent(
                 openAiService,
@@ -686,4 +689,5 @@ internal static class Program
         return DateTimeOffset.MinValue;
     }
 }
+
 

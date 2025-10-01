@@ -42,6 +42,8 @@ You are to follow these instructions sequentially and precisely, while adhering 
     - `COGNITIVE_SERVICES_ENDPOINT`
     - `COGNITIVE_SERVICES_API_KEY`
     - `GOOGLE_API_KEY`
+    - [Optional] `CACHE_DIRECTORY`
+    - [Optional] `REPORTS_DIRECTORY`
 3.  **Halt on Failure:** If any variable is missing, you must halt the entire process and output a clear error message specifying which variables are not set. **Do not proceed with a partial configuration.**
 
 ### Step 3.3: Code Generation & Implementation
@@ -72,6 +74,8 @@ You are to follow these instructions sequentially and precisely, while adhering 
 5.  **Execute Tests:** Run `dotnet test` from the root directory. All tests must pass. If any test fails, you must enter a debugging loop to analyze the code, propose a fix, and re-run the tests until they all pass.
 6.  **Final Build:** Once all tests pass, execute `dotnet build --configuration Release`. Confirm that the build succeeds without errors.
 7.  **Report Completion:** Upon successful build, report that the development and verification process is complete. The application is ready for execution.
+
+
 
 
 

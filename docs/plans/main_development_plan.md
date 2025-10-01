@@ -76,10 +76,7 @@
 
 - [x] Review `docs/user_requests.md` at each working session and update plans/instructions as needed
 
-## M10 - Cache Strategy Migration
-- [x] Remove Redis dependency from codebase and packages
-- [x] Introduce hybrid caching service using IMemoryCache and disk persistence
-- [x] Update memory and tool components to use the new cache abstraction
-- [x] Adjust configuration, documentation, and tests for disk-backed cache
+## M10 - Cache Strategy Migration`n- [x] Remove Redis dependency from codebase and packages`n- [x] Introduce hybrid caching service using IMemoryCache and disk persistence`n- [x] Update memory and tool components to use the new cache abstraction`n- [x] Adjust configuration, documentation, and tests for disk-backed cache`n- [x] Configure cache directory path in appsettings.local.json for local development`n- [x] Add report output directory setting and wire default usage when CLI args omitted`n
+
 
 

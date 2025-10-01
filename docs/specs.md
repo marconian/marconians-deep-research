@@ -47,6 +47,7 @@ This architecture allows for massive parallelism, resilience, and specialization
 - **Caching Layer:** Hybrid disk + in-memory cache
     - **Runtime:** `Microsoft.Extensions.Caching.Memory` for fast in-process reads
     - **Persistence:** Local disk snapshot store for reuse across sessions
+    - **Configuration:** Override directories with optional `CACHE_DIRECTORY` and `REPORTS_DIRECTORY` settings
 - **Web Interaction:**
     - **Search:** Google Custom Search API. While not entirely free, it provides a stable and powerful way to search. Free alternatives often rely on web scraping which can be unstable.
     - **Scraping:** Libraries like `HtmlAgilityPack` for HTML parsing and `Playwright` for dynamic sites.
@@ -73,6 +74,8 @@ This architecture allows for massive parallelism, resilience, and specialization
     - `GOOGLE_API_KEY`
     - `GOOGLE_SEARCH_ENGINE_ID`
     - `[Optional] PRIMARY_RESEARCH_OBJECTIVE` (default question when CLI args are omitted)
+    - `[Optional] CACHE_DIRECTORY` (overrides the default `debug/cache` relative path)
+    - `[Optional] REPORTS_DIRECTORY` (overrides the default `debug/reports` relative path)
 
     Explicit deployment names keep the Azure OpenAI wrapper configuration-driven instead of hardcoding resource IDs.
 
@@ -139,6 +142,9 @@ This architecture allows for massive parallelism, resilience, and specialization
 - **M5: Orchestrator & Branching.** Implement the Orchestrator and the logic for spawning and managing parallel `ResearcherAgent` tasks.
 - **M6: Synthesis & Reporting.** Develop the final report generation and citation capabilities.
 - **M7: Testing & Refinement.** End-to-end testing, performance tuning, and prompt engineering refinement.
+
+
+
 
 
 

@@ -50,4 +50,5 @@
 [x] connection to Cosmos DB sometimes failes in our corporate environments. make sure it is in gateway mode.
 [ ] analyse "LLM Autonomous Research Application Best Practices.md" again and reflect on the current state of the project
 [x] remove redis cache and implement a strategy based on disk caching and IMemoryCache (completed 2025-10-01)
+[x] adjust cache/report directories configuration per latest request (completed 2025-10-01)
 

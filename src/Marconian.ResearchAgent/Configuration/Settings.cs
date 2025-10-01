@@ -56,7 +56,8 @@ public static class Settings
             CognitiveServicesApiKey = ReadRequired("COGNITIVE_SERVICES_API_KEY"),
             GoogleApiKey = ReadRequired("GOOGLE_API_KEY"),
             GoogleSearchEngineId = ReadRequired("GOOGLE_SEARCH_ENGINE_ID"),
-            CacheDirectory = ResolveCacheDirectory(configuration["CACHE_DIRECTORY"]),
+            CacheDirectory = ResolveDirectory(configuration["CACHE_DIRECTORY"], Path.Combine("debug", "cache")),
+            ReportsDirectory = ResolveDirectory(configuration["REPORTS_DIRECTORY"], Path.Combine("debug", "reports")),
             PrimaryResearchObjective = configuration["PRIMARY_RESEARCH_OBJECTIVE"]?.Trim()
         };
 
@@ -71,11 +72,11 @@ public static class Settings
 
     public static IReadOnlyList<string> RequiredVariables => RequiredEnvironmentVariables;
 
-    private static string ResolveCacheDirectory(string? configuredPath)
+    private static string ResolveDirectory(string? configuredPath, string defaultRelativePath)
     {
         if (string.IsNullOrWhiteSpace(configuredPath))
         {
-            return Path.Combine(Directory.GetCurrentDirectory(), "debug", "cache");
+            return Path.GetFullPath(Path.Combine(Directory.GetCurrentDirectory(), defaultRelativePath));
         }
 
         string trimmed = configuredPath.Trim();
@@ -100,6 +101,8 @@ public static class Settings
         public required string GoogleApiKey { get; init; }
         public required string GoogleSearchEngineId { get; init; }
         public required string CacheDirectory { get; init; }
+        public required string ReportsDirectory { get; init; }
         public string? PrimaryResearchObjective { get; init; }
     }
 }
+
