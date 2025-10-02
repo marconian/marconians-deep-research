@@ -10,6 +10,7 @@ using Marconian.ResearchAgent.Services.Caching;
 using Marconian.ResearchAgent.Services.OpenAI;
 using Marconian.ResearchAgent.Services.OpenAI.Models;
 using Marconian.ResearchAgent.Tools;
+using Marconian.ResearchAgent.Tracking;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -24,6 +25,7 @@ public sealed class ResearcherAgent : IAgent
     private readonly ICacheService? _cacheService;
     private readonly ILogger<ResearcherAgent> _logger;
     private readonly ILogger<ShortTermMemoryManager> _shortTermLogger;
+    private readonly ResearchFlowTracker? _flowTracker;
 
     public ResearcherAgent(
         IAzureOpenAiService openAiService,
@@ -31,6 +33,7 @@ public sealed class ResearcherAgent : IAgent
         IEnumerable<ITool> tools,
         string chatDeploymentName,
         ICacheService? cacheService = null,
+        ResearchFlowTracker? flowTracker = null,
         ILogger<ResearcherAgent>? logger = null,
         ILogger<ShortTermMemoryManager>? shortTermLogger = null)
     {
@@ -41,6 +44,7 @@ public sealed class ResearcherAgent : IAgent
             ? throw new ArgumentException("Chat deployment name must be provided.", nameof(chatDeploymentName))
             : chatDeploymentName;
         _cacheService = cacheService;
+        _flowTracker = flowTracker;
         _logger = logger ?? NullLogger<ResearcherAgent>.Instance;
         _shortTermLogger = shortTermLogger ?? NullLogger<ShortTermMemoryManager>.Instance;
     }
@@ -73,6 +77,7 @@ public sealed class ResearcherAgent : IAgent
         {
             string memorySummary = string.Join('\n', relatedMemories.Select(m => $"- {m.Record.Content}"));
             await shortTermMemory.AppendAsync("memory", memorySummary, cancellationToken).ConfigureAwait(false);
+            _flowTracker?.RecordBranchNote(task.TaskId, $"Loaded {relatedMemories.Count} related memories.");
             _logger.LogDebug("Loaded {Count} related memories into short-term context for task {TaskId}.", relatedMemories.Count, task.TaskId);
         }
 
@@ -247,6 +252,7 @@ public sealed class ResearcherAgent : IAgent
         }
 
         outputs.Add(result);
+        _flowTracker?.RecordToolExecution(task.TaskId, result);
 
         if (result.Success && !string.IsNullOrWhiteSpace(result.Output))
         {
@@ -269,6 +275,7 @@ public sealed class ResearcherAgent : IAgent
         if (!result.Success && result.ErrorMessage is not null)
         {
             errors.Add($"{tool.Name}: {result.ErrorMessage}");
+            _flowTracker?.RecordBranchNote(task.TaskId, $"{tool.Name}: {result.ErrorMessage}");
             _logger.LogWarning("Tool {Tool} failed for task {TaskId}: {Error}.", tool.Name, task.TaskId, result.ErrorMessage);
         }
         else

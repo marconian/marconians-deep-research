@@ -1,3 +1,4 @@
+using Marconian.ResearchAgent.Configuration;
 using Marconian.ResearchAgent.Models.Tools;
 using Marconian.ResearchAgent.Tools;
 using NUnit.Framework;
@@ -19,7 +20,7 @@ public sealed class WebSearchToolIntegrationTests
         }
 
         using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
-        var tool = new WebSearchTool(apiKey, searchEngineId, cacheService: null, httpClient: httpClient);
+        var tool = new WebSearchTool(apiKey, searchEngineId, cacheService: null, httpClient: httpClient, logger: null, provider: WebSearchProvider.GoogleApi);
 
         var context = new ToolExecutionContext
         {
@@ -40,3 +41,5 @@ public sealed class WebSearchToolIntegrationTests
         Assert.That(string.IsNullOrWhiteSpace(result.Output), Is.False);
     }
 }
+
+

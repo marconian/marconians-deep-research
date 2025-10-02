@@ -54,4 +54,5 @@
 
 [x] produce runtime mermaid diagrams for branch execution, document overall flow (completed 2025-10-01)
 
-[ ] implement the use of the model `computer-use-preview` for browser exploration with Playwright (config key: AZURE_OPENAI_COMPUTER_USE_DEPLOYMENT). See documentation/manual `Computer Use Model Microsoft Documentation.md`. Also build in an option to choose in config between using the google api and using this model with Playwright for navigating Google and collecting search results.
+[x] implement the use of the model `computer-use-preview` for browser exploration with Playwright (config key: AZURE_OPENAI_COMPUTER_USE_DEPLOYMENT). See documentation/manual `Computer Use Model Microsoft Documentation.md`. Also build in an option to choose in config between using the google api and using this model with Playwright for navigating Google and collecting search results. (completed 2025-10-01)
+

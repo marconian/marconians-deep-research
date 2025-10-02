@@ -9,6 +9,7 @@ using Marconian.ResearchAgent.Memory;
 using Marconian.ResearchAgent.Models.Agents;
 using Marconian.ResearchAgent.Models.Memory;
 using Marconian.ResearchAgent.Services.Caching;
+using Marconian.ResearchAgent.Services.ComputerUse;
 using Marconian.ResearchAgent.Services.Cosmos;
 using Marconian.ResearchAgent.Services.Files;
 using Marconian.ResearchAgent.Services.OpenAI;
@@ -69,9 +70,11 @@ internal static class Program
         };
         Console.CancelKeyPress += cancelHandler;
 
+        ComputerUseSearchService? computerUseSearchService = null;
+
+        ResearchFlowTracker? flowTracker = null;
         try
         {
-            logger.LogInformation("Starting Marconian research agent.");
 
             Settings.AppSettings settings;
             try
@@ -101,7 +104,7 @@ internal static class Program
             logger.LogInformation("Initializing hybrid cache (memory + disk).");
             await using var cacheService = new HybridCacheService(settings.CacheDirectory, loggerFactory.CreateLogger<HybridCacheService>());
 
-            var flowTracker = new ResearchFlowTracker(loggerFactory.CreateLogger<ResearchFlowTracker>());
+            flowTracker = new ResearchFlowTracker(loggerFactory.CreateLogger<ResearchFlowTracker>());
 
             var openAiService = new AzureOpenAiService(settings, loggerFactory.CreateLogger<AzureOpenAiService>());
             var longTermMemory = new LongTermMemoryManager(
@@ -112,10 +115,25 @@ internal static class Program
             var documentService = new DocumentIntelligenceService(settings, loggerFactory.CreateLogger<DocumentIntelligenceService>());
             var fileRegistryService = new FileRegistryService();
             using var sharedHttpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+            if (settings.WebSearchProvider == WebSearchProvider.ComputerUse)
+            {
+                if (string.IsNullOrWhiteSpace(settings.AzureOpenAiComputerUseDeployment))
+                {
+                    throw new InvalidOperationException("AZURE_OPENAI_COMPUTER_USE_DEPLOYMENT must be set when using the computer-use search provider.");
+                }
+
+                computerUseSearchService = new ComputerUseSearchService(
+                    settings.AzureOpenAiEndpoint,
+                    settings.AzureOpenAiApiKey,
+                    settings.AzureOpenAiComputerUseDeployment,
+                    sharedHttpClient,
+                    loggerFactory.CreateLogger<ComputerUseSearchService>());
+            }
+
 
             Func<IEnumerable<ITool>> toolFactory = () => new ITool[]
             {
-                new WebSearchTool(settings.GoogleApiKey, settings.GoogleSearchEngineId, cacheService, sharedHttpClient, loggerFactory.CreateLogger<WebSearchTool>()),
+                new WebSearchTool(settings.GoogleApiKey, settings.GoogleSearchEngineId, cacheService, sharedHttpClient, loggerFactory.CreateLogger<WebSearchTool>(), settings.WebSearchProvider, computerUseSearchService),
                 new WebScraperTool(cacheService, sharedHttpClient, loggerFactory.CreateLogger<WebScraperTool>()),
                 new FileReaderTool(fileRegistryService, documentService, sharedHttpClient, loggerFactory.CreateLogger<FileReaderTool>()),
                 new ImageReaderTool(fileRegistryService, openAiService, settings.AzureOpenAiVisionDeployment, sharedHttpClient, loggerFactory.CreateLogger<ImageReaderTool>())
@@ -277,12 +295,24 @@ internal static class Program
             Console.Error.WriteLine("Fatal error encountered. Check logs for details.");
             return 1;
         }
+
         finally
         {
+            if (computerUseSearchService is not null)
+            {
+                await computerUseSearchService.DisposeAsync().ConfigureAwait(false);
+            }
+
+            if (flowTracker is not null)
+            {
+                await flowTracker.SaveAsync().ConfigureAwait(false);
+            }
+
             Console.CancelKeyPress -= cancelHandler;
             AppDomain.CurrentDomain.UnhandledException -= unhandledExceptionHandler;
         }
     }
+
 
     private static void ParseCommandLine(string[] args, out string? resumeSessionId, out string? query, out string? reportsDirectory)
     {
@@ -321,7 +351,6 @@ internal static class Program
             }
         }
     }
-
     private static async Task RunCosmosDiagnosticsAsync(
         Settings.AppSettings settings,
         ILoggerFactory loggerFactory,
@@ -692,6 +721,22 @@ internal static class Program
         return DateTimeOffset.MinValue;
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

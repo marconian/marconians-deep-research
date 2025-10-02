@@ -2,47 +2,75 @@ using System.Linq;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
+using Marconian.ResearchAgent.Configuration;
 using Marconian.ResearchAgent.Models.Reporting;
 using Marconian.ResearchAgent.Models.Tools;
 using Marconian.ResearchAgent.Services.Caching;
+using Marconian.ResearchAgent.Services.ComputerUse;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Playwright;
 
 namespace Marconian.ResearchAgent.Tools;
 
 public sealed class WebSearchTool : ITool, IDisposable
 {
-    private readonly HttpClient _httpClient;
+    private readonly HttpClient? _httpClient;
     private readonly bool _ownsHttpClient;
     private readonly ICacheService? _cacheService;
     private readonly string _apiKey;
     private readonly string _searchEngineId;
     private readonly ILogger<WebSearchTool> _logger;
+    private readonly WebSearchProvider _provider;
+    private readonly ComputerUseSearchService? _computerUseService;
 
     public WebSearchTool(
         string apiKey,
         string searchEngineId,
         ICacheService? cacheService = null,
         HttpClient? httpClient = null,
-        ILogger<WebSearchTool>? logger = null)
+        ILogger<WebSearchTool>? logger = null,
+        WebSearchProvider provider = WebSearchProvider.GoogleApi,
+        ComputerUseSearchService? computerUseService = null)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(apiKey);
-        ArgumentException.ThrowIfNullOrWhiteSpace(searchEngineId);
-
-        _apiKey = apiKey;
-        _searchEngineId = searchEngineId;
         _cacheService = cacheService;
         _logger = logger ?? NullLogger<WebSearchTool>.Instance;
-        if (httpClient is null)
+        _provider = provider;
+
+        if (_provider == WebSearchProvider.GoogleApi)
         {
-            _httpClient = new HttpClient
+            if (string.IsNullOrWhiteSpace(apiKey))
             {
-                Timeout = TimeSpan.FromSeconds(30)
-            };
-            _ownsHttpClient = true;
+                throw new ArgumentException("Google API key must be provided when using the Google search provider.", nameof(apiKey));
+            }
+
+            if (string.IsNullOrWhiteSpace(searchEngineId))
+            {
+                throw new ArgumentException("Google search engine id must be provided when using the Google search provider.", nameof(searchEngineId));
+            }
+
+            _apiKey = apiKey;
+            _searchEngineId = searchEngineId;
+
+            if (httpClient is null)
+            {
+                _httpClient = new HttpClient
+                {
+                    Timeout = TimeSpan.FromSeconds(30)
+                };
+                _ownsHttpClient = true;
+            }
+            else
+            {
+                _httpClient = httpClient;
+                _ownsHttpClient = false;
+            }
         }
         else
         {
+            _apiKey = apiKey ?? string.Empty;
+            _searchEngineId = searchEngineId ?? string.Empty;
+            _computerUseService = computerUseService ?? throw new ArgumentNullException(nameof(computerUseService), "Computer-use search service must be supplied when using the computer-use provider.");
             _httpClient = httpClient;
             _ownsHttpClient = false;
         }
@@ -50,7 +78,9 @@ public sealed class WebSearchTool : ITool, IDisposable
 
     public string Name => "WebSearch";
 
-    public string Description => "Searches the web using Google Custom Search API and returns curated links with snippets.";
+    public string Description => _provider == WebSearchProvider.GoogleApi
+        ? "Searches the web using Google Custom Search API and returns curated links with snippets."
+        : "Searches the web using Azure computer-use automation (Playwright-controlled Google) and returns curated links with snippets.";
 
     public async Task<ToolExecutionResult> ExecuteAsync(ToolExecutionContext context, CancellationToken cancellationToken = default)
     {
@@ -71,16 +101,54 @@ public sealed class WebSearchTool : ITool, IDisposable
         }
 
         string normalizedQuery = query.Trim().ToLowerInvariant();
-        string cacheKey = $"tool:websearch:{normalizedQuery}";
+        string cacheKey = $"tool:websearch:{_provider}:{normalizedQuery}";
 
         if (_cacheService is not null)
         {
             var cached = await _cacheService.GetAsync<ToolExecutionResult>(cacheKey, cancellationToken).ConfigureAwait(false);
             if (cached is not null && cached.Success)
             {
-                _logger.LogDebug("Returning cached web search result for query '{Query}'.", query);
+                _logger.LogDebug("Returning cached web search result for query '{Query}' via provider {Provider}.", query, _provider);
                 return cached;
             }
+        }
+
+        ToolExecutionResult result = _provider switch
+        {
+            WebSearchProvider.GoogleApi => await ExecuteGoogleAsync(query, cancellationToken).ConfigureAwait(false),
+            WebSearchProvider.ComputerUse => await ExecuteComputerUseAsync(query, cancellationToken).ConfigureAwait(false),
+            _ => new ToolExecutionResult
+            {
+                ToolName = Name,
+                Success = false,
+                ErrorMessage = $"Unsupported search provider: {_provider}"
+            }
+        };
+
+        if (_cacheService is not null && result.Success)
+        {
+            await _cacheService.SetAsync(cacheKey, result, TimeSpan.FromMinutes(30), cancellationToken).ConfigureAwait(false);
+            _logger.LogDebug("Cached web search result for query '{Query}' using provider {Provider}.", query, _provider);
+        }
+
+        return result;
+    }
+
+    private async Task<ToolExecutionResult> ExecuteGoogleAsync(string query, CancellationToken cancellationToken)
+    {
+        if (_httpClient is null)
+        {
+            return new ToolExecutionResult
+            {
+                ToolName = Name,
+                Success = false,
+                ErrorMessage = "HTTP client not configured for Google search mode.",
+                Metadata = new Dictionary<string, string>
+                {
+                    ["query"] = query,
+                    ["provider"] = WebSearchProvider.GoogleApi.ToString()
+                }
+            };
         }
 
         var requestUri = new Uri($"https://www.googleapis.com/customsearch/v1?key={_apiKey}&cx={_searchEngineId}&q={Uri.EscapeDataString(query)}");
@@ -114,7 +182,8 @@ public sealed class WebSearchTool : ITool, IDisposable
 
             var metadata = new Dictionary<string, string>
             {
-                ["query"] = query
+                ["query"] = query,
+                ["provider"] = WebSearchProvider.GoogleApi.ToString()
             };
 
             if (root.TryGetProperty("searchInformation", out JsonElement searchInfo) && searchInfo.TryGetProperty("totalResults", out JsonElement totalResults))
@@ -122,22 +191,15 @@ public sealed class WebSearchTool : ITool, IDisposable
                 metadata["totalResults"] = totalResults.GetString() ?? string.Empty;
             }
 
-            var result = new ToolExecutionResult
+            string output = outputBuilder.Length == 0 ? "No results found." : outputBuilder.ToString().Trim();
+            return new ToolExecutionResult
             {
                 ToolName = Name,
                 Success = true,
-                Output = outputBuilder.Length == 0 ? "No results found." : outputBuilder.ToString().Trim(),
+                Output = output,
                 Citations = citations,
                 Metadata = metadata
             };
-
-            if (_cacheService is not null && result.Success)
-            {
-                await _cacheService.SetAsync(cacheKey, result, TimeSpan.FromMinutes(30), cancellationToken).ConfigureAwait(false);
-                _logger.LogDebug("Cached web search result for query '{Query}'.", query);
-            }
-
-            return result;
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
         {
@@ -149,7 +211,101 @@ public sealed class WebSearchTool : ITool, IDisposable
                 ErrorMessage = $"Web search failed: {ex.Message}",
                 Metadata = new Dictionary<string, string>
                 {
-                    ["query"] = query
+                    ["query"] = query,
+                    ["provider"] = WebSearchProvider.GoogleApi.ToString()
+                }
+            };
+        }
+    }
+
+    private async Task<ToolExecutionResult> ExecuteComputerUseAsync(string query, CancellationToken cancellationToken)
+    {
+        if (_computerUseService is null)
+        {
+            return new ToolExecutionResult
+            {
+                ToolName = Name,
+                Success = false,
+                ErrorMessage = "Computer-use search service is not configured.",
+                Metadata = new Dictionary<string, string>
+                {
+                    ["query"] = query,
+                    ["provider"] = WebSearchProvider.ComputerUse.ToString()
+                }
+            };
+        }
+
+        try
+        {
+            ComputerUseSearchResult searchResult = await _computerUseService.SearchAsync(query, cancellationToken).ConfigureAwait(false);
+            if (searchResult.Items.Count == 0)
+            {
+                return new ToolExecutionResult
+                {
+                    ToolName = Name,
+                    Success = false,
+                    ErrorMessage = "No results found via computer-use search.",
+                    Metadata = new Dictionary<string, string>
+                    {
+                        ["query"] = query,
+                        ["provider"] = WebSearchProvider.ComputerUse.ToString()
+                    }
+                };
+            }
+
+            var citations = new List<SourceCitation>();
+            var outputBuilder = new StringBuilder();
+            int index = 1;
+            foreach (var item in searchResult.Items.Take(5))
+            {
+                citations.Add(new SourceCitation($"cus:{index}", item.Title, item.Url, item.Snippet));
+                outputBuilder.AppendLine($"{index}. {item.Title}");
+                outputBuilder.AppendLine(item.Url);
+                if (!string.IsNullOrWhiteSpace(item.Snippet))
+                {
+                    outputBuilder.AppendLine(item.Snippet);
+                }
+                outputBuilder.AppendLine();
+                index++;
+            }
+
+            var metadata = new Dictionary<string, string>
+            {
+                ["query"] = query,
+                ["provider"] = WebSearchProvider.ComputerUse.ToString()
+            };
+
+            if (!string.IsNullOrWhiteSpace(searchResult.FinalUrl))
+            {
+                metadata["finalUrl"] = searchResult.FinalUrl;
+            }
+
+            if (searchResult.Transcript.Count > 0)
+            {
+                metadata["steps"] = string.Join(" | ", searchResult.Transcript.Take(8));
+            }
+
+            return new ToolExecutionResult
+            {
+                ToolName = Name,
+                Success = true,
+                Output = outputBuilder.ToString().Trim(),
+                Citations = citations,
+                Metadata = metadata
+            };
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or PlaywrightException or InvalidOperationException)
+        {
+            _logger.LogWarning(ex, "Computer-use search failed for query '{Query}'.", query);
+            return new ToolExecutionResult
+            {
+                ToolName = Name,
+                Success = false,
+                ErrorMessage = $"Computer-use search failed: {ex.Message}",
+                Metadata = new Dictionary<string, string>
+                {
+                    ["query"] = query,
+                    ["provider"] = WebSearchProvider.ComputerUse.ToString()
                 }
             };
         }
@@ -159,7 +315,7 @@ public sealed class WebSearchTool : ITool, IDisposable
     {
         if (_ownsHttpClient)
         {
-            _httpClient.Dispose();
+            _httpClient?.Dispose();
         }
     }
 }

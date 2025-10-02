@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.IO;
 using Microsoft.Extensions.Configuration;
@@ -44,6 +45,39 @@ public static class Settings
             return value.Trim();
         }
 
+        string? providerRaw = configuration["WEB_SEARCH_PROVIDER"];
+        WebSearchProvider provider = WebSearchProvider.GoogleApi;
+        if (!string.IsNullOrWhiteSpace(providerRaw) &&
+            !Enum.TryParse(providerRaw.Trim(), ignoreCase: true, out provider))
+        {
+            missing.Add("WEB_SEARCH_PROVIDER");
+            provider = WebSearchProvider.GoogleApi;
+        }
+
+        string googleApiKey = configuration["GOOGLE_API_KEY"]?.Trim() ?? string.Empty;
+        string googleSearchEngineId = configuration["GOOGLE_SEARCH_ENGINE_ID"]?.Trim() ?? string.Empty;
+        string? computerUseDeployment = configuration["AZURE_OPENAI_COMPUTER_USE_DEPLOYMENT"]?.Trim();
+
+        if (provider == WebSearchProvider.GoogleApi)
+        {
+            if (string.IsNullOrWhiteSpace(googleApiKey))
+            {
+                missing.Add("GOOGLE_API_KEY");
+            }
+
+            if (string.IsNullOrWhiteSpace(googleSearchEngineId))
+            {
+                missing.Add("GOOGLE_SEARCH_ENGINE_ID");
+            }
+        }
+        else if (provider == WebSearchProvider.ComputerUse)
+        {
+            if (string.IsNullOrWhiteSpace(computerUseDeployment))
+            {
+                missing.Add("AZURE_OPENAI_COMPUTER_USE_DEPLOYMENT");
+            }
+        }
+
         var settings = new AppSettings
         {
             AzureOpenAiEndpoint = ReadRequired("AZURE_OPENAI_ENDPOINT"),
@@ -54,8 +88,10 @@ public static class Settings
             CosmosConnectionString = ReadRequired("COSMOS_CONN_STRING"),
             CognitiveServicesEndpoint = ReadRequired("COGNITIVE_SERVICES_ENDPOINT"),
             CognitiveServicesApiKey = ReadRequired("COGNITIVE_SERVICES_API_KEY"),
-            GoogleApiKey = ReadRequired("GOOGLE_API_KEY"),
-            GoogleSearchEngineId = ReadRequired("GOOGLE_SEARCH_ENGINE_ID"),
+            GoogleApiKey = googleApiKey,
+            GoogleSearchEngineId = googleSearchEngineId,
+            AzureOpenAiComputerUseDeployment = computerUseDeployment,
+            WebSearchProvider = provider,
             CacheDirectory = ResolveDirectory(configuration["CACHE_DIRECTORY"], Path.Combine("debug", "cache")),
             ReportsDirectory = ResolveDirectory(configuration["REPORTS_DIRECTORY"], Path.Combine("debug", "reports")),
             PrimaryResearchObjective = configuration["PRIMARY_RESEARCH_OBJECTIVE"]?.Trim()
@@ -100,6 +136,8 @@ public static class Settings
         public required string CognitiveServicesApiKey { get; init; }
         public required string GoogleApiKey { get; init; }
         public required string GoogleSearchEngineId { get; init; }
+        public string? AzureOpenAiComputerUseDeployment { get; init; }
+        public WebSearchProvider WebSearchProvider { get; init; } = WebSearchProvider.GoogleApi;
         public required string CacheDirectory { get; init; }
         public required string ReportsDirectory { get; init; }
         public string? PrimaryResearchObjective { get; init; }

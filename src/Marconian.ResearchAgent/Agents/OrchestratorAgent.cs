@@ -17,6 +17,7 @@ using Marconian.ResearchAgent.Services.OpenAI;
 using Marconian.ResearchAgent.Services.OpenAI.Models;
 using Marconian.ResearchAgent.Synthesis;
 using Marconian.ResearchAgent.Tools;
+using Marconian.ResearchAgent.Tracking;
 using Marconian.ResearchAgent.Utilities;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -35,6 +36,7 @@ public sealed class OrchestratorAgent : IAgent
     private readonly ILogger<OrchestratorAgent> _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ICacheService? _cacheService;
+    private readonly ResearchFlowTracker? _flowTracker;
     private readonly int _maxRevisionPasses;
     private readonly JsonSerializerOptions _revisionOptions = new(JsonSerializerDefaults.Web)
     {
@@ -51,6 +53,7 @@ public sealed class OrchestratorAgent : IAgent
         ILogger<OrchestratorAgent>? logger = null,
         ILoggerFactory? loggerFactory = null,
         ICacheService? cacheService = null,
+        ResearchFlowTracker? flowTracker = null,
         string? reportsDirectory = null,
         int maxReportRevisionPasses = 2)
     {
@@ -69,12 +72,15 @@ public sealed class OrchestratorAgent : IAgent
         _logger = logger ?? NullLogger<OrchestratorAgent>.Instance;
         _loggerFactory = loggerFactory ?? NullLoggerFactory.Instance;
         _cacheService = cacheService;
+        _flowTracker = flowTracker;
         _maxRevisionPasses = Math.Max(0, maxReportRevisionPasses);
     }
 
     public async Task<AgentExecutionResult> ExecuteTaskAsync(AgentTask task, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(task);
+        string diagramPath = Path.Combine(_reportsDirectory, $"flow_{task.ResearchSessionId}_{DateTimeOffset.UtcNow:yyyyMMdd_HHmmss}.md");
+        _flowTracker?.ConfigureSession(task.ResearchSessionId, task.Objective ?? string.Empty, diagramPath);
 
         ResearchPlan? plan = null;
         List<ResearchBranchResult> branchResults = new();
@@ -90,6 +96,7 @@ public sealed class OrchestratorAgent : IAgent
 
             CurrentState = OrchestratorState.Planning;
             plan = await GeneratePlanAsync(task, cancellationToken).ConfigureAwait(false);
+            _flowTracker?.RecordPlan(plan);
             _logger.LogInformation("Generated research plan with {BranchCount} branches.", plan.Branches.Count);
             await _longTermMemoryManager.UpsertSessionStateAsync(
                 task.ResearchSessionId,
@@ -109,6 +116,7 @@ public sealed class OrchestratorAgent : IAgent
                 cancellationToken).ConfigureAwait(false);
 
             aggregationResult = _aggregator.Aggregate(branchResults);
+            _flowTracker?.RecordAggregation(aggregationResult.Findings.Count);
 
             CurrentState = OrchestratorState.SynthesizingResults;
             synthesis = await SynthesizeAsync(task, plan, aggregationResult, cancellationToken).ConfigureAwait(false);
@@ -120,6 +128,7 @@ public sealed class OrchestratorAgent : IAgent
 
             CurrentState = OrchestratorState.GeneratingReport;
             reportPath = await GenerateReportAsync(task, aggregationResult, synthesis, cancellationToken).ConfigureAwait(false);
+            _flowTracker?.RecordReportDraft(reportPath);
             _logger.LogInformation("Initial report generated at {ReportPath}.", reportPath);
 
             revisionsApplied = await ReviseReportAsync(task, aggregationResult, reportPath, cancellationToken).ConfigureAwait(false);
@@ -144,7 +153,12 @@ public sealed class OrchestratorAgent : IAgent
                 memoryType: "final_report_finding",
                 cancellationToken: cancellationToken).ConfigureAwait(false);
 
-            string finalReportContent = await File.ReadAllTextAsync(reportPath ?? string.Empty, cancellationToken).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(reportPath))
+            {
+                throw new InvalidOperationException("Report generation completed without producing a file path.");
+            }
+
+            string finalReportContent = await File.ReadAllTextAsync(reportPath, cancellationToken).ConfigureAwait(false);
 
             await _longTermMemoryManager.StoreDocumentAsync(
                 task.ResearchSessionId,
@@ -166,6 +180,10 @@ public sealed class OrchestratorAgent : IAgent
 
             CurrentState = OrchestratorState.Completed;
 
+            if (!string.IsNullOrWhiteSpace(reportPath))
+            {
+                _flowTracker?.RecordArtifacts(reportPath);
+            }
             return new AgentExecutionResult
             {
                 Success = true,
@@ -208,8 +226,15 @@ public sealed class OrchestratorAgent : IAgent
                 }
             };
         }
-    }
 
+        finally
+        {
+            if (_flowTracker is not null)
+            {
+                await _flowTracker.SaveAsync(cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
     private async Task<ResearchPlan> GeneratePlanAsync(AgentTask task, CancellationToken cancellationToken)
     {
         var request = new OpenAiChatRequest(
@@ -249,6 +274,7 @@ public sealed class OrchestratorAgent : IAgent
         {
             branchTasks.Add(Task.Run(async () =>
             {
+                _flowTracker?.RecordBranchStarted(branch.BranchId);
                 await _longTermMemoryManager.UpsertBranchStateAsync(
                     task.ResearchSessionId,
                     branch.BranchId,
@@ -276,10 +302,12 @@ public sealed class OrchestratorAgent : IAgent
                         _toolFactory(),
                         _chatDeploymentName,
                         _cacheService,
+                        _flowTracker,
                         researcherLogger,
                         shortTermLogger);
 
                     AgentExecutionResult result = await researcher.ExecuteTaskAsync(branchTask, cancellationToken).ConfigureAwait(false);
+                    _flowTracker?.RecordBranchCompleted(branch.BranchId, result.Success, result.Summary);
 
                     branch.Status = result.Success ? ResearchBranchStatus.Completed : ResearchBranchStatus.Failed;
 
@@ -310,6 +338,8 @@ public sealed class OrchestratorAgent : IAgent
                 {
                     branch.Status = ResearchBranchStatus.Failed;
                     _logger.LogError(ex, "Branch {BranchId} failed.", branch.BranchId);
+                    _flowTracker?.RecordBranchNote(branch.BranchId, $"Exception: {ex.Message}");
+                    _flowTracker?.RecordBranchCompleted(branch.BranchId, false, ex.Message);
 
                     results.Add(new ResearchBranchResult
                     {
@@ -425,10 +455,12 @@ public sealed class OrchestratorAgent : IAgent
             if (!modified)
             {
                 _logger.LogDebug("Report revision pass {Pass} instructions could not be applied.", pass);
+                _flowTracker?.RecordReportRevision(pass, applied: false);
                 break;
             }
 
             editor.Save(reportPath);
+            _flowTracker?.RecordReportRevision(pass, applied: true);
             appliedPasses = pass;
         }
 
@@ -540,4 +572,19 @@ public sealed class OrchestratorAgent : IAgent
         public string Content { get; set; } = string.Empty;
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
