@@ -80,7 +80,7 @@
 ## M12 - Research Flow Visualization
 - [x] Wire ResearchFlowTracker throughout orchestrator/researcher lifecycle
 - [x] Ensure flow diagram files are emitted alongside report artifacts
-- [ ] Document flow tracking behavior and update specs/user requests
+- [x] Document flow tracking behavior and update specs/user requests
 ## Documentation & Patterns
 - [x] Update `docs/specs.md` if architecture adjustments arise (with justification)
 - [x] Capture architectural patterns in `docs/architectural_patterns.md` when stabilized
@@ -88,6 +88,7 @@
 - [x] Review `docs/user_requests.md` at each working session and update plans/instructions as needed
 
 ## M10 - Cache Strategy Migration`n- [x] Remove Redis dependency from codebase and packages`n- [x] Introduce hybrid caching service using IMemoryCache and disk persistence`n- [x] Update memory and tool components to use the new cache abstraction`n- [x] Adjust configuration, documentation, and tests for disk-backed cache`n- [x] Configure cache directory path in appsettings.local.json for local development`n- [x] Add report output directory setting and wire default usage when CLI args omitted`n
+
 
 
 

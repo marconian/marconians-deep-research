@@ -5,7 +5,12 @@ This document outlines the development plan for creating 1.  **File Storage:** W
 
 ### 4.8. Report Generation
 1.  **Final Synthesis:** This is the last stage of the Orchestrator's pipeline.
-2.  **Structure Generation:** The agent will first generate an outline for the final report based on the synthesized findings.anced, autonomous deep research agent. The agent will be built as a .NET console application, designed for long-running, complex research tasks. It will leverage Azure services for its cognitive and memory functions and follow best practices for autonomous agent architecture.
+2.  **Structure Generation:** The agent will first generate an outline for the final report based on the synthesized findings.
+### 4.9. Flow Tracking and Visualization
+1.  **ResearchFlowTracker:** The orchestrator now records every major state transition (planning, branch execution, synthesis, report generation) into a flow tracker that emits Mermaid diagrams alongside the final Markdown report. Each branch, tool invocation, and revision pass is captured for post-run auditing.
+2.  **Mermaid Output:** Flow diagrams are written to the same directory as the report. They provide an at-a-glance view of branch fan-out, tool usage, and report iteration history, making it easier to debug long research sessions.
+3.  **Configuration:** Flow diagram output path mirrors the report directory and adopts CLI overrides. The tracker persists after each significant step so partially completed sessions still yield a diagram.
+anced, autonomous deep research agent. The agent will be built as a .NET console application, designed for long-running, complex research tasks. It will leverage Azure services for its cognitive and memory functions and follow best practices for autonomous agent architecture.
 
 ## 1. Vision & Core Principles
 
@@ -129,6 +134,11 @@ This architecture allows for massive parallelism, resilience, and specialization
 ### 4.8. Report Generation
 1.  **Final Synthesis:** This is the last stage of the Orchestrator's pipeline.
 2.  **Structure Generation:** The agent will first generate an outline for the final report based on the synthesized findings.
+### 4.9. Flow Tracking and Visualization
+1.  **ResearchFlowTracker:** The orchestrator now records every major state transition (planning, branch execution, synthesis, report generation) into a flow tracker that emits Mermaid diagrams alongside the final Markdown report. Each branch, tool invocation, and revision pass is captured for post-run auditing.
+2.  **Mermaid Output:** Flow diagrams are written to the same directory as the report. They provide an at-a-glance view of branch fan-out, tool usage, and report iteration history, making it easier to debug long research sessions.
+3.  **Configuration:** Flow diagram output path mirrors the report directory and adopts CLI overrides. The tracker persists after each significant step so partially completed sessions still yield a diagram.
+
 3.  **Content Writing:** It will then iterate through the outline, writing detailed content for each section, pulling in the evidence and synthesized knowledge from its memory.
 4.  **Citation Management:** As it writes, the agent will be prompted to include citations. The `Source` documents stored in Cosmos DB will be used to generate formatted citations (e.g., `[Source 1: URL]`).
 5.  **Output Format:** The final report will be saved as a Markdown file, allowing for rich formatting.
@@ -142,6 +152,7 @@ This architecture allows for massive parallelism, resilience, and specialization
 - **M5: Orchestrator & Branching.** Implement the Orchestrator and the logic for spawning and managing parallel `ResearcherAgent` tasks.
 - **M6: Synthesis & Reporting.** Develop the final report generation and citation capabilities.
 - **M7: Testing & Refinement.** End-to-end testing, performance tuning, and prompt engineering refinement.
+
 
 
 
