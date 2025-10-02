@@ -75,19 +75,31 @@
 - [x] Extend configuration to allow choosing between Google API and Azure computer-use deployment
 - [x] Implement computer-use driven search workflow with Playwright control and DOM extraction
 - [x] Update WebSearchTool to route to the selected search provider and ensure caching/logging
-- [ ] Add validation coverage for computer-use search mode (unit/integration as feasible)
+- [x] Add startup readiness probe to verify Playwright availability and emit a single warning on failure
+- [x] Provide configuration flag and runtime fallback to disable computer-use searches when browsers are missing
+- [x] Add validation coverage for computer-use search mode (unit/integration as feasible) — see `ComputerUseSearchServiceIntegrationTests`
 
 ## M12 - Research Flow Visualization
 - [x] Wire ResearchFlowTracker throughout orchestrator/researcher lifecycle
 - [x] Ensure flow diagram files are emitted alongside report artifacts
 - [x] Document flow tracking behavior and update specs/user requests
+
+## M13 - Operational Diagnostics
+- [x] Add CLI or scripted diagnostic path to enumerate Cosmos tool outputs for a session
+- [x] Document workflow for inspecting stored scrape content when computer-use is disabled
 ## Documentation & Patterns
 - [x] Update `docs/specs.md` if architecture adjustments arise (with justification)
 - [x] Capture architectural patterns in `docs/architectural_patterns.md` when stabilized
 
 - [x] Review `docs/user_requests.md` at each working session and update plans/instructions as needed
 
-## M10 - Cache Strategy Migration`n- [x] Remove Redis dependency from codebase and packages`n- [x] Introduce hybrid caching service using IMemoryCache and disk persistence`n- [x] Update memory and tool components to use the new cache abstraction`n- [x] Adjust configuration, documentation, and tests for disk-backed cache`n- [x] Configure cache directory path in appsettings.local.json for local development`n- [x] Add report output directory setting and wire default usage when CLI args omitted`n
+## M10 - Cache Strategy Migration
+- [x] Remove Redis dependency from codebase and packages
+- [x] Introduce hybrid caching service using IMemoryCache and disk persistence
+- [x] Update memory and tool components to use the new cache abstraction
+- [x] Adjust configuration, documentation, and tests for disk-backed cache
+- [x] Configure cache directory path in appsettings.local.json for local development
+- [x] Add report output directory setting and wire default usage when CLI args omitted
 
 
 

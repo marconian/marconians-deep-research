@@ -56,3 +56,6 @@
 
 [x] implement the use of the model `computer-use-preview` for browser exploration with Playwright (config key: AZURE_OPENAI_COMPUTER_USE_DEPLOYMENT). See documentation/manual `Computer Use Model Microsoft Documentation.md`. Also build in an option to choose in config between using the google api and using this model with Playwright for navigating Google and collecting search results. (completed 2025-10-01)
 
+[x] add a startup readiness probe for Playwright, cache a per-session disabled state, and fall back to Google-based search when the computer-use browsers are unavailable (completed 2025-10-02)
+[x] create a simple diagnostic path to review Cosmos-stored scrape outputs when computer-use mode is disabled (completed 2025-10-02)
+

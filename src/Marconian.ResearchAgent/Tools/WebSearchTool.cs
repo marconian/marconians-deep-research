@@ -21,7 +21,10 @@ public sealed class WebSearchTool : ITool, IDisposable
     private readonly string _apiKey;
     private readonly string _searchEngineId;
     private readonly ILogger<WebSearchTool> _logger;
-    private readonly WebSearchProvider _provider;
+    private readonly WebSearchProvider _requestedProvider;
+    private readonly WebSearchProvider _fallbackProvider;
+    private readonly string? _computerUseDisabledReason;
+    private bool _computerUseWarningIssued;
     private readonly ComputerUseSearchService? _computerUseService;
 
     public WebSearchTool(
@@ -31,13 +34,19 @@ public sealed class WebSearchTool : ITool, IDisposable
         HttpClient? httpClient = null,
         ILogger<WebSearchTool>? logger = null,
         WebSearchProvider provider = WebSearchProvider.GoogleApi,
-        ComputerUseSearchService? computerUseService = null)
+        ComputerUseSearchService? computerUseService = null,
+        WebSearchProvider? fallbackProvider = null,
+        string? computerUseDisabledReason = null)
     {
         _cacheService = cacheService;
         _logger = logger ?? NullLogger<WebSearchTool>.Instance;
-        _provider = provider;
+        _requestedProvider = provider;
+        _fallbackProvider = fallbackProvider ?? WebSearchProvider.GoogleApi;
+        _computerUseDisabledReason = string.IsNullOrWhiteSpace(computerUseDisabledReason)
+            ? null
+            : computerUseDisabledReason;
 
-        if (_provider == WebSearchProvider.GoogleApi)
+        if (_requestedProvider == WebSearchProvider.GoogleApi)
         {
             if (string.IsNullOrWhiteSpace(apiKey))
             {
@@ -70,7 +79,12 @@ public sealed class WebSearchTool : ITool, IDisposable
         {
             _apiKey = apiKey ?? string.Empty;
             _searchEngineId = searchEngineId ?? string.Empty;
-            _computerUseService = computerUseService ?? throw new ArgumentNullException(nameof(computerUseService), "Computer-use search service must be supplied when using the computer-use provider.");
+            if (computerUseService is null && string.IsNullOrWhiteSpace(_computerUseDisabledReason))
+            {
+                throw new ArgumentNullException(nameof(computerUseService), "Computer-use search service must be supplied when using the computer-use provider.");
+            }
+
+            _computerUseService = computerUseService;
             _httpClient = httpClient;
             _ownsHttpClient = false;
         }
@@ -78,9 +92,16 @@ public sealed class WebSearchTool : ITool, IDisposable
 
     public string Name => "WebSearch";
 
-    public string Description => _provider == WebSearchProvider.GoogleApi
-        ? "Searches the web using Google Custom Search API and returns curated links with snippets."
-        : "Searches the web using Azure computer-use automation (Playwright-controlled Google) and returns curated links with snippets.";
+    public string Description
+    {
+        get
+        {
+            WebSearchProvider provider = ResolveProvider();
+            return provider == WebSearchProvider.GoogleApi
+                ? "Searches the web using Google Custom Search API and returns curated links with snippets."
+                : "Searches the web using Azure computer-use automation (Playwright-controlled Google) and returns curated links with snippets.";
+        }
+    }
 
     public async Task<ToolExecutionResult> ExecuteAsync(ToolExecutionContext context, CancellationToken cancellationToken = default)
     {
@@ -101,19 +122,20 @@ public sealed class WebSearchTool : ITool, IDisposable
         }
 
         string normalizedQuery = query.Trim().ToLowerInvariant();
-        string cacheKey = $"tool:websearch:{_provider}:{normalizedQuery}";
+        WebSearchProvider provider = ResolveProvider();
+        string cacheKey = $"tool:websearch:{provider}:{normalizedQuery}";
 
         if (_cacheService is not null)
         {
             var cached = await _cacheService.GetAsync<ToolExecutionResult>(cacheKey, cancellationToken).ConfigureAwait(false);
             if (cached is not null && cached.Success)
             {
-                _logger.LogDebug("Returning cached web search result for query '{Query}' via provider {Provider}.", query, _provider);
+                _logger.LogDebug("Returning cached web search result for query '{Query}' via provider {Provider}.", query, provider);
                 return cached;
             }
         }
 
-        ToolExecutionResult result = _provider switch
+        ToolExecutionResult result = provider switch
         {
             WebSearchProvider.GoogleApi => await ExecuteGoogleAsync(query, cancellationToken).ConfigureAwait(false),
             WebSearchProvider.ComputerUse => await ExecuteComputerUseAsync(query, cancellationToken).ConfigureAwait(false),
@@ -121,14 +143,14 @@ public sealed class WebSearchTool : ITool, IDisposable
             {
                 ToolName = Name,
                 Success = false,
-                ErrorMessage = $"Unsupported search provider: {_provider}"
+                ErrorMessage = $"Unsupported search provider: {provider}"
             }
         };
 
         if (_cacheService is not null && result.Success)
         {
             await _cacheService.SetAsync(cacheKey, result, TimeSpan.FromMinutes(30), cancellationToken).ConfigureAwait(false);
-            _logger.LogDebug("Cached web search result for query '{Query}' using provider {Provider}.", query, _provider);
+            _logger.LogDebug("Cached web search result for query '{Query}' using provider {Provider}.", query, provider);
         }
 
         return result;
@@ -226,7 +248,24 @@ public sealed class WebSearchTool : ITool, IDisposable
             {
                 ToolName = Name,
                 Success = false,
-                ErrorMessage = "Computer-use search service is not configured.",
+                ErrorMessage = _computerUseDisabledReason is not null
+                    ? $"Computer-use search is disabled: {_computerUseDisabledReason}"
+                    : "Computer-use search service is not configured.",
+                Metadata = new Dictionary<string, string>
+                {
+                    ["query"] = query,
+                    ["provider"] = WebSearchProvider.ComputerUse.ToString()
+                }
+            };
+        }
+
+        if (_computerUseDisabledReason is not null)
+        {
+            return new ToolExecutionResult
+            {
+                ToolName = Name,
+                Success = false,
+                ErrorMessage = $"Computer-use search is disabled: {_computerUseDisabledReason}",
                 Metadata = new Dictionary<string, string>
                 {
                     ["query"] = query,
@@ -240,16 +279,31 @@ public sealed class WebSearchTool : ITool, IDisposable
             ComputerUseSearchResult searchResult = await _computerUseService.SearchAsync(query, cancellationToken).ConfigureAwait(false);
             if (searchResult.Items.Count == 0)
             {
+                string transcriptSummary = searchResult.Transcript.Count == 0 ? "<empty>" : string.Join(" | ", searchResult.Transcript.Take(8));
+                _logger.LogWarning("Computer-use search returned no DOM items for query '{Query}'. Transcript={Transcript}. FinalUrl={Url}", query, transcriptSummary, searchResult.FinalUrl);
+
+                var failureMetadata = new Dictionary<string, string>
+                {
+                    ["query"] = query,
+                    ["provider"] = WebSearchProvider.ComputerUse.ToString()
+                };
+
+                if (!string.IsNullOrWhiteSpace(searchResult.FinalUrl))
+                {
+                    failureMetadata["finalUrl"] = searchResult.FinalUrl;
+                }
+
+                if (searchResult.Transcript.Count > 0)
+                {
+                    failureMetadata["steps"] = transcriptSummary;
+                }
+
                 return new ToolExecutionResult
                 {
                     ToolName = Name,
                     Success = false,
                     ErrorMessage = "No results found via computer-use search.",
-                    Metadata = new Dictionary<string, string>
-                    {
-                        ["query"] = query,
-                        ["provider"] = WebSearchProvider.ComputerUse.ToString()
-                    }
+                    Metadata = failureMetadata
                 };
             }
 
@@ -294,6 +348,23 @@ public sealed class WebSearchTool : ITool, IDisposable
                 Metadata = metadata
             };
         }
+        catch (ComputerUseSearchBlockedException blockedEx)
+        {
+            _logger.LogWarning(blockedEx, "Computer-use search was blocked by a CAPTCHA challenge for query '{Query}'.", query);
+
+            return new ToolExecutionResult
+            {
+                ToolName = Name,
+                Success = false,
+                ErrorMessage = "Computer-use search was blocked by a CAPTCHA challenge from Bing. Falling back to an alternative provider is recommended.",
+                Metadata = new Dictionary<string, string>
+                {
+                    ["query"] = query,
+                    ["provider"] = WebSearchProvider.ComputerUse.ToString(),
+                    ["blockReason"] = blockedEx.Message
+                }
+            };
+        }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or PlaywrightException or InvalidOperationException)
         {
             _logger.LogWarning(ex, "Computer-use search failed for query '{Query}'.", query);
@@ -317,6 +388,42 @@ public sealed class WebSearchTool : ITool, IDisposable
         {
             _httpClient?.Dispose();
         }
+    }
+
+    private WebSearchProvider ResolveProvider()
+    {
+        if (_requestedProvider != WebSearchProvider.ComputerUse)
+        {
+            return _requestedProvider;
+        }
+
+        if (_computerUseDisabledReason is null && _computerUseService is not null)
+        {
+            return WebSearchProvider.ComputerUse;
+        }
+
+        if (_fallbackProvider == WebSearchProvider.GoogleApi && HasGoogleCredentials())
+        {
+            LogComputerUseDisabledIfNeeded();
+            return WebSearchProvider.GoogleApi;
+        }
+
+        LogComputerUseDisabledIfNeeded();
+        return WebSearchProvider.ComputerUse;
+    }
+
+    private bool HasGoogleCredentials() => !string.IsNullOrWhiteSpace(_apiKey) && !string.IsNullOrWhiteSpace(_searchEngineId);
+
+    private void LogComputerUseDisabledIfNeeded()
+    {
+        if (_computerUseWarningIssued)
+        {
+            return;
+        }
+
+        string reason = _computerUseDisabledReason ?? "Playwright computer-use provider was not initialized.";
+        _logger.LogWarning("Computer-use search is unavailable: {Reason}.", reason);
+        _computerUseWarningIssued = true;
     }
 }
 

@@ -78,6 +78,7 @@ This architecture allows for massive parallelism, resilience, and specialization
     - `COGNITIVE_SERVICES_API_KEY`
     - `GOOGLE_API_KEY`
     - `GOOGLE_SEARCH_ENGINE_ID`
+    - `[Optional] COMPUTER_USE_ENABLED` (set to `false` to skip Playwright/computer-use search and force Google API mode)
     - `[Optional] PRIMARY_RESEARCH_OBJECTIVE` (default question when CLI args are omitted)
     - `[Optional] CACHE_DIRECTORY` (overrides the default `debug/cache` relative path)
     - `[Optional] REPORTS_DIRECTORY` (overrides the default `debug/reports` relative path)
@@ -138,6 +139,11 @@ This architecture allows for massive parallelism, resilience, and specialization
 1.  **ResearchFlowTracker:** The orchestrator now records every major state transition (planning, branch execution, synthesis, report generation) into a flow tracker that emits Mermaid diagrams alongside the final Markdown report. Each branch, tool invocation, and revision pass is captured for post-run auditing.
 2.  **Mermaid Output:** Flow diagrams are written to the same directory as the report. They provide an at-a-glance view of branch fan-out, tool usage, and report iteration history, making it easier to debug long research sessions.
 3.  **Configuration:** Flow diagram output path mirrors the report directory and adopts CLI overrides. The tracker persists after each significant step so partially completed sessions still yield a diagram.
+
+### 4.10. Operational Diagnostics
+1.  **Session dump CLI:** The console application exposes `--dump-session <sessionId>` to export long-term memory artifacts (defaulting to `tool_output::WebScraper` records) into Markdown files for offline review.
+2.  **Filtering & Limits:** Optional flags `--dump-type`, `--dump-dir`, and `--dump-limit` customize which records are exported, where they land on disk, and how many entries are collected.
+3.  **Use Cases:** This path lets operators review previously scraped HTML payloads even when Playwright/computer-use tooling is disabled on the current machine.
 
 3.  **Content Writing:** It will then iterate through the outline, writing detailed content for each section, pulling in the evidence and synthesized knowledge from its memory.
 4.  **Citation Management:** As it writes, the agent will be prompted to include citations. The `Source` documents stored in Cosmos DB will be used to generate formatted citations (e.g., `[Source 1: URL]`).

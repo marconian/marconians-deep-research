@@ -57,6 +57,14 @@ public static class Settings
         string googleApiKey = configuration["GOOGLE_API_KEY"]?.Trim() ?? string.Empty;
         string googleSearchEngineId = configuration["GOOGLE_SEARCH_ENGINE_ID"]?.Trim() ?? string.Empty;
         string? computerUseDeployment = configuration["AZURE_OPENAI_COMPUTER_USE_DEPLOYMENT"]?.Trim();
+        bool computerUseEnabled = true;
+
+        string? computerUseEnabledRaw = configuration["COMPUTER_USE_ENABLED"]?.Trim();
+        if (!string.IsNullOrWhiteSpace(computerUseEnabledRaw) &&
+            !bool.TryParse(computerUseEnabledRaw, out computerUseEnabled))
+        {
+            throw new InvalidOperationException("COMPUTER_USE_ENABLED must be either 'true' or 'false'.");
+        }
 
         if (provider == WebSearchProvider.GoogleApi)
         {
@@ -92,6 +100,7 @@ public static class Settings
             GoogleSearchEngineId = googleSearchEngineId,
             AzureOpenAiComputerUseDeployment = computerUseDeployment,
             WebSearchProvider = provider,
+            ComputerUseEnabled = computerUseEnabled,
             CacheDirectory = ResolveDirectory(configuration["CACHE_DIRECTORY"], Path.Combine("debug", "cache")),
             ReportsDirectory = ResolveDirectory(configuration["REPORTS_DIRECTORY"], Path.Combine("debug", "reports")),
             PrimaryResearchObjective = configuration["PRIMARY_RESEARCH_OBJECTIVE"]?.Trim()
@@ -138,6 +147,7 @@ public static class Settings
         public required string GoogleSearchEngineId { get; init; }
         public string? AzureOpenAiComputerUseDeployment { get; init; }
         public WebSearchProvider WebSearchProvider { get; init; } = WebSearchProvider.GoogleApi;
+        public bool ComputerUseEnabled { get; init; } = true;
         public required string CacheDirectory { get; init; }
         public required string ReportsDirectory { get; init; }
         public string? PrimaryResearchObjective { get; init; }

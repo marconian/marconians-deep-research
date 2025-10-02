@@ -175,7 +175,7 @@ public sealed class CosmosMemoryService : ICosmosMemoryService
 
         var query = new QueryDefinition(
             "SELECT TOP @limit c, VectorDistance(c.embedding, @embedding) AS distance " +
-            "FROM c WHERE c.researchSessionId = @session ORDER BY distance")
+            "FROM c WHERE c.researchSessionId = @session ORDER BY VectorDistance(c.embedding, @embedding)")
             .WithParameter("@limit", Math.Max(1, limit))
             .WithParameter("@embedding", embedding)
             .WithParameter("@session", researchSessionId);
@@ -200,8 +200,8 @@ public sealed class CosmosMemoryService : ICosmosMemoryService
                         continue;
                     }
 
-                    double similarity = 1d - item.Distance;
-                    similarity = Math.Clamp(similarity, -1d, 1d);
+                    double distance = Math.Max(0d, item.Distance);
+                    double similarity = 1d - Math.Min(2d, distance);
                     results.Add(new MemorySearchResult(item.Record, similarity));
 
                     if (results.Count >= limit)

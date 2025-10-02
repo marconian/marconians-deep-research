@@ -1,10 +1,13 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Marconian.ResearchAgent.Configuration;
@@ -45,6 +48,67 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
         ["super"] = "Meta",
         ["option"] = "Alt"
     };
+
+    private static readonly string[] ConsentButtonSelectors =
+    {
+        // Bing specific
+        "#bnp_btn_reject",
+        "#bnp_btn_decline",
+        "button#bnp_btn_reject",
+        "button#bnp_btn_decline",
+        // Generic reject / decline
+        "button[aria-label*='Reject' i]",
+        "button[aria-label*='Decline' i]",
+        "button:has-text(\"Reject\")",
+        "button:has-text(\"Decline\")",
+        "button:has-text(\"No thanks\")",
+        "button:has-text(\"Not now\")",
+        // Google specific (EU consent screens)
+        "button:has-text(\"Reject all\")",
+        "button[aria-label*='Reject all' i]",
+        "button:has-text(\"I do not agree\")",
+        // Fallback acceptance (only if reject not present)
+        "button:has-text(\"Accept all\")",
+        "button[aria-label*='Accept all' i]"
+    };
+
+    private static readonly Regex[] ConsentButtonNamePatterns =
+    {
+        new("reject all", RegexOptions.IgnoreCase | RegexOptions.Compiled),
+        new("reject", RegexOptions.IgnoreCase | RegexOptions.Compiled),
+        new("decline", RegexOptions.IgnoreCase | RegexOptions.Compiled),
+        new("no thanks", RegexOptions.IgnoreCase | RegexOptions.Compiled),
+        new("not now", RegexOptions.IgnoreCase | RegexOptions.Compiled),
+        new("accept all", RegexOptions.IgnoreCase | RegexOptions.Compiled) // fallback if reject unavailable
+    };
+
+    private const string ConsentDismissScript = @"() => {
+        const selectors = ['#bnp_btn_reject', '#bnp_btn_decline', '[aria-label*=""Reject"" i]', '[aria-label*=""Decline"" i]'];
+        for (const selector of selectors) {
+            const el = document.querySelector(selector);
+            if (el) {
+                el.click();
+                return true;
+            }
+        }
+
+        const candidates = Array.from(document.querySelectorAll('button, a, span, div'));
+        const target = candidates.find(el => {
+            const text = (el.textContent || '').trim().toLowerCase();
+            if (!text) {
+                return false;
+            }
+
+            return text.includes('reject') || text.includes('decline') || text.includes('no thanks') || text.includes('not now');
+        });
+
+        if (target) {
+            target.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            return true;
+        }
+
+        return false;
+    }";
 
     private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.Web)
     {
@@ -124,7 +188,8 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
             }).ConfigureAwait(false);
 
             _page = await _context.NewPageAsync().ConfigureAwait(false);
-            await _page.GotoAsync("https://www.google.com", new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded }).ConfigureAwait(false);
+            // Use Google NCR (no country redirect) to reduce regional consent variance.
+            await _page.GotoAsync("https://www.google.com/ncr", new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded }).ConfigureAwait(false);
             _initialized = true;
         }
         finally
@@ -170,7 +235,8 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
                 _logger.LogWarning("Computer-use search for query '{Query}' reached iteration limit before completion.", query);
             }
 
-            IReadOnlyList<ComputerUseSearchResultItem> items = await ExtractResultsAsync(cancellationToken).ConfigureAwait(false);
+            await EnsureSearchResultsAsync(query, cancellationToken).ConfigureAwait(false);
+            IReadOnlyList<ComputerUseSearchResultItem> items = await ExtractResultsAsync(query, transcript, cancellationToken).ConfigureAwait(false);
             string? finalUrl = _page.Url;
             return new ComputerUseSearchResult(items, transcript.ToArray(), finalUrl);
         }
@@ -196,7 +262,8 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
             return;
         }
 
-        await _page.GotoAsync("https://www.google.com", new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded }).ConfigureAwait(false);
+    await _page.GotoAsync("https://www.google.com/ncr", new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded }).ConfigureAwait(false);
+        await DismissConsentAsync(cancellationToken).ConfigureAwait(false);
         await _page.BringToFrontAsync().ConfigureAwait(false);
         await Task.Delay(250, cancellationToken).ConfigureAwait(false);
     }
@@ -216,7 +283,7 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
                         new JsonObject
                         {
                             ["type"] = "input_text",
-                            ["text"] = $"Use Google Search to gather the top five organic results for \"{query}\". Avoid ads."
+                            ["text"] = $"Use Google Search to gather the top five organic results for \"{query}\". Avoid ads and sponsored listings."
                         },
                         new JsonObject
                         {
@@ -226,13 +293,14 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
                     }
                 }
             },
-            ["instructions"] = "You control a Chromium browser. Execute actions one at a time, reviewing a screenshot after each step. Stop once Google results are visible so the host application can read them.",
+            ["instructions"] = "You control a Chromium browser. Execute actions one at a time, reviewing a screenshot after each step. Stop once Google search results are visible so the host application can read them.",
             ["tools"] = BuildToolsArray(),
             ["reasoning"] = new JsonObject { ["generate_summary"] = "concise" },
             ["temperature"] = 0.2,
             ["top_p"] = 0.8,
             ["truncation"] = "auto"
         };
+        payload["model"] = _deployment;
 
         using JsonDocument response = await SendRequestAsync(payload, cancellationToken).ConfigureAwait(false);
         return ParseResponse(response, transcript);
@@ -289,6 +357,7 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
             ["previous_response_id"] = previous.ResponseId,
             ["truncation"] = "auto"
         };
+        payload["model"] = _deployment;
 
         using JsonDocument response = await SendRequestAsync(payload, cancellationToken).ConfigureAwait(false);
         return ParseResponse(response, transcript);
@@ -310,25 +379,50 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
 
     private async Task<JsonDocument> SendRequestAsync(JsonNode payload, CancellationToken cancellationToken)
     {
-        string uri = $"{_endpoint}openai/deployments/{_deployment}/responses?api-version={ResponsesApiVersion}";
         string body = payload.ToJsonString(SerializerOptions);
 
-        using var request = new HttpRequestMessage(HttpMethod.Post, uri)
+        var endpoints = new (string Uri, bool AppendApiVersion, string Tag)[]
         {
-            Content = new StringContent(body, Encoding.UTF8, "application/json")
+            ($"{_endpoint}openai/v1/responses", false, "unified"),
+            ($"{_endpoint}openai/deployments/{_deployment}/responses", true, "deployment")
         };
-        request.Headers.Add("api-key", _apiKey);
 
-        using HttpResponseMessage response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
-        string responseContent = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-
-        if (!response.IsSuccessStatusCode)
+        for (int index = 0; index < endpoints.Length; index++)
         {
-            _logger.LogWarning("Computer-use responses call failed with status {Status}: {Body}", response.StatusCode, responseContent);
-            response.EnsureSuccessStatusCode();
+            (string baseUri, bool appendApiVersion, string tag) = endpoints[index];
+            string uri = appendApiVersion ? $"{baseUri}?api-version={ResponsesApiVersion}" : baseUri;
+            using var request = new HttpRequestMessage(HttpMethod.Post, uri)
+            {
+                Content = new StringContent(body, Encoding.UTF8, "application/json")
+            };
+            request.Headers.Add("api-key", _apiKey);
+
+            using HttpResponseMessage response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+            string responseContent = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+
+            if (response.IsSuccessStatusCode)
+            {
+                if (index > 0)
+                {
+                    _logger.LogInformation("Computer-use request succeeded after falling back to {Tag} endpoint.", tag);
+                }
+
+                return JsonDocument.Parse(responseContent);
+            }
+
+            bool canRetry = index < endpoints.Length - 1 &&
+                (response.StatusCode == HttpStatusCode.NotFound ||
+                 (response.StatusCode == HttpStatusCode.BadRequest && responseContent.Contains("API version not supported", StringComparison.OrdinalIgnoreCase)));
+
+            _logger.LogWarning("Computer-use responses call to {Tag} endpoint failed with status {Status}: {Body}", tag, response.StatusCode, responseContent);
+
+            if (!canRetry)
+            {
+                response.EnsureSuccessStatusCode();
+            }
         }
 
-        return JsonDocument.Parse(responseContent);
+        throw new InvalidOperationException("Computer-use request failed for all configured endpoints.");
     }
 
     private ComputerUseResponseState ParseResponse(JsonDocument document, List<string> transcript)
@@ -670,60 +764,89 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
         }
     }
 
-    private async Task<IReadOnlyList<ComputerUseSearchResultItem>> ExtractResultsAsync(CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<ComputerUseSearchResultItem>> ExtractResultsAsync(string query, IReadOnlyList<string> transcript, CancellationToken cancellationToken)
     {
         if (_page is null)
         {
             return Array.Empty<ComputerUseSearchResultItem>();
         }
 
+        await ThrowIfCaptchaDetectedAsync(query, cancellationToken).ConfigureAwait(false);
+
         const string script = @"(() => {
-            const results = [];
-            const candidates = document.querySelectorAll('div.g');
-            for (const candidate of candidates) {
-                const titleNode = candidate.querySelector('h3');
-                const linkNode = candidate.querySelector('a');
+            const serializeResult = (titleNode, linkNode, snippetNode) => {
                 if (!titleNode || !linkNode) {
-                    continue;
+                    return null;
                 }
                 const title = titleNode.innerText.trim();
                 const url = linkNode.href;
                 if (!title || !url) {
+                    return null;
+                }
+                const snippet = snippetNode ? snippetNode.innerText.trim() : '';
+                return { title, url, snippet };
+            };
+
+            const results = [];
+
+            const googleCandidates = document.querySelectorAll('div.g');
+            for (const candidate of googleCandidates) {
+                const record = serializeResult(
+                    candidate.querySelector('h3'),
+                    candidate.querySelector('a'),
+                    candidate.querySelector('div.VwiC3b, span.aCOpRe, .MUxGbd, .zCubwf')
+                );
+                if (!record) {
                     continue;
                 }
-                const snippetNode = candidate.querySelector('div.VwiC3b') || candidate.querySelector('span.aCOpRe') || candidate.querySelector('.MUxGbd') || candidate.querySelector('.zCubwf');
-                const snippet = snippetNode ? snippetNode.innerText.trim() : '';
-                results.push({ title, url, snippet });
+                results.push(record);
                 if (results.length >= 5) {
                     break;
                 }
             }
+
             if (results.length === 0) {
-                const fallbacks = document.querySelectorAll('a h3');
-                for (const titleNode of fallbacks) {
-                    const anchor = titleNode.closest('a');
-                    if (!anchor) {
+                const bingCandidates = document.querySelectorAll('li.b_algo');
+                for (const candidate of bingCandidates) {
+                    const heading = candidate.querySelector('h2 a');
+                    const record = serializeResult(
+                        heading,
+                        heading,
+                        candidate.querySelector('p, div.b_caption p, div.b_snippet')
+                    );
+                    if (!record) {
                         continue;
                     }
-                    const title = titleNode.innerText.trim();
-                    const url = anchor.href;
-                    if (!title || !url) {
-                        continue;
-                    }
-                    let snippet = '';
-                    const container = anchor.closest('div.g') || anchor.parentElement;
-                    if (container) {
-                        const snippetNode = container.querySelector('div.VwiC3b') || container.querySelector('span.aCOpRe') || container.querySelector('.MUxGbd');
-                        if (snippetNode) {
-                            snippet = snippetNode.innerText.trim();
-                        }
-                    }
-                    results.push({ title, url, snippet });
+                    results.push(record);
                     if (results.length >= 5) {
                         break;
                     }
                 }
             }
+
+            if (results.length === 0) {
+                const fallbackHeadings = document.querySelectorAll('a h3');
+                for (const titleNode of fallbackHeadings) {
+                    const anchor = titleNode.closest('a');
+                    if (!anchor) {
+                        continue;
+                    }
+                    const container = anchor.closest('div.g, li.b_algo') || anchor.parentElement;
+                    const record = serializeResult(
+                        titleNode,
+                        anchor,
+                        container ? container.querySelector('div.VwiC3b, span.aCOpRe, .MUxGbd, .zCubwf, p, div.b_caption p, div.b_snippet') : null
+                    );
+                    if (!record) {
+                        continue;
+                    }
+                    results.push(record);
+                    if (results.length >= 5) {
+                        break;
+                    }
+                }
+            }
+
             return JSON.stringify(results);
         })()";
 
@@ -731,14 +854,324 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
         try
         {
             var items = JsonSerializer.Deserialize<List<ComputerUseSearchResultItem>>(json, SerializerOptions);
-            return items?.Where(item => !string.IsNullOrWhiteSpace(item.Title) && !string.IsNullOrWhiteSpace(item.Url)).ToList()
-                   ?? new List<ComputerUseSearchResultItem>();
+            var filtered = items?.Where(item => !string.IsNullOrWhiteSpace(item.Title) && !string.IsNullOrWhiteSpace(item.Url)).ToList()
+                           ?? new List<ComputerUseSearchResultItem>();
+
+            if (filtered.Count == 0)
+            {
+                string transcriptSummary = transcript.Count == 0 ? "<empty>" : string.Join(" | ", transcript.Take(8));
+                string? currentUrl = _page?.Url;
+                _logger.LogWarning("Computer-use DOM extraction produced no items for query '{Query}'. CurrentUrl={Url}. Transcript={Transcript}", query, currentUrl, transcriptSummary);
+                await PersistDebugArtifactsAsync(query, json, cancellationToken).ConfigureAwait(false);
+            }
+
+            return filtered;
         }
         catch (JsonException ex)
         {
             _logger.LogWarning(ex, "Failed to parse search results DOM.");
+            await PersistDebugArtifactsAsync(query, json, cancellationToken).ConfigureAwait(false);
             return Array.Empty<ComputerUseSearchResultItem>();
         }
+    }
+
+    private async Task PersistDebugArtifactsAsync(string query, string rawJson, CancellationToken cancellationToken)
+    {
+        try
+        {
+            string root = Path.Combine(Environment.CurrentDirectory, "debug", "computer-use");
+            Directory.CreateDirectory(root);
+
+            string timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmssfff");
+            string safeQuery = SanitizeForFileName(query);
+
+            if (!string.IsNullOrWhiteSpace(rawJson))
+            {
+                string jsonPath = Path.Combine(root, $"{timestamp}_{safeQuery}_dom.json");
+                await File.WriteAllTextAsync(jsonPath, rawJson, cancellationToken).ConfigureAwait(false);
+            }
+
+            if (_page is not null)
+            {
+                string htmlPath = Path.Combine(root, $"{timestamp}_{safeQuery}_page.html");
+                string pageHtml = await _page.ContentAsync().ConfigureAwait(false);
+                await File.WriteAllTextAsync(htmlPath, pageHtml, cancellationToken).ConfigureAwait(false);
+            }
+
+            string screenshotBase64 = _lastScreenshot ?? await CaptureScreenshotAsync(cancellationToken).ConfigureAwait(false);
+            string screenshotPath = Path.Combine(root, $"{timestamp}_{safeQuery}.png");
+            byte[] bytes = Convert.FromBase64String(screenshotBase64);
+            await File.WriteAllBytesAsync(screenshotPath, bytes, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to persist computer-use debug artifacts for query '{Query}'.", query);
+        }
+    }
+
+    private async Task EnsureSearchResultsAsync(string query, CancellationToken cancellationToken)
+    {
+        if (_page is null)
+        {
+            return;
+        }
+
+        await ThrowIfCaptchaDetectedAsync(query, cancellationToken).ConfigureAwait(false);
+
+        bool hasResults = false;
+        try
+        {
+            hasResults = await _page.EvaluateAsync<bool>("() => !!document.querySelector('li.b_algo, div.g')").ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is PlaywrightException or InvalidOperationException)
+        {
+            _logger.LogDebug(ex, "Failed to evaluate current SERP state before fallback navigation.");
+        }
+
+        if (hasResults)
+        {
+            return;
+        }
+
+    string targetUrl = $"https://www.google.com/search?q={Uri.EscapeDataString(query)}&hl=en";
+    _logger.LogInformation("No SERP content detected; navigating directly to Google results '{Url}'.", targetUrl);
+
+        try
+        {
+            await _page.GotoAsync(targetUrl, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded }).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is PlaywrightException or TimeoutException)
+        {
+            _logger.LogWarning(ex, "Direct navigation to Bing results failed for query '{Query}'.", query);
+        }
+
+        await DismissConsentAsync(cancellationToken).ConfigureAwait(false);
+        await ThrowIfCaptchaDetectedAsync(query, cancellationToken).ConfigureAwait(false);
+        await WaitForSerpContentAsync(cancellationToken).ConfigureAwait(false);
+        await ThrowIfCaptchaDetectedAsync(query, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task DismissConsentAsync(CancellationToken cancellationToken)
+    {
+        if (_page is null)
+        {
+            return;
+        }
+
+        foreach (IFrame frame in _page.Frames)
+        {
+            if (await TryDismissConsentSelectorsAsync(frame).ConfigureAwait(false))
+            {
+                _logger.LogDebug("Dismissed consent dialog using selector in frame '{FrameInfo}'.", DescribeFrame(frame));
+                await Task.Delay(250, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+        }
+
+        foreach (IFrame frame in _page.Frames)
+        {
+            if (await TryDismissConsentByRoleAsync(frame).ConfigureAwait(false))
+            {
+                _logger.LogDebug("Dismissed consent dialog using role lookup in frame '{FrameInfo}'.", DescribeFrame(frame));
+                await Task.Delay(250, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+        }
+
+        foreach (IFrame frame in _page.Frames)
+        {
+            if (await TryDismissConsentViaScriptAsync(frame).ConfigureAwait(false))
+            {
+                _logger.LogDebug("Dismissed consent dialog using script in frame '{FrameInfo}'.", DescribeFrame(frame));
+                await Task.Delay(250, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+        }
+
+        try
+        {
+            bool removed = await _page.EvaluateAsync<bool>("() => { const overlays = ['#bnp_container', '#bnp_dialog', '.bnp_container', '.bnp_dialog']; let removed = false; for (const selector of overlays) { document.querySelectorAll(selector).forEach(el => { el.remove(); removed = true; }); } return removed; }").ConfigureAwait(false);
+            if (removed)
+            {
+                _logger.LogDebug("Removed consent overlay containers from main frame.");
+                await Task.Delay(150, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex) when (ex is PlaywrightException or InvalidOperationException)
+        {
+            _logger.LogDebug(ex, "Consent removal script encountered an error.");
+        }
+    }
+
+    private async Task<bool> TryDismissConsentSelectorsAsync(IFrame frame)
+    {
+        foreach (string selector in ConsentButtonSelectors)
+        {
+            try
+            {
+                ILocator locator = frame.Locator(selector);
+                if (await locator.CountAsync().ConfigureAwait(false) == 0)
+                {
+                    continue;
+                }
+
+                await locator.First.ClickAsync(new LocatorClickOptions { Timeout = 800, Force = true }).ConfigureAwait(false);
+                return true;
+            }
+            catch (Exception ex) when (ex is PlaywrightException or TimeoutException)
+            {
+                _logger.LogTrace(ex, "Consent selector '{Selector}' not clickable in frame '{FrameInfo}'.", selector, DescribeFrame(frame));
+            }
+        }
+
+        return false;
+    }
+
+    private async Task<bool> TryDismissConsentByRoleAsync(IFrame frame)
+    {
+        foreach (Regex pattern in ConsentButtonNamePatterns)
+        {
+            try
+            {
+                var options = new FrameGetByRoleOptions { NameRegex = pattern };
+                ILocator locator = frame.GetByRole(AriaRole.Button, options);
+                if (await locator.CountAsync().ConfigureAwait(false) == 0)
+                {
+                    continue;
+                }
+
+                await locator.First.ClickAsync(new LocatorClickOptions { Timeout = 800, Force = true }).ConfigureAwait(false);
+                return true;
+            }
+            catch (Exception ex) when (ex is PlaywrightException or TimeoutException)
+            {
+                _logger.LogTrace(ex, "Role-based consent dismissal failed for pattern '{Pattern}' in frame '{FrameInfo}'.", pattern, DescribeFrame(frame));
+            }
+        }
+
+        return false;
+    }
+
+    private async Task<bool> TryDismissConsentViaScriptAsync(IFrame frame)
+    {
+        try
+        {
+            return await frame.EvaluateAsync<bool>(ConsentDismissScript).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is PlaywrightException or InvalidOperationException)
+        {
+            _logger.LogTrace(ex, "Consent dismissal script failed in frame '{FrameInfo}'.", DescribeFrame(frame));
+        }
+
+        return false;
+    }
+
+    private static string DescribeFrame(IFrame frame)
+    {
+        try
+        {
+            string name = frame.Name;
+            string url = frame.Url;
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                return url;
+            }
+
+            return string.IsNullOrWhiteSpace(url) ? name : $"{name} ({url})";
+        }
+        catch
+        {
+            return "<unknown frame>";
+        }
+    }
+
+    private async Task WaitForSerpContentAsync(CancellationToken cancellationToken)
+    {
+        if (_page is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await _page.WaitForSelectorAsync("li.b_algo, div.g", new PageWaitForSelectorOptions { Timeout = 4000 }).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is PlaywrightException or TimeoutException)
+        {
+            _logger.LogDebug(ex, "SERP content did not appear within the expected timeframe.");
+        }
+
+        await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task ThrowIfCaptchaDetectedAsync(string query, CancellationToken cancellationToken)
+    {
+        if (!await IsCaptchaDetectedAsync().ConfigureAwait(false))
+        {
+            return;
+        }
+
+    _logger.LogWarning("Detected CAPTCHA / challenge page during computer-use search for query '{Query}'.", query);
+        await PersistDebugArtifactsAsync(query, "{\"captcha\":true}", cancellationToken).ConfigureAwait(false);
+    throw new ComputerUseSearchBlockedException("Encountered a CAPTCHA / bot challenge from the search engine while using Playwright automation.");
+    }
+
+    private async Task<bool> IsCaptchaDetectedAsync()
+    {
+        if (_page is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            const string script = @"() => {
+                const selectors = ['.captcha', '#cf-chl-widget', '#turnstile-widget', 'iframe[src*=""challenges.cloudflare.com""]', 'form[action*=""/challenge/""]'];
+                if (selectors.some(selector => document.querySelector(selector))) {
+                    return true;
+                }
+
+                const title = (document.title || '').toLowerCase();
+                if (title.includes('just a moment') || title.includes('captcha')) {
+                    return true;
+                }
+
+                const bodyText = ((document.body && document.body.innerText) || '').toLowerCase();
+                if (bodyText.includes('please solve the challenge')) {
+                    return true;
+                }
+
+                return false;
+            }";
+
+            return await _page.EvaluateAsync<bool>(script).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is PlaywrightException or InvalidOperationException)
+        {
+            _logger.LogDebug(ex, "Captcha detection script failed.");
+            return false;
+        }
+    }
+
+    private static string SanitizeForFileName(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return "query";
+        }
+
+        Span<char> buffer = stackalloc char[value.Length];
+        int index = 0;
+        foreach (char ch in value)
+        {
+            buffer[index++] = Array.IndexOf(Path.GetInvalidFileNameChars(), ch) >= 0 ? '_' : ch;
+        }
+
+        return new string(buffer[..index]);
     }
 
     private static (float X, float Y)? ClampCoordinates(double? x, double? y)
@@ -829,6 +1262,14 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
         IReadOnlyList<string> Keys,
         string? Text,
         double? DurationMs);
+}
+
+public sealed class ComputerUseSearchBlockedException : InvalidOperationException
+{
+    public ComputerUseSearchBlockedException(string message)
+        : base(message)
+    {
+    }
 }
 
 public sealed record ComputerUseSearchResult(

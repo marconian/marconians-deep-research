@@ -15,6 +15,7 @@ using Marconian.ResearchAgent.Services.Files;
 using Marconian.ResearchAgent.Services.OpenAI;
 using Marconian.ResearchAgent.Tools;
 using System.Linq;
+using System.Text;
 using System.Text.Json;
 using Microsoft.Azure.Cosmos;
 using System.Collections.ObjectModel;
@@ -70,7 +71,8 @@ internal static class Program
         };
         Console.CancelKeyPress += cancelHandler;
 
-        ComputerUseSearchService? computerUseSearchService = null;
+    ComputerUseSearchService? computerUseSearchService = null;
+    string? computerUseDisabledReason = null;
 
         ResearchFlowTracker? flowTracker = null;
         try
@@ -117,29 +119,98 @@ internal static class Program
             using var sharedHttpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
             if (settings.WebSearchProvider == WebSearchProvider.ComputerUse)
             {
-                if (string.IsNullOrWhiteSpace(settings.AzureOpenAiComputerUseDeployment))
+                if (!settings.ComputerUseEnabled)
+                {
+                    computerUseDisabledReason = "Computer-use search disabled via COMPUTER_USE_ENABLED=false.";
+                }
+                else if (string.IsNullOrWhiteSpace(settings.AzureOpenAiComputerUseDeployment))
                 {
                     throw new InvalidOperationException("AZURE_OPENAI_COMPUTER_USE_DEPLOYMENT must be set when using the computer-use search provider.");
                 }
+                else
+                {
+                    var probeLogger = loggerFactory.CreateLogger("ComputerUseProbe");
+                    ComputerUseReadinessResult readiness = await ComputerUseRuntimeProbe
+                        .EnsureReadyAsync(probeLogger, cts.Token)
+                        .ConfigureAwait(false);
 
-                computerUseSearchService = new ComputerUseSearchService(
-                    settings.AzureOpenAiEndpoint,
-                    settings.AzureOpenAiApiKey,
-                    settings.AzureOpenAiComputerUseDeployment,
-                    sharedHttpClient,
-                    loggerFactory.CreateLogger<ComputerUseSearchService>());
+                    if (readiness.IsReady)
+                    {
+                        computerUseSearchService = new ComputerUseSearchService(
+                            settings.AzureOpenAiEndpoint,
+                            settings.AzureOpenAiApiKey,
+                            settings.AzureOpenAiComputerUseDeployment,
+                            sharedHttpClient,
+                            loggerFactory.CreateLogger<ComputerUseSearchService>());
+                    }
+                    else
+                    {
+                        computerUseDisabledReason = readiness.FailureReason ?? "Playwright browsers are unavailable.";
+                    }
+                }
+
+                if (computerUseDisabledReason is not null)
+                {
+                    logger.LogWarning("Computer-use search disabled: {Reason}. Falling back to Google API provider where possible.", computerUseDisabledReason);
+                }
+                else
+                {
+                    logger.LogInformation("Computer-use search provider is ready. Playwright browsers detected.");
+                }
             }
-
-
+            else
+            {
+                logger.LogInformation("Using Google API web search provider.");
+            }
             Func<IEnumerable<ITool>> toolFactory = () => new ITool[]
             {
-                new WebSearchTool(settings.GoogleApiKey, settings.GoogleSearchEngineId, cacheService, sharedHttpClient, loggerFactory.CreateLogger<WebSearchTool>(), settings.WebSearchProvider, computerUseSearchService),
+                new WebSearchTool(
+                    settings.GoogleApiKey,
+                    settings.GoogleSearchEngineId,
+                    cacheService,
+                    sharedHttpClient,
+                    loggerFactory.CreateLogger<WebSearchTool>(),
+                    settings.WebSearchProvider,
+                    computerUseSearchService,
+                    fallbackProvider: computerUseDisabledReason is null ? WebSearchProvider.ComputerUse : WebSearchProvider.GoogleApi,
+                    computerUseDisabledReason: computerUseDisabledReason),
                 new WebScraperTool(cacheService, sharedHttpClient, loggerFactory.CreateLogger<WebScraperTool>()),
                 new FileReaderTool(fileRegistryService, documentService, sharedHttpClient, loggerFactory.CreateLogger<FileReaderTool>()),
                 new ImageReaderTool(fileRegistryService, openAiService, settings.AzureOpenAiVisionDeployment, sharedHttpClient, loggerFactory.CreateLogger<ImageReaderTool>())
             };
 
-            ParseCommandLine(args, out string? resumeSessionId, out string? providedQuery, out string? reportDirectoryArgument);
+            ParseCommandLine(
+                args,
+                out string? resumeSessionId,
+                out string? providedQuery,
+                out string? reportDirectoryArgument,
+                out string? dumpSessionId,
+                out string? dumpDirectory,
+                out string? dumpType,
+                out int dumpLimit);
+
+            if (!string.IsNullOrWhiteSpace(dumpSessionId))
+            {
+                string destination = string.IsNullOrWhiteSpace(dumpDirectory)
+                    ? Path.Combine(defaultReportDirectory, "session_dumps", dumpSessionId)
+                    : Path.GetFullPath(dumpDirectory);
+
+                Directory.CreateDirectory(destination);
+
+                var typeFilters = ParseDumpTypes(dumpType);
+                await DumpSessionArtifactsAsync(
+                        cosmosService,
+                        dumpSessionId,
+                        typeFilters,
+                        destination,
+                        dumpLimit,
+                        loggerFactory.CreateLogger("SessionDump"),
+                        cts.Token)
+                    .ConfigureAwait(false);
+
+                logger.LogInformation("Session dump complete for {SessionId}. Files written to {Destination}.", dumpSessionId, destination);
+                return 0;
+            }
 
             string reportDirectory = string.IsNullOrWhiteSpace(reportDirectoryArgument)
                 ? defaultReportDirectory
@@ -314,11 +385,169 @@ internal static class Program
     }
 
 
-    private static void ParseCommandLine(string[] args, out string? resumeSessionId, out string? query, out string? reportsDirectory)
+    private static IReadOnlyList<string> ParseDumpTypes(string? dumpType)
+    {
+        if (string.IsNullOrWhiteSpace(dumpType))
+        {
+            return Array.Empty<string>();
+        }
+
+        string trimmed = dumpType.Trim();
+        if (string.Equals(trimmed, "all", StringComparison.OrdinalIgnoreCase) || trimmed == "*")
+        {
+            return Array.Empty<string>();
+        }
+
+        string[] parts = trimmed.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return parts.Length == 0 ? Array.Empty<string>() : parts;
+    }
+
+    private static async Task DumpSessionArtifactsAsync(
+        CosmosMemoryService cosmosService,
+        string sessionId,
+        IReadOnlyList<string> typeFilters,
+        string outputDirectory,
+        int limit,
+        ILogger logger,
+        CancellationToken cancellationToken)
+    {
+        HashSet<string>? filterSet = typeFilters.Count == 0
+            ? null
+            : new HashSet<string>(typeFilters, StringComparer.OrdinalIgnoreCase);
+
+        IReadOnlyList<MemoryRecord> records = await cosmosService
+            .QueryBySessionAsync(sessionId, Math.Max(limit, 1), cancellationToken)
+            .ConfigureAwait(false);
+
+        var filtered = records
+            .Where(record => filterSet is null || filterSet.Contains(record.Type))
+            .OrderByDescending(record => record.CreatedAtUtc)
+            .Take(limit)
+            .ToList();
+
+        if (filtered.Count == 0)
+        {
+            logger.LogWarning("No memory records matched the export criteria for session {SessionId}.", sessionId);
+            Console.WriteLine("# Session Dump\nNo records matched the export criteria.");
+            return;
+        }
+
+        logger.LogInformation(
+            "Exporting {Count} memory records (limit {Limit}) from session {SessionId} to {OutputDirectory}.",
+            filtered.Count,
+            limit,
+            sessionId,
+            outputDirectory);
+
+        var indexEntries = new List<object>(filtered.Count);
+        int counter = 1;
+        foreach (var record in filtered)
+        {
+            string fileName = $"{counter:000}_{SanitizeFileName(record.Type)}_{SanitizeFileName(record.Id)}.md";
+            string filePath = Path.Combine(outputDirectory, fileName);
+
+            var builder = new StringBuilder();
+            builder.AppendLine($"# Memory Record {counter}");
+            builder.AppendLine($"- RecordId: {record.Id}");
+            builder.AppendLine($"- Type: {record.Type}");
+            builder.AppendLine($"- CreatedUtc: {record.CreatedAtUtc:O}");
+
+            if (record.Metadata.Count > 0)
+            {
+                builder.AppendLine("- Metadata:");
+                foreach (var kvp in record.Metadata)
+                {
+                    builder.AppendLine($"    - {kvp.Key}: {kvp.Value}");
+                }
+            }
+
+            if (record.Sources.Count > 0)
+            {
+                builder.AppendLine("- Sources:");
+                foreach (var source in record.Sources)
+                {
+                    builder.AppendLine($"    - {source.Title ?? source.SourceId}: {source.Url}");
+                }
+            }
+
+            builder.AppendLine();
+            builder.AppendLine("## Content");
+            builder.AppendLine();
+            builder.AppendLine(record.Content);
+
+            await File.WriteAllTextAsync(filePath, builder.ToString(), cancellationToken).ConfigureAwait(false);
+
+            indexEntries.Add(new
+            {
+                record.Id,
+                record.Type,
+                record.CreatedAtUtc,
+                record.Metadata,
+                record.Sources,
+                ContentFile = fileName
+            });
+
+            counter++;
+        }
+
+        string indexPath = Path.Combine(outputDirectory, "index.json");
+        await File.WriteAllTextAsync(
+                indexPath,
+                JsonSerializer.Serialize(indexEntries, new JsonSerializerOptions { WriteIndented = true }),
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        Console.WriteLine($"# Session Dump\nExported {filtered.Count} record(s) to {outputDirectory}.\nIndex: {indexPath}");
+    }
+
+    private static string SanitizeFileName(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return "record";
+        }
+
+        var builder = new StringBuilder(value.Length);
+        char[] invalid = Path.GetInvalidFileNameChars();
+
+        foreach (char ch in value)
+        {
+            if (Array.IndexOf(invalid, ch) >= 0)
+            {
+                builder.Append('_');
+            }
+            else
+            {
+                builder.Append(ch);
+            }
+        }
+
+        string sanitized = builder.ToString().Trim('_');
+        if (sanitized.Length == 0)
+        {
+            sanitized = "record";
+        }
+
+        return sanitized.Length > 64 ? sanitized[..64] : sanitized;
+    }
+
+    private static void ParseCommandLine(
+        string[] args,
+        out string? resumeSessionId,
+        out string? query,
+        out string? reportsDirectory,
+        out string? dumpSessionId,
+        out string? dumpDirectory,
+        out string? dumpType,
+        out int dumpLimit)
     {
         resumeSessionId = null;
         query = null;
         reportsDirectory = null;
+        dumpSessionId = null;
+        dumpDirectory = null;
+        dumpType = null;
+        dumpLimit = 200;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -343,9 +572,34 @@ internal static class Program
                         reportsDirectory = args[++i];
                     }
                     break;
+                case "--dump-session":
+                    if (i + 1 < args.Length)
+                    {
+                        dumpSessionId = args[++i];
+                    }
+                    break;
+                case "--dump-dir":
+                case "--dump-output":
+                    if (i + 1 < args.Length)
+                    {
+                        dumpDirectory = args[++i];
+                    }
+                    break;
+                case "--dump-type":
+                    if (i + 1 < args.Length)
+                    {
+                        dumpType = args[++i];
+                    }
+                    break;
+                case "--dump-limit":
+                    if (i + 1 < args.Length && int.TryParse(args[++i], out int parsedLimit) && parsedLimit > 0)
+                    {
+                        dumpLimit = parsedLimit;
+                    }
+                    break;
                 case "--help":
                 case "-h":
-                    Console.WriteLine("Usage: dotnet run [--query \"question\"] [--resume sessionId] [--reports path]");
+                    Console.WriteLine("Usage: dotnet run [--query \"question\"] [--resume sessionId] [--reports path] [--dump-session sessionId [--dump-type type] [--dump-dir path] [--dump-limit N]]");
                     Environment.Exit(0);
                     break;
             }

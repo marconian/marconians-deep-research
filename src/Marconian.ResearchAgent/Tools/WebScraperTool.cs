@@ -325,7 +325,7 @@ public sealed class WebScraperTool : ITool, IAsyncDisposable
         await Task.CompletedTask;
     }
 
-    private static bool IsUnsupportedBrowserPage(string html)
+    private static bool IsUnsupportedBrowserPage(string? html)
     {
         if (string.IsNullOrEmpty(html))
         {

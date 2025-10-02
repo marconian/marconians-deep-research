@@ -82,7 +82,7 @@ public sealed class OrchestratorAgent : IAgent
         string diagramPath = Path.Combine(_reportsDirectory, $"flow_{task.ResearchSessionId}_{DateTimeOffset.UtcNow:yyyyMMdd_HHmmss}.md");
         _flowTracker?.ConfigureSession(task.ResearchSessionId, task.Objective ?? string.Empty, diagramPath);
 
-        ResearchPlan? plan = null;
+    ResearchPlan? plan = null;
         List<ResearchBranchResult> branchResults = new();
         ResearchAggregationResult? aggregationResult = null;
         string? synthesis = null;
@@ -96,6 +96,11 @@ public sealed class OrchestratorAgent : IAgent
 
             CurrentState = OrchestratorState.Planning;
             plan = await GeneratePlanAsync(task, cancellationToken).ConfigureAwait(false);
+            if (plan is null)
+            {
+                throw new InvalidOperationException("Failed to generate a research plan.");
+            }
+
             _flowTracker?.RecordPlan(plan);
             _logger.LogInformation("Generated research plan with {BranchCount} branches.", plan.Branches.Count);
             await _longTermMemoryManager.UpsertSessionStateAsync(
@@ -139,7 +144,7 @@ public sealed class OrchestratorAgent : IAgent
 
             var finalFinding = new ResearchFinding
             {
-                Title = task.Objective,
+                Title = task.Objective ?? string.Empty,
                 Content = synthesis,
                 Citations = aggregationResult.UniqueCitations.ToList(),
                 Confidence = aggregationResult.Findings.Any()
