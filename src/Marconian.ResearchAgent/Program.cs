@@ -71,8 +71,8 @@ internal static class Program
         };
         Console.CancelKeyPress += cancelHandler;
 
-    ComputerUseSearchService? computerUseSearchService = null;
-    string? computerUseDisabledReason = null;
+        ComputerUseSearchService? computerUseSearchService = null;
+        string? computerUseDisabledReason = null;
 
         ResearchFlowTracker? flowTracker = null;
         try
@@ -117,66 +117,111 @@ internal static class Program
             var documentService = new DocumentIntelligenceService(settings, loggerFactory.CreateLogger<DocumentIntelligenceService>());
             var fileRegistryService = new FileRegistryService();
             using var sharedHttpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
-            if (settings.WebSearchProvider == WebSearchProvider.ComputerUse)
+
+            if (settings.WebSearchProvider == WebSearchProvider.ComputerUse && string.IsNullOrWhiteSpace(settings.AzureOpenAiComputerUseDeployment))
             {
-                if (!settings.ComputerUseEnabled)
+                throw new InvalidOperationException("AZURE_OPENAI_COMPUTER_USE_DEPLOYMENT must be set when using the computer-use search provider.");
+            }
+
+            bool computerUseConfigured = settings.ComputerUseEnabled && !string.IsNullOrWhiteSpace(settings.AzureOpenAiComputerUseDeployment);
+
+            if (computerUseConfigured)
+            {
+                var probeLogger = loggerFactory.CreateLogger("ComputerUseProbe");
+                ComputerUseReadinessResult readiness = await ComputerUseRuntimeProbe
+                    .EnsureReadyAsync(probeLogger, cts.Token)
+                    .ConfigureAwait(false);
+
+                if (readiness.IsReady)
                 {
-                    computerUseDisabledReason = "Computer-use search disabled via COMPUTER_USE_ENABLED=false.";
-                }
-                else if (string.IsNullOrWhiteSpace(settings.AzureOpenAiComputerUseDeployment))
-                {
-                    throw new InvalidOperationException("AZURE_OPENAI_COMPUTER_USE_DEPLOYMENT must be set when using the computer-use search provider.");
+                    computerUseSearchService = new ComputerUseSearchService(
+                        settings.AzureOpenAiEndpoint,
+                        settings.AzureOpenAiApiKey,
+                        settings.AzureOpenAiComputerUseDeployment!,
+                        sharedHttpClient,
+                        loggerFactory.CreateLogger<ComputerUseSearchService>());
+                    logger.LogInformation(
+                        "Computer-use automation is ready (Mode={Mode}, Provider={Provider}).",
+                        settings.ComputerUseMode,
+                        settings.WebSearchProvider);
                 }
                 else
                 {
-                    var probeLogger = loggerFactory.CreateLogger("ComputerUseProbe");
-                    ComputerUseReadinessResult readiness = await ComputerUseRuntimeProbe
-                        .EnsureReadyAsync(probeLogger, cts.Token)
-                        .ConfigureAwait(false);
+                    computerUseDisabledReason = readiness.FailureReason ?? "Playwright browsers are unavailable.";
+                }
+            }
+            else if (!settings.ComputerUseEnabled)
+            {
+                computerUseDisabledReason = "Computer-use automation disabled via COMPUTER_USE_ENABLED=false.";
+            }
+            else if (string.IsNullOrWhiteSpace(settings.AzureOpenAiComputerUseDeployment))
+            {
+                computerUseDisabledReason = "AZURE_OPENAI_COMPUTER_USE_DEPLOYMENT not configured.";
+            }
 
-                    if (readiness.IsReady)
-                    {
-                        computerUseSearchService = new ComputerUseSearchService(
-                            settings.AzureOpenAiEndpoint,
-                            settings.AzureOpenAiApiKey,
-                            settings.AzureOpenAiComputerUseDeployment,
-                            sharedHttpClient,
-                            loggerFactory.CreateLogger<ComputerUseSearchService>());
-                    }
-                    else
-                    {
-                        computerUseDisabledReason = readiness.FailureReason ?? "Playwright browsers are unavailable.";
-                    }
+            if (computerUseDisabledReason is not null)
+            {
+                if (settings.WebSearchProvider == WebSearchProvider.ComputerUse && settings.ComputerUseMode == ComputerUseMode.Full)
+                {
+                    logger.LogError("Computer-use mode is set to Full but the runtime is unavailable: {Reason}", computerUseDisabledReason);
+                    Console.Error.WriteLine($"Computer-use provider unavailable: {computerUseDisabledReason}");
+                    return 1;
                 }
 
-                if (computerUseDisabledReason is not null)
+                if (settings.WebSearchProvider == WebSearchProvider.ComputerUse)
                 {
                     logger.LogWarning("Computer-use search disabled: {Reason}. Falling back to Google API provider where possible.", computerUseDisabledReason);
                 }
                 else
                 {
-                    logger.LogInformation("Computer-use search provider is ready. Playwright browsers detected.");
+                    logger.LogWarning("Computer-use navigation unavailable: {Reason}.", computerUseDisabledReason);
                 }
             }
-            else
+            if (settings.WebSearchProvider == WebSearchProvider.GoogleApi)
             {
-                logger.LogInformation("Using Google API web search provider.");
+                logger.LogInformation(
+                    computerUseSearchService is not null
+                        ? "Using Google API web search provider with computer-use navigation enabled."
+                        : "Using Google API web search provider.");
             }
-            Func<IEnumerable<ITool>> toolFactory = () => new ITool[]
+            bool googleCredentialsAvailable =
+                !string.IsNullOrWhiteSpace(settings.GoogleApiKey) && !string.IsNullOrWhiteSpace(settings.GoogleSearchEngineId);
+
+            WebSearchProvider fallbackProvider =
+                settings.WebSearchProvider == WebSearchProvider.ComputerUse &&
+                settings.ComputerUseMode == ComputerUseMode.Hybrid &&
+                googleCredentialsAvailable
+                    ? WebSearchProvider.GoogleApi
+                    : WebSearchProvider.ComputerUse;
+
+            Func<IEnumerable<ITool>> toolFactory = () =>
             {
-                new WebSearchTool(
-                    settings.GoogleApiKey,
-                    settings.GoogleSearchEngineId,
-                    cacheService,
-                    sharedHttpClient,
-                    loggerFactory.CreateLogger<WebSearchTool>(),
-                    settings.WebSearchProvider,
-                    computerUseSearchService,
-                    fallbackProvider: computerUseDisabledReason is null ? WebSearchProvider.ComputerUse : WebSearchProvider.GoogleApi,
-                    computerUseDisabledReason: computerUseDisabledReason),
-                new WebScraperTool(cacheService, sharedHttpClient, loggerFactory.CreateLogger<WebScraperTool>()),
-                new FileReaderTool(fileRegistryService, documentService, sharedHttpClient, loggerFactory.CreateLogger<FileReaderTool>()),
-                new ImageReaderTool(fileRegistryService, openAiService, settings.AzureOpenAiVisionDeployment, sharedHttpClient, loggerFactory.CreateLogger<ImageReaderTool>())
+                var tools = new List<ITool>
+                {
+                    new WebSearchTool(
+                        settings.GoogleApiKey,
+                        settings.GoogleSearchEngineId,
+                        cacheService,
+                        sharedHttpClient,
+                        loggerFactory.CreateLogger<WebSearchTool>(),
+                        settings.WebSearchProvider,
+                        computerUseSearchService,
+                        fallbackProvider: fallbackProvider,
+                        computerUseDisabledReason: computerUseDisabledReason,
+                        computerUseMode: settings.ComputerUseMode),
+                    new WebScraperTool(cacheService, sharedHttpClient, loggerFactory.CreateLogger<WebScraperTool>()),
+                    new FileReaderTool(fileRegistryService, documentService, sharedHttpClient, loggerFactory.CreateLogger<FileReaderTool>()),
+                    new ImageReaderTool(fileRegistryService, openAiService, settings.AzureOpenAiVisionDeployment, sharedHttpClient, loggerFactory.CreateLogger<ImageReaderTool>())
+                };
+
+                if (computerUseSearchService is not null)
+                {
+                    tools.Add(new ComputerUseNavigatorTool(
+                        computerUseSearchService,
+                        loggerFactory.CreateLogger<ComputerUseNavigatorTool>()));
+                }
+
+                return tools;
             };
 
             ParseCommandLine(

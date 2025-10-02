@@ -58,4 +58,5 @@
 
 [x] add a startup readiness probe for Playwright, cache a per-session disabled state, and fall back to Google-based search when the computer-use browsers are unavailable (completed 2025-10-02)
 [x] create a simple diagnostic path to review Cosmos-stored scrape outputs when computer-use mode is disabled (completed 2025-10-02)
+[x] extend the hybrid search flow so Google API results are triaged by an agent and each chosen citation launches a computer-use browsing session for deeper capture (completed 2025-10-03)
 

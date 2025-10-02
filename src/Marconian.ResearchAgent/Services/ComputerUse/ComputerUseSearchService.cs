@@ -11,18 +11,30 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Marconian.ResearchAgent.Configuration;
+using Marconian.ResearchAgent.Models.Tools;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Playwright;
 
 namespace Marconian.ResearchAgent.Services.ComputerUse;
 
-public sealed class ComputerUseSearchService : IAsyncDisposable
+public sealed class ComputerUseSearchService : IAsyncDisposable, IComputerUseExplorer
 {
     private const string ResponsesApiVersion = "2024-08-01-preview";
     private const int DisplayWidth = 1280;
     private const int DisplayHeight = 720;
     private const int MaxIterations = 8;
+
+    private const string SearchInstructions = "You control a Chromium browser. Execute actions one at a time, reviewing a screenshot after each step. Stop once Google search results are visible so the host application can read them.";
+
+    private const string ExplorationInstructions = """
+You control a Chromium browser. Navigate the page, scroll to gather supporting evidence, follow relevant outbound links, and stop once you can provide a concise summary of the key takeaways.
+
+When you stop, respond with exactly one JSON object on the final turn matching this schema:
+{"summary":"...","flagged":[{"type":"page|file|download","title":"...","url":"...","notes":"optional context","mimeType":"optional mime"}]}
+
+Flag any resources that should be revisited (interesting subpages, downloadable files, data sources). Emit an empty array when nothing is flagged. Do not include text outside the JSON object.
+""";
 
     private static readonly Dictionary<string, string> KeyMapping = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -47,6 +59,19 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
         ["cmd"] = "Meta",
         ["super"] = "Meta",
         ["option"] = "Alt"
+    };
+
+    private static readonly HashSet<string> ScrollKeys = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "ArrowDown",
+        "ArrowUp",
+        "ArrowLeft",
+        "ArrowRight",
+        "PageDown",
+        "PageUp",
+        "End",
+        "Home",
+        "Space"
     };
 
     private static readonly string[] ConsentButtonSelectors =
@@ -129,6 +154,10 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
     private IPage? _page;
     private bool _initialized;
     private string? _lastScreenshot;
+    private string? _currentSessionId;
+    private int _screenshotSequence;
+    private List<TimelineEntry>? _timelineEntries;
+    private string? _timelinePath;
 
     public ComputerUseSearchService(
         string endpoint,
@@ -207,6 +236,10 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
 
         try
         {
+            // Start a new session for this query to correlate artifacts.
+            _currentSessionId = Guid.NewGuid().ToString("N");
+            _screenshotSequence = 0;
+            InitializeTimeline(query);
             if (_page is null)
             {
                 throw new InvalidOperationException("Computer-use browser page was not initialized.");
@@ -222,7 +255,7 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
             {
                 iteration++;
                 await HandleComputerCallAsync(response.Call, cancellationToken).ConfigureAwait(false);
-                response = await SendFollowupRequestAsync(response, transcript, cancellationToken).ConfigureAwait(false);
+                response = await SendFollowupRequestAsync(response, transcript, cancellationToken, SearchInstructions).ConfigureAwait(false);
 
                 if (response.Call is null || response.Completed)
                 {
@@ -251,6 +284,15 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
         }
         finally
         {
+            try
+            {
+                await PersistTimelineAsync(query, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Failed to persist computer-use timeline for query '{Query}'.", query);
+            }
+
             _operationLock.Release();
         }
     }
@@ -293,7 +335,7 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
                     }
                 }
             },
-            ["instructions"] = "You control a Chromium browser. Execute actions one at a time, reviewing a screenshot after each step. Stop once Google search results are visible so the host application can read them.",
+                ["instructions"] = SearchInstructions,
             ["tools"] = BuildToolsArray(),
             ["reasoning"] = new JsonObject { ["generate_summary"] = "concise" },
             ["temperature"] = 0.2,
@@ -306,7 +348,7 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
         return ParseResponse(response, transcript);
     }
 
-    private async Task<ComputerUseResponseState> SendFollowupRequestAsync(ComputerUseResponseState previous, List<string> transcript, CancellationToken cancellationToken)
+    private async Task<ComputerUseResponseState> SendFollowupRequestAsync(ComputerUseResponseState previous, List<string> transcript, CancellationToken cancellationToken, string? instructions = null)
     {
         if (previous.Call is null)
         {
@@ -357,6 +399,10 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
             ["previous_response_id"] = previous.ResponseId,
             ["truncation"] = "auto"
         };
+        if (!string.IsNullOrWhiteSpace(instructions))
+        {
+            payload["instructions"] = instructions;
+        }
         payload["model"] = _deployment;
 
         using JsonDocument response = await SendRequestAsync(payload, cancellationToken).ConfigureAwait(false);
@@ -557,6 +603,25 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
         (float X, float Y)? coordinates = ClampCoordinates(action.X, action.Y);
         string normalizedType = action.Type.ToLowerInvariant();
 
+        _logger.LogInformation("Action {Type} | Coords=({X},{Y}) | Button={Button} | Keys={Keys} | Text='{Text}' | Session={Session}",
+            normalizedType,
+            coordinates?.X.ToString("F0") ?? "-",
+            coordinates?.Y.ToString("F0") ?? "-",
+            action.Button ?? string.Empty,
+            action.Keys.Count == 0 ? "-" : string.Join('+', action.Keys),
+            TruncateForLog(action.Text),
+            _currentSessionId ?? "-" );
+
+        RecordTimelineEvent("action", new Dictionary<string, object?>
+        {
+            ["type"] = normalizedType,
+            ["x"] = coordinates?.X,
+            ["y"] = coordinates?.Y,
+            ["button"] = action.Button,
+            ["keys"] = action.Keys.Count == 0 ? null : string.Join('+', action.Keys),
+            ["text"] = TruncateForLog(action.Text)
+        });
+
         switch (normalizedType)
         {
             case "click":
@@ -570,7 +635,7 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
                 }
                 break;
             case "scroll":
-                await HandleScrollAsync(action, coordinates).ConfigureAwait(false);
+                await HandleScrollAsync(action, coordinates, cancellationToken).ConfigureAwait(false);
                 break;
             case "move":
                 if (coordinates is not null)
@@ -580,7 +645,7 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
                 break;
             case "keypress":
             case "key":
-                await HandleKeyPressAsync(action.Keys).ConfigureAwait(false);
+                await HandleKeyPressAsync(action.Keys, cancellationToken).ConfigureAwait(false);
                 break;
             case "type":
                 if (!string.IsNullOrWhiteSpace(action.Text))
@@ -613,6 +678,7 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
         {
             await _page.GoBackAsync().ConfigureAwait(false);
             await Task.Delay(250, cancellationToken).ConfigureAwait(false);
+            await WaitForVisualStabilityAsync(cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -620,12 +686,14 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
         {
             await _page.GoForwardAsync().ConfigureAwait(false);
             await Task.Delay(250, cancellationToken).ConfigureAwait(false);
+            await WaitForVisualStabilityAsync(cancellationToken).ConfigureAwait(false);
             return;
         }
 
         if (button == "wheel")
         {
             await _page.Mouse.WheelAsync(0, (float)action.ScrollY).ConfigureAwait(false);
+            await WaitForVisualStabilityAsync(cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -638,7 +706,7 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
         await WaitForPotentialNavigationAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task HandleScrollAsync(ComputerUseAction action, (float X, float Y)? coordinates)
+    private async Task HandleScrollAsync(ComputerUseAction action, (float X, float Y)? coordinates, CancellationToken cancellationToken)
     {
         if (_page is null)
         {
@@ -651,9 +719,10 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
         }
 
         await _page.Mouse.WheelAsync((float)action.ScrollX, (float)action.ScrollY).ConfigureAwait(false);
+        await WaitForVisualStabilityAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task HandleKeyPressAsync(IReadOnlyList<string> keys)
+    private async Task HandleKeyPressAsync(IReadOnlyList<string> keys, CancellationToken cancellationToken)
     {
         if (_page is null || keys.Count == 0)
         {
@@ -687,6 +756,18 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
         else
         {
             await _page.Keyboard.PressAsync(translated[0]).ConfigureAwait(false);
+        }
+
+        bool hasEnter = translated.Any(key => string.Equals(key, "Enter", StringComparison.OrdinalIgnoreCase) || string.Equals(key, "NumpadEnter", StringComparison.OrdinalIgnoreCase));
+        if (hasEnter)
+        {
+            await WaitForPotentialNavigationAsync(cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        if (translated.Any(key => ScrollKeys.Contains(key)))
+        {
+            await WaitForVisualStabilityAsync(cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -736,6 +817,76 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
                 _page = newest;
             }
         }
+
+        await WaitForVisualStabilityAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task WaitForVisualStabilityAsync(CancellationToken cancellationToken)
+    {
+        if (_page is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await _page.WaitForLoadStateAsync(LoadState.DOMContentLoaded, new PageWaitForLoadStateOptions { Timeout = 2000 }).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+        }
+        catch (PlaywrightException)
+        {
+        }
+
+        double? previousHeight = null;
+        int stableSamples = 0;
+        int attempts = 0;
+
+        while (stableSamples < 3 && attempts < 12)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            ViewportSnapshot? snapshot = null;
+            try
+            {
+                snapshot = await _page.EvaluateAsync<ViewportSnapshot?>("""
+                    () => {
+                        const body = document.body;
+                        const scrollHeight = body ? body.scrollHeight : 0;
+                        const pendingImages = Array.from(document.images || []).filter(img => !img.complete).length;
+                        return { scrollHeight, pendingImages };
+                    }
+                """).ConfigureAwait(false);
+            }
+            catch (PlaywrightException ex)
+            {
+                _logger.LogDebug(ex, "Visual stability probe failed; retrying.");
+            }
+
+            if (snapshot.HasValue)
+            {
+                double height = snapshot.Value.ScrollHeight;
+                bool heightStable = previousHeight is null || Math.Abs(height - previousHeight.Value) < 4;
+                bool imagesSettled = snapshot.Value.PendingImages == 0;
+
+                if (heightStable && imagesSettled)
+                {
+                    stableSamples++;
+                }
+                else
+                {
+                    stableSamples = 0;
+                }
+
+                previousHeight = height;
+            }
+
+            attempts++;
+            await Task.Delay(120, cancellationToken).ConfigureAwait(false);
+        }
+
+        await Task.Delay(120, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<string> CaptureScreenshotAsync(CancellationToken cancellationToken)
@@ -750,6 +901,27 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
             byte[] data = await _page.ScreenshotAsync(new PageScreenshotOptions { FullPage = false }).ConfigureAwait(false);
             string base64 = Convert.ToBase64String(data);
             _lastScreenshot = base64;
+            // Persist every screenshot with session-aware naming for full traceability
+            try
+            {
+                string root = Path.Combine(Environment.CurrentDirectory, "debug", "computer-use");
+                Directory.CreateDirectory(root);
+                string timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmssfff");
+                int seq = Interlocked.Increment(ref _screenshotSequence);
+                string session = _currentSessionId ?? "nosession";
+                string fileName = $"{session}_{timestamp}_{seq:D4}.png";
+                string path = Path.Combine(root, fileName);
+                await File.WriteAllBytesAsync(path, data, cancellationToken).ConfigureAwait(false);
+                RecordTimelineEvent("screenshot", new Dictionary<string, object?>
+                {
+                    ["file"] = Path.GetRelativePath(Environment.CurrentDirectory, path),
+                    ["sequence"] = seq
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Failed to persist per-iteration screenshot.");
+            }
             return base64;
         }
         catch (Exception ex)
@@ -902,6 +1074,13 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
             string screenshotPath = Path.Combine(root, $"{timestamp}_{safeQuery}.png");
             byte[] bytes = Convert.FromBase64String(screenshotBase64);
             await File.WriteAllBytesAsync(screenshotPath, bytes, cancellationToken).ConfigureAwait(false);
+
+            RecordTimelineEvent("debug_artifacts_persisted", new Dictionary<string, object?>
+            {
+                ["domFile"] = $"{timestamp}_{safeQuery}_dom.json",
+                ["htmlFile"] = $"{timestamp}_{safeQuery}_page.html",
+                ["pngFile"] = $"{timestamp}_{safeQuery}.png"
+            });
         }
         catch (OperationCanceledException)
         {
@@ -1116,6 +1295,19 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
         }
 
     _logger.LogWarning("Detected CAPTCHA / challenge page during computer-use search for query '{Query}'.", query);
+        // capture current state so saved artifacts reflect the actual challenge screen
+        try
+        {
+            await CaptureScreenshotAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to capture screenshot while handling CAPTCHA detection.");
+        }
+        RecordTimelineEvent("captcha_detected", new Dictionary<string, object?>
+        {
+            ["query"] = query
+        });
         await PersistDebugArtifactsAsync(query, "{\"captcha\":true}", cancellationToken).ConfigureAwait(false);
     throw new ComputerUseSearchBlockedException("Encountered a CAPTCHA / bot challenge from the search engine while using Playwright automation.");
     }
@@ -1196,6 +1388,68 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
         };
     }
 
+    private static string? TruncateForLog(string? value)
+    {
+        if (string.IsNullOrEmpty(value)) return value;
+        return value.Length <= 80 ? value : value.Substring(0, 77) + "...";
+    }
+
+    private void InitializeTimeline(string query)
+    {
+        _timelineEntries = new List<TimelineEntry>
+        {
+            new TimelineEntry(DateTimeOffset.UtcNow, "session_start", new Dictionary<string, object?>
+            {
+                ["query"] = query,
+                ["sessionId"] = _currentSessionId
+            })
+        };
+        string root = Path.Combine(Environment.CurrentDirectory, "debug", "computer-use");
+        Directory.CreateDirectory(root);
+        _timelinePath = _currentSessionId is null
+            ? null
+            : Path.Combine(root, $"{_currentSessionId}_timeline.json");
+    }
+
+    private void RecordTimelineEvent(string eventName, Dictionary<string, object?>? data = null)
+    {
+        if (_timelineEntries is null)
+        {
+            return;
+        }
+
+        _timelineEntries.Add(new TimelineEntry(DateTimeOffset.UtcNow, eventName, data ?? new Dictionary<string, object?>()));
+    }
+
+    private async Task PersistTimelineAsync(string query, CancellationToken cancellationToken)
+    {
+        if (_timelineEntries is null || _timelineEntries.Count == 0 || string.IsNullOrWhiteSpace(_timelinePath))
+        {
+            return;
+        }
+
+        try
+        {
+            var payload = JsonSerializer.Serialize(_timelineEntries, SerializerOptions);
+            await File.WriteAllTextAsync(_timelinePath, payload, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to write timeline for query '{Query}'.", query);
+        }
+        finally
+        {
+            _timelineEntries = null;
+            _timelinePath = null;
+        }
+    }
+
+    private sealed record TimelineEntry(DateTimeOffset TimestampUtc, string Event, Dictionary<string, object?> Data);
+
     public async ValueTask DisposeAsync()
     {
         _operationLock.Dispose();
@@ -1262,6 +1516,369 @@ public sealed class ComputerUseSearchService : IAsyncDisposable
         IReadOnlyList<string> Keys,
         string? Text,
         double? DurationMs);
+
+    private readonly record struct ViewportSnapshot(double ScrollHeight, int PendingImages);
+
+    public async Task<ComputerUseExplorationResult> ExploreAsync(string url, string? objective = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(url);
+
+        await InitializeAsync(cancellationToken).ConfigureAwait(false);
+        await _operationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+
+        try
+        {
+            _currentSessionId = Guid.NewGuid().ToString("N");
+            _screenshotSequence = 0;
+            InitializeTimeline($"explore::{url}");
+            if (_page is null)
+            {
+                throw new InvalidOperationException("Computer-use browser page was not initialized.");
+            }
+
+            RecordTimelineEvent("exploration_start", new Dictionary<string, object?>
+            {
+                ["url"] = url,
+                ["objective"] = objective
+            });
+
+            await _page.GotoAsync(url, new PageGotoOptions
+            {
+                WaitUntil = WaitUntilState.DOMContentLoaded,
+                Timeout = 20000
+            }).ConfigureAwait(false);
+            await DismissConsentAsync(cancellationToken).ConfigureAwait(false);
+            await ThrowIfCaptchaDetectedAsync(url, cancellationToken).ConfigureAwait(false);
+            await _page.BringToFrontAsync().ConfigureAwait(false);
+            await Task.Delay(300, cancellationToken).ConfigureAwait(false);
+
+            var transcript = new List<string>();
+            ComputerUseResponseState response = await SendInitialExplorationRequestAsync(url, objective, transcript, cancellationToken).ConfigureAwait(false);
+            int iteration = 0;
+
+            while (response.Call is not null && iteration < MaxIterations)
+            {
+                iteration++;
+                await HandleComputerCallAsync(response.Call, cancellationToken).ConfigureAwait(false);
+                response = await SendFollowupRequestAsync(response, transcript, cancellationToken, ExplorationInstructions).ConfigureAwait(false);
+
+                if (response.Call is null || response.Completed)
+                {
+                    break;
+                }
+            }
+
+            if (iteration >= MaxIterations && response.Call is not null)
+            {
+                _logger.LogWarning("Computer-use exploration for url '{Url}' reached iteration limit before completion.", url);
+            }
+
+            string? finalUrl = null;
+            string? pageTitle = null;
+            try
+            {
+                finalUrl = _page.Url;
+                pageTitle = await _page.TitleAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is PlaywrightException or InvalidOperationException)
+            {
+                _logger.LogDebug(ex, "Failed to capture final page metadata for exploration '{Url}'.", url);
+            }
+
+            ExplorationStructuredOutput structured = ParseExplorationStructuredOutput(transcript);
+            string summary = !string.IsNullOrWhiteSpace(structured.Summary)
+                ? structured.Summary!
+                : ExtractExplorationSummary(transcript);
+
+            if (structured.FlaggedResources.Count > 0)
+            {
+                RecordTimelineEvent("flagged_resources", new Dictionary<string, object?>
+                {
+                    ["count"] = structured.FlaggedResources.Count,
+                    ["items"] = structured.FlaggedResources.Select(resource => new Dictionary<string, object?>
+                    {
+                        ["type"] = resource.Type.ToString(),
+                        ["title"] = resource.Title,
+                        ["url"] = resource.Url,
+                        ["mimeType"] = resource.MimeType,
+                        ["notes"] = resource.Notes
+                    }).ToArray()
+                });
+            }
+
+            RecordTimelineEvent("exploration_complete", new Dictionary<string, object?>
+            {
+                ["requestedUrl"] = url,
+                ["finalUrl"] = finalUrl,
+                ["summary"] = summary
+            });
+
+            return new ComputerUseExplorationResult(url, finalUrl, pageTitle, summary, transcript.ToArray(), structured.FlaggedResources);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (ComputerUseSearchBlockedException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Computer-use exploration failed for url '{Url}'.", url);
+            throw;
+        }
+        finally
+        {
+            try
+            {
+                await PersistTimelineAsync(url, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Failed to persist computer-use timeline for exploration '{Url}'.", url);
+            }
+
+            try
+            {
+                await NavigateToStartAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Failed to reset browser after exploration session.");
+            }
+
+            _operationLock.Release();
+        }
+    }
+
+    private async Task<ComputerUseResponseState> SendInitialExplorationRequestAsync(string targetUrl, string? objective, List<string> transcript, CancellationToken cancellationToken)
+    {
+        string screenshot = await CaptureScreenshotAsync(cancellationToken).ConfigureAwait(false);
+        string objectiveClause = string.IsNullOrWhiteSpace(objective)
+            ? "Review the currently open page and capture the most important insights."
+            : $"Review the currently open page and capture information relevant to \"{objective}\".";
+
+        string userInstruction = string.Concat(objectiveClause, " Scroll as needed before summarizing your findings. The requested page is ", targetUrl, ". Provide a concise summary with bullet points and note any important sections or outbound links.");
+
+        var payload = new JsonObject
+        {
+            ["input"] = new JsonArray
+            {
+                new JsonObject
+                {
+                    ["role"] = "user",
+                    ["content"] = new JsonArray
+                    {
+                        new JsonObject
+                        {
+                            ["type"] = "input_text",
+                            ["text"] = userInstruction
+                        },
+                        new JsonObject
+                        {
+                            ["type"] = "input_image",
+                            ["image_url"] = $"data:image/png;base64,{screenshot}"
+                        }
+                    }
+                }
+            },
+                ["instructions"] = ExplorationInstructions,
+            ["tools"] = BuildToolsArray(),
+            ["reasoning"] = new JsonObject { ["generate_summary"] = "concise" },
+            ["temperature"] = 0.2,
+            ["top_p"] = 0.8,
+            ["truncation"] = "auto"
+        };
+        payload["model"] = _deployment;
+
+        using JsonDocument response = await SendRequestAsync(payload, cancellationToken).ConfigureAwait(false);
+        return ParseResponse(response, transcript);
+    }
+
+    private ExplorationStructuredOutput ParseExplorationStructuredOutput(IReadOnlyList<string> transcript)
+    {
+        if (transcript.Count == 0)
+        {
+            return new ExplorationStructuredOutput(null, Array.Empty<FlaggedResource>());
+        }
+
+        for (int index = transcript.Count - 1; index >= 0; index--)
+        {
+            string entry = transcript[index];
+            if (!TryParseExplorationPayload(entry, out var payload))
+            {
+                continue;
+            }
+
+            List<FlaggedResource> flagged = payload.Flagged is null
+                ? new List<FlaggedResource>()
+                : payload.Flagged
+                    .Select(TryConvertResource)
+                    .Where(static resource => resource is not null)
+                    .Select(static resource => resource!)
+                    .DistinctBy(static resource => resource.Url, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+            return new ExplorationStructuredOutput(payload.Summary, flagged);
+        }
+
+        return new ExplorationStructuredOutput(null, Array.Empty<FlaggedResource>());
+    }
+
+    private bool TryParseExplorationPayload(string entry, out ExplorationPayload payload)
+    {
+        payload = new ExplorationPayload();
+        if (string.IsNullOrWhiteSpace(entry))
+        {
+            return false;
+        }
+
+        string trimmed = entry.Trim();
+        int start = trimmed.IndexOf('{');
+        int end = trimmed.LastIndexOf('}');
+        if (start < 0 || end <= start)
+        {
+            return false;
+        }
+
+        string candidate = trimmed[start..(end + 1)];
+        try
+        {
+            ExplorationPayload? parsed = JsonSerializer.Deserialize<ExplorationPayload>(candidate, SerializerOptions);
+            if (parsed is null)
+            {
+                return false;
+            }
+
+            if (string.IsNullOrWhiteSpace(parsed.Summary) && (parsed.Flagged is null || parsed.Flagged.Count == 0))
+            {
+                return false;
+            }
+
+            payload = parsed;
+            return true;
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogDebug(ex, "Failed to parse structured exploration payload. Raw={Payload}", candidate);
+            return false;
+        }
+    }
+
+    private static FlaggedResource? TryConvertResource(ExplorationPayloadResource resource)
+    {
+        if (resource is null)
+        {
+            return null;
+        }
+
+        string? url = resource.Url?.Trim();
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return null;
+        }
+
+        string title = string.IsNullOrWhiteSpace(resource.Title) ? url : resource.Title!.Trim();
+        string? mime = string.IsNullOrWhiteSpace(resource.MimeType) ? null : resource.MimeType!.Trim();
+        string? notes = string.IsNullOrWhiteSpace(resource.Notes) ? null : resource.Notes!.Trim();
+
+        FlaggedResourceType type = ParseResourceType(resource.Type);
+
+        if (type == FlaggedResourceType.Page && LooksLikePdf(url, mime))
+        {
+            type = FlaggedResourceType.File;
+        }
+
+        if (type is FlaggedResourceType.File or FlaggedResourceType.Download && mime is null && LooksLikePdf(url, mime))
+        {
+            mime = "application/pdf";
+        }
+
+        return new FlaggedResource(type, title, url, mime, notes);
+    }
+
+    private static bool LooksLikePdf(string url, string? mime)
+    {
+        if (!string.IsNullOrWhiteSpace(mime) && mime.Contains("pdf", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (Uri.TryCreate(url, UriKind.Absolute, out var uri))
+        {
+            string path = uri.AbsolutePath;
+            if (!string.IsNullOrEmpty(path) && path.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+        else if (url.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static FlaggedResourceType ParseResourceType(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return FlaggedResourceType.Page;
+        }
+
+        return value.Trim().ToLowerInvariant() switch
+        {
+            "page" or "article" or "link" or "section" => FlaggedResourceType.Page,
+            "file" or "document" or "pdf" or "report" => FlaggedResourceType.File,
+            "download" or "binary" or "dataset" or "archive" => FlaggedResourceType.Download,
+            _ => FlaggedResourceType.Page
+        };
+    }
+
+    private static string ExtractExplorationSummary(IReadOnlyList<string> transcript)
+    {
+        if (transcript.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        for (int index = transcript.Count - 1; index >= 0; index--)
+        {
+            string candidate = transcript[index];
+            if (!string.IsNullOrWhiteSpace(candidate) && candidate.Length > 40)
+            {
+                return candidate.Trim();
+            }
+        }
+
+        string fallback = string.Join(" ", transcript.TakeLast(3).Where(static entry => !string.IsNullOrWhiteSpace(entry))).Trim();
+        return fallback;
+    }
+
+    private sealed record ExplorationStructuredOutput(string? Summary, IReadOnlyList<FlaggedResource> FlaggedResources);
+
+    private sealed class ExplorationPayload
+    {
+        public string? Summary { get; set; }
+
+        public List<ExplorationPayloadResource>? Flagged { get; set; }
+    }
+
+    private sealed class ExplorationPayloadResource
+    {
+        public string? Type { get; set; }
+
+        public string? Title { get; set; }
+
+        public string? Url { get; set; }
+
+        public string? MimeType { get; set; }
+
+        public string? Notes { get; set; }
+    }
+
 }
 
 public sealed class ComputerUseSearchBlockedException : InvalidOperationException
@@ -1278,6 +1895,14 @@ public sealed record ComputerUseSearchResult(
     string? FinalUrl);
 
 public sealed record ComputerUseSearchResultItem(string Title, string Url, string Snippet);
+
+public sealed record ComputerUseExplorationResult(
+    string RequestedUrl,
+    string? FinalUrl,
+    string? PageTitle,
+    string? Summary,
+    IReadOnlyList<string> Transcript,
+    IReadOnlyList<FlaggedResource> FlaggedResources);
 
 
 

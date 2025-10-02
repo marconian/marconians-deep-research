@@ -14,5 +14,7 @@ public sealed class ToolExecutionResult
 
     public List<SourceCitation> Citations { get; init; } = new();
 
+    public List<FlaggedResource> FlaggedResources { get; init; } = new();
+
     public string? ErrorMessage { get; init; }
 }

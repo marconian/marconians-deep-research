@@ -1,6 +1,10 @@
+using System;
+using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
 using System.Linq;
 using System.Text;
+using System.Text.Json;
 using Marconian.ResearchAgent.Memory;
 using Marconian.ResearchAgent.Models.Agents;
 using Marconian.ResearchAgent.Models.Memory;
@@ -68,6 +72,8 @@ public sealed class ResearcherAgent : IAgent
 
         var toolOutputs = new List<ToolExecutionResult>();
         var errors = new List<string>();
+        var flaggedResources = new List<FlaggedResource>();
+        var flaggedResourceUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         IReadOnlyList<MemorySearchResult> relatedMemories = await _longTermMemoryManager
             .SearchRelevantAsync(task.ResearchSessionId, task.Objective, 3, cancellationToken)
@@ -97,9 +103,134 @@ public sealed class ResearcherAgent : IAgent
                 cancellationToken).ConfigureAwait(false);
         }
 
-        if (searchResult is { Success: true } && TryGetTool<WebScraperTool>(out var scraperTool))
+        var citationsForFollowUp = searchResult?.Citations?.ToList() ?? new List<SourceCitation>();
+
+        if (searchResult is { Success: true, Citations.Count: > 0 } && TryGetTool<ComputerUseNavigatorTool>(out var navigatorTool))
         {
-            foreach (var citation in searchResult.Citations.Take(3))
+            ExplorationSelection selection = await SelectCitationsForExplorationAsync(task, searchResult, cancellationToken).ConfigureAwait(false);
+            if (selection.Citations.Count > 0)
+            {
+                citationsForFollowUp = selection.Citations.ToList();
+                string selectionMessage = $"Selected {citationsForFollowUp.Count} search result(s) for computer-use exploration.";
+                if (!string.IsNullOrWhiteSpace(selection.Notes))
+                {
+                    selectionMessage += $" Rationale: {selection.Notes}";
+                }
+
+                await shortTermMemory.AppendAsync("assistant", selectionMessage, cancellationToken).ConfigureAwait(false);
+                _flowTracker?.RecordBranchNote(task.TaskId, selectionMessage);
+
+                    await PersistSelectionAsync(task, selection, cancellationToken).ConfigureAwait(false);
+
+                foreach (var citation in citationsForFollowUp)
+                {
+                    if (string.IsNullOrWhiteSpace(citation.Url))
+                    {
+                        continue;
+                    }
+
+                    var navParameters = new Dictionary<string, string>
+                    {
+                        ["url"] = citation.Url,
+                        ["objective"] = task.Objective
+                    };
+
+                    ToolExecutionResult navResult = await ExecuteToolAsync(
+                        task,
+                        navigatorTool,
+                        CreateContext(task, navParameters),
+                        toolOutputs,
+                        errors,
+                        shortTermMemory,
+                        cancellationToken).ConfigureAwait(false);
+
+                    if (navResult.FlaggedResources.Count > 0)
+                    {
+                        foreach (var resource in navResult.FlaggedResources)
+                        {
+                            if (string.IsNullOrWhiteSpace(resource.Url))
+                            {
+                                continue;
+                            }
+
+                            if (flaggedResourceUrls.Add(resource.Url))
+                            {
+                                flaggedResources.Add(resource);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (citationsForFollowUp.Count == 0 && searchResult is { Success: true })
+        {
+            citationsForFollowUp = searchResult.Citations.Take(3).ToList();
+        }
+
+        var splitCitations = SplitCitations(citationsForFollowUp);
+        citationsForFollowUp = splitCitations.Pages;
+        var documentCitations = splitCitations.Documents;
+
+        if (flaggedResources.Count > 0)
+        {
+            var noteBuilder = new StringBuilder();
+            noteBuilder.AppendLine($"Navigator flagged {flaggedResources.Count} resource(s) for deeper review.");
+            foreach (var resource in flaggedResources)
+            {
+                FlaggedResourceType displayType = ShouldTreatAsBinaryResource(resource) ? FlaggedResourceType.File : resource.Type;
+                noteBuilder.Append("- ").Append(displayType).Append(':');
+                noteBuilder.Append(' ').Append(string.IsNullOrWhiteSpace(resource.Title) ? resource.Url : resource.Title);
+                if (!string.IsNullOrWhiteSpace(resource.Url))
+                {
+                    noteBuilder.Append(" -> ").Append(resource.Url);
+                }
+                if (!string.IsNullOrWhiteSpace(resource.Notes))
+                {
+                    noteBuilder.Append(" (" + resource.Notes + ")");
+                }
+                noteBuilder.AppendLine();
+            }
+
+            string flaggedSummary = noteBuilder.ToString().TrimEnd();
+            await shortTermMemory.AppendAsync("assistant", flaggedSummary, cancellationToken).ConfigureAwait(false);
+            _flowTracker?.RecordBranchNote(task.TaskId, flaggedSummary);
+        }
+
+        var flaggedPageCitations = new List<SourceCitation>();
+        var flaggedFileResources = new List<FlaggedResource>();
+        var seenFlaggedUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var resource in flaggedResources)
+        {
+            if (string.IsNullOrWhiteSpace(resource.Url) || !seenFlaggedUrls.Add(resource.Url))
+            {
+                continue;
+            }
+
+            if (ShouldTreatAsBinaryResource(resource))
+            {
+                flaggedFileResources.Add(resource);
+                continue;
+            }
+
+            flaggedPageCitations.Add(new SourceCitation(
+                $"flag:{Guid.NewGuid():N}",
+                string.IsNullOrWhiteSpace(resource.Title) ? resource.Url : resource.Title,
+                resource.Url,
+                resource.Notes ?? resource.MimeType ?? "Flagged during computer-use exploration"));
+        }
+
+        if ((citationsForFollowUp.Count > 0 || flaggedPageCitations.Count > 0) && TryGetTool<WebScraperTool>(out var scraperTool))
+        {
+            var scrapeCandidates = flaggedPageCitations
+                .Concat(citationsForFollowUp)
+                .Where(citation => !string.IsNullOrWhiteSpace(citation.Url))
+                .DistinctBy(static citation => citation.Url, StringComparer.OrdinalIgnoreCase)
+                .Take(5)
+                .ToList();
+
+            foreach (var citation in scrapeCandidates)
             {
                 if (string.IsNullOrWhiteSpace(citation.Url))
                 {
@@ -127,16 +258,79 @@ public sealed class ResearcherAgent : IAgent
             }
         }
 
-        if (task.Parameters.Keys.Any(key => key is "fileId" or "url" or "path") && TryGetTool<FileReaderTool>(out var fileReader))
+        if (TryGetTool<FileReaderTool>(out var fileReader))
         {
-            await ExecuteToolAsync(
-                task,
-                fileReader,
-                CreateContext(task, new Dictionary<string, string>(task.Parameters)),
-                toolOutputs,
-                errors,
-                shortTermMemory,
-                cancellationToken).ConfigureAwait(false);
+            var fileReadRequests = new List<Dictionary<string, string>>();
+            var requestedFileUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            if (task.Parameters.Keys.Any(key => key is "fileId" or "url" or "path"))
+            {
+                fileReadRequests.Add(new Dictionary<string, string>(task.Parameters));
+            }
+
+            foreach (var resource in flaggedFileResources.Take(3))
+            {
+                if (string.IsNullOrWhiteSpace(resource.Url) || !requestedFileUrls.Add(resource.Url))
+                {
+                    continue;
+                }
+
+                var parameters = new Dictionary<string, string>
+                {
+                    ["url"] = resource.Url
+                };
+
+                if (!string.IsNullOrWhiteSpace(resource.MimeType))
+                {
+                    parameters["contentTypeHint"] = resource.MimeType!;
+                }
+
+                if (!string.IsNullOrWhiteSpace(resource.Notes))
+                {
+                    parameters["note"] = resource.Notes!;
+                }
+
+                parameters["origin"] = "computer-use";
+                fileReadRequests.Add(parameters);
+            }
+
+            foreach (var citation in documentCitations.Take(3))
+            {
+                if (string.IsNullOrWhiteSpace(citation.Url) || !requestedFileUrls.Add(citation.Url))
+                {
+                    continue;
+                }
+
+                var parameters = new Dictionary<string, string>
+                {
+                    ["url"] = citation.Url,
+                    ["origin"] = "search-result",
+                    ["contentTypeHint"] = "application/pdf"
+                };
+
+                if (!string.IsNullOrWhiteSpace(citation.Title))
+                {
+                    parameters["note"] = citation.Title!;
+                }
+                else if (!string.IsNullOrWhiteSpace(citation.Snippet))
+                {
+                    parameters["note"] = citation.Snippet!;
+                }
+
+                fileReadRequests.Add(parameters);
+            }
+
+            foreach (var request in fileReadRequests)
+            {
+                await ExecuteToolAsync(
+                    task,
+                    fileReader,
+                    CreateContext(task, request),
+                    toolOutputs,
+                    errors,
+                    shortTermMemory,
+                    cancellationToken).ConfigureAwait(false);
+            }
         }
 
         if ((task.Parameters.ContainsKey("imageFileId") || task.Parameters.ContainsKey("imageUrl")) && TryGetTool<ImageReaderTool>(out var imageReader))
@@ -198,6 +392,58 @@ public sealed class ResearcherAgent : IAgent
         };
     }
 
+    private async Task PersistSelectionAsync(AgentTask task, ExplorationSelection selection, CancellationToken cancellationToken)
+    {
+        if (selection.Citations.Count == 0)
+        {
+            return;
+        }
+
+        var builder = new StringBuilder();
+        builder.AppendLine($"Selected citations for objective: {task.Objective}");
+
+        if (!string.IsNullOrWhiteSpace(selection.Notes))
+        {
+            builder.AppendLine($"Notes: {selection.Notes}");
+            builder.AppendLine();
+        }
+
+        for (int index = 0; index < selection.Citations.Count; index++)
+        {
+            var citation = selection.Citations[index];
+            builder.AppendLine($"{index + 1}. {citation.Title ?? citation.Url ?? citation.SourceId}");
+            if (!string.IsNullOrWhiteSpace(citation.Url))
+            {
+                builder.AppendLine(citation.Url);
+            }
+            if (!string.IsNullOrWhiteSpace(citation.Snippet))
+            {
+                builder.AppendLine(citation.Snippet);
+            }
+            builder.AppendLine();
+        }
+
+        var metadata = new Dictionary<string, string>
+        {
+            ["agentTaskId"] = task.TaskId,
+            ["selectionCount"] = selection.Citations.Count.ToString(CultureInfo.InvariantCulture),
+            ["tool"] = "SearchSelection"
+        };
+
+        if (!string.IsNullOrWhiteSpace(selection.Notes))
+        {
+            metadata["selectionNotes"] = selection.Notes!;
+        }
+
+        await _longTermMemoryManager.StoreDocumentAsync(
+            task.ResearchSessionId,
+            builder.ToString().TrimEnd(),
+            "search_selection",
+            selection.Citations,
+            metadata,
+            cancellationToken).ConfigureAwait(false);
+    }
+
     private ToolExecutionContext CreateContext(AgentTask task, Dictionary<string, string> parameters)
         => new()
         {
@@ -206,6 +452,64 @@ public sealed class ResearcherAgent : IAgent
             Instruction = task.Objective,
             Parameters = parameters
         };
+
+    private static (List<SourceCitation> Pages, List<SourceCitation> Documents) SplitCitations(IEnumerable<SourceCitation> citations)
+    {
+        var pages = new List<SourceCitation>();
+        var documents = new List<SourceCitation>();
+
+        foreach (var citation in citations)
+        {
+            if (IsLikelyPdf(citation.Url))
+            {
+                documents.Add(citation);
+            }
+            else
+            {
+                pages.Add(citation);
+            }
+        }
+
+        return (pages, documents);
+    }
+
+    private static bool ShouldTreatAsBinaryResource(FlaggedResource resource)
+    {
+        if (resource.Type is FlaggedResourceType.File or FlaggedResourceType.Download)
+        {
+            return true;
+        }
+
+        return IsLikelyPdf(resource.Url, resource.MimeType);
+    }
+
+    private static bool IsLikelyPdf(string? url, string? mimeType = null)
+    {
+        if (!string.IsNullOrWhiteSpace(mimeType) && mimeType.Contains("pdf", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return false;
+        }
+
+        if (Uri.TryCreate(url, UriKind.Absolute, out var uri))
+        {
+            string path = uri.AbsolutePath;
+            if (!string.IsNullOrEmpty(path) && path.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+        else if (url.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return false;
+    }
 
     private async Task<ToolExecutionResult> ExecuteToolAsync(
         AgentTask task,
@@ -349,6 +653,144 @@ public sealed class ResearcherAgent : IAgent
 
         return 0.6d;
     }
+
+    private async Task<ExplorationSelection> SelectCitationsForExplorationAsync(
+        AgentTask task,
+        ToolExecutionResult searchResult,
+        CancellationToken cancellationToken)
+    {
+        if (searchResult.Citations.Count == 0)
+        {
+            return new ExplorationSelection(Array.Empty<SourceCitation>(), null);
+        }
+
+        var prompt = new StringBuilder();
+        prompt.AppendLine($"Research objective: {task.Objective}");
+        prompt.AppendLine("Review the search results below and choose up to three that warrant a deeper computer-use browsing session. Favor sources that appear authoritative, comprehensive, or directly aligned with the objective.");
+        prompt.AppendLine();
+
+        for (int index = 0; index < searchResult.Citations.Count; index++)
+        {
+            var citation = searchResult.Citations[index];
+            string title = string.IsNullOrWhiteSpace(citation.Title) ? "Untitled" : citation.Title;
+            prompt.AppendLine($"{index + 1}. {title}");
+            if (!string.IsNullOrWhiteSpace(citation.Url))
+            {
+                prompt.AppendLine($"   URL: {citation.Url}");
+            }
+            if (!string.IsNullOrWhiteSpace(citation.Snippet))
+            {
+                prompt.AppendLine($"   Snippet: {citation.Snippet}");
+            }
+            prompt.AppendLine();
+        }
+
+        var selectionRequest = new OpenAiChatRequest(
+            SystemPrompt: "You triage search results for an autonomous researcher. Always reply with strict JSON in the schema {\"selected\":[int],\"notes\":\"string\"}. Indices are 1-based. Include at least one entry when possible.",
+            Messages: new[]
+            {
+                new OpenAiChatMessage("user", prompt.ToString())
+            },
+            DeploymentName: _chatDeploymentName,
+            MaxOutputTokens: 350);
+
+        string response = await _openAiService.GenerateTextAsync(selectionRequest, cancellationToken).ConfigureAwait(false);
+        ParsedSelection parsed = ParseSelectionResponse(response, searchResult.Citations.Count);
+
+        var chosen = new List<SourceCitation>();
+        foreach (int selectionIndex in parsed.Indices)
+        {
+            int zeroBased = selectionIndex - 1;
+            if (zeroBased >= 0 && zeroBased < searchResult.Citations.Count)
+            {
+                var citation = searchResult.Citations[zeroBased];
+                if (!chosen.Contains(citation))
+                {
+                    chosen.Add(citation);
+                }
+            }
+        }
+
+        if (chosen.Count == 0)
+        {
+            chosen.AddRange(searchResult.Citations.Take(Math.Min(2, searchResult.Citations.Count)));
+        }
+
+        return new ExplorationSelection(chosen, parsed.Notes);
+    }
+
+    private static ParsedSelection ParseSelectionResponse(string response, int maxCount)
+    {
+        var indices = new List<int>();
+        string? notes = null;
+
+        string? jsonPayload = ExtractJsonSegment(response);
+        if (jsonPayload is null)
+        {
+            return new ParsedSelection(indices, notes);
+        }
+
+        try
+        {
+            using JsonDocument document = JsonDocument.Parse(jsonPayload);
+            if (document.RootElement.TryGetProperty("selected", out JsonElement selectedElement) && selectedElement.ValueKind == JsonValueKind.Array)
+            {
+                foreach (JsonElement value in selectedElement.EnumerateArray())
+                {
+                    if (value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out int index) && index >= 1 && index <= maxCount)
+                    {
+                        if (!indices.Contains(index))
+                        {
+                            indices.Add(index);
+                        }
+                    }
+                }
+            }
+
+            if (document.RootElement.TryGetProperty("notes", out JsonElement notesElement) && notesElement.ValueKind == JsonValueKind.String)
+            {
+                notes = notesElement.GetString();
+            }
+        }
+        catch (JsonException)
+        {
+            return new ParsedSelection(indices, notes);
+        }
+
+        if (indices.Count > 3)
+        {
+            indices = indices.Take(3).ToList();
+        }
+
+        return new ParsedSelection(indices, notes);
+    }
+
+    private static string? ExtractJsonSegment(string response)
+    {
+        if (string.IsNullOrWhiteSpace(response))
+        {
+            return null;
+        }
+
+        string trimmed = response.Trim();
+        if (trimmed.StartsWith('{') && trimmed.EndsWith('}'))
+        {
+            return trimmed;
+        }
+
+        int start = trimmed.IndexOf('{');
+        int end = trimmed.LastIndexOf('}');
+        if (start >= 0 && end > start)
+        {
+            return trimmed.Substring(start, end - start + 1);
+        }
+
+        return null;
+    }
+
+    private sealed record ExplorationSelection(IReadOnlyList<SourceCitation> Citations, string? Notes);
+
+    private sealed record ParsedSelection(IReadOnlyList<int> Indices, string? Notes);
 }
 
 

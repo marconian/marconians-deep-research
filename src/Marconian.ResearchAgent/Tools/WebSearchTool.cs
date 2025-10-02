@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http;
 using System.Text;
@@ -24,6 +25,7 @@ public sealed class WebSearchTool : ITool, IDisposable
     private readonly WebSearchProvider _requestedProvider;
     private readonly WebSearchProvider _fallbackProvider;
     private readonly string? _computerUseDisabledReason;
+    private readonly ComputerUseMode _computerUseMode;
     private bool _computerUseWarningIssued;
     private readonly ComputerUseSearchService? _computerUseService;
 
@@ -36,7 +38,8 @@ public sealed class WebSearchTool : ITool, IDisposable
         WebSearchProvider provider = WebSearchProvider.GoogleApi,
         ComputerUseSearchService? computerUseService = null,
         WebSearchProvider? fallbackProvider = null,
-        string? computerUseDisabledReason = null)
+        string? computerUseDisabledReason = null,
+        ComputerUseMode computerUseMode = ComputerUseMode.Hybrid)
     {
         _cacheService = cacheService;
         _logger = logger ?? NullLogger<WebSearchTool>.Instance;
@@ -45,6 +48,7 @@ public sealed class WebSearchTool : ITool, IDisposable
         _computerUseDisabledReason = string.IsNullOrWhiteSpace(computerUseDisabledReason)
             ? null
             : computerUseDisabledReason;
+        _computerUseMode = computerUseMode;
 
         if (_requestedProvider == WebSearchProvider.GoogleApi)
         {
@@ -122,6 +126,12 @@ public sealed class WebSearchTool : ITool, IDisposable
         }
 
         string normalizedQuery = query.Trim().ToLowerInvariant();
+
+        if (_requestedProvider == WebSearchProvider.ComputerUse && _computerUseMode == ComputerUseMode.Hybrid)
+        {
+            return await ExecuteHybridAsync(query, normalizedQuery, cancellationToken).ConfigureAwait(false);
+        }
+
         WebSearchProvider provider = ResolveProvider();
         string cacheKey = $"tool:websearch:{provider}:{normalizedQuery}";
 
@@ -298,6 +308,35 @@ public sealed class WebSearchTool : ITool, IDisposable
                     failureMetadata["steps"] = transcriptSummary;
                 }
 
+                if (CanUseHybridFallback())
+                {
+                    _logger.LogInformation("Falling back to {FallbackProvider} search for query '{Query}' after empty computer-use results.", _fallbackProvider, query);
+                    ToolExecutionResult fallback = await ExecuteFallbackAsync(query, "NoResults", cancellationToken).ConfigureAwait(false);
+                    if (fallback.Success)
+                    {
+                        return fallback;
+                    }
+
+                    // merge failure metadata to surface root cause if fallback fails
+                    if (fallback.Metadata is not null)
+                    {
+                        foreach (var kvp in fallback.Metadata)
+                        {
+                            failureMetadata[kvp.Key] = kvp.Value;
+                        }
+                    }
+
+                    return new ToolExecutionResult
+                    {
+                        ToolName = fallback.ToolName,
+                        Success = fallback.Success,
+                        Output = fallback.Output,
+                        Citations = new List<SourceCitation>(fallback.Citations),
+                        Metadata = failureMetadata,
+                        ErrorMessage = fallback.ErrorMessage
+                    };
+                }
+
                 return new ToolExecutionResult
                 {
                     ToolName = Name,
@@ -351,12 +390,17 @@ public sealed class WebSearchTool : ITool, IDisposable
         catch (ComputerUseSearchBlockedException blockedEx)
         {
             _logger.LogWarning(blockedEx, "Computer-use search was blocked by a CAPTCHA challenge for query '{Query}'.", query);
+            if (CanUseHybridFallback())
+            {
+                _logger.LogInformation("Falling back to {FallbackProvider} search for query '{Query}' after CAPTCHA block.", _fallbackProvider, query);
+                return await ExecuteFallbackAsync(query, "CAPTCHA", cancellationToken, blockedEx.Message).ConfigureAwait(false);
+            }
 
             return new ToolExecutionResult
             {
                 ToolName = Name,
                 Success = false,
-                ErrorMessage = "Computer-use search was blocked by a CAPTCHA challenge from Bing. Falling back to an alternative provider is recommended.",
+                ErrorMessage = "Computer-use search was blocked by a CAPTCHA challenge from the search engine. No fallback provider was available.",
                 Metadata = new Dictionary<string, string>
                 {
                     ["query"] = query,
@@ -368,6 +412,11 @@ public sealed class WebSearchTool : ITool, IDisposable
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or PlaywrightException or InvalidOperationException)
         {
             _logger.LogWarning(ex, "Computer-use search failed for query '{Query}'.", query);
+            if (CanUseHybridFallback())
+            {
+                _logger.LogInformation("Falling back to {FallbackProvider} search for query '{Query}' after computer-use failure.", _fallbackProvider, query);
+                return await ExecuteFallbackAsync(query, "Exception", cancellationToken, ex.Message).ConfigureAwait(false);
+            }
             return new ToolExecutionResult
             {
                 ToolName = Name,
@@ -380,6 +429,91 @@ public sealed class WebSearchTool : ITool, IDisposable
                 }
             };
         }
+    }
+
+    private async Task<ToolExecutionResult> ExecuteHybridAsync(string query, string normalizedQuery, CancellationToken cancellationToken)
+    {
+        string cacheKey = $"tool:websearch:hybrid:{normalizedQuery}";
+        if (_cacheService is not null)
+        {
+            var cached = await _cacheService.GetAsync<ToolExecutionResult>(cacheKey, cancellationToken).ConfigureAwait(false);
+            if (cached is not null && cached.Success)
+            {
+                _logger.LogDebug("Returning cached hybrid web search result for query '{Query}'.", query);
+                return cached;
+            }
+        }
+
+        bool googleAvailable = HasGoogleCredentials();
+        if (googleAvailable)
+        {
+            ToolExecutionResult apiResult = await ExecuteGoogleAsync(query, cancellationToken).ConfigureAwait(false);
+            if (apiResult.Success && !string.IsNullOrWhiteSpace(apiResult.Output))
+            {
+                apiResult.Metadata["mode"] = "HybridPrimary";
+                apiResult.Metadata["hybridProvider"] = WebSearchProvider.GoogleApi.ToString();
+
+                if (_cacheService is not null)
+                {
+                    await _cacheService.SetAsync(cacheKey, apiResult, TimeSpan.FromMinutes(30), cancellationToken).ConfigureAwait(false);
+                    _logger.LogDebug("Cached hybrid web search result for query '{Query}' from Google API.", query);
+                }
+
+                return apiResult;
+            }
+
+            _logger.LogWarning("Google API search did not yield usable results for query '{Query}'. Attempting computer-use provider.", query);
+        }
+        else
+        {
+            _logger.LogWarning("Hybrid mode requested but Google API credentials are unavailable. Falling back to computer-use provider for query '{Query}'.", query);
+        }
+
+        ToolExecutionResult computerUseResult = await ExecuteComputerUseAsync(query, cancellationToken).ConfigureAwait(false);
+        computerUseResult.Metadata["mode"] = "HybridSecondary";
+        computerUseResult.Metadata["hybridProvider"] = WebSearchProvider.ComputerUse.ToString();
+
+        if (_cacheService is not null && computerUseResult.Success)
+        {
+            await _cacheService.SetAsync(cacheKey, computerUseResult, TimeSpan.FromMinutes(15), cancellationToken).ConfigureAwait(false);
+            _logger.LogDebug("Cached hybrid web search result for query '{Query}' from computer-use provider.", query);
+        }
+
+        return computerUseResult;
+    }
+
+    private bool CanUseHybridFallback() =>
+        _computerUseMode == ComputerUseMode.Hybrid &&
+        _fallbackProvider == WebSearchProvider.GoogleApi &&
+        HasGoogleCredentials();
+
+    private async Task<ToolExecutionResult> ExecuteFallbackAsync(
+        string query,
+        string fallbackReason,
+        CancellationToken cancellationToken,
+        string? additionalDetail = null)
+    {
+        ToolExecutionResult fallback = await ExecuteGoogleAsync(query, cancellationToken).ConfigureAwait(false);
+        var metadata = new Dictionary<string, string>(fallback.Metadata)
+        {
+            ["fallbackFrom"] = WebSearchProvider.ComputerUse.ToString(),
+            ["fallbackReason"] = fallbackReason
+        };
+
+        if (!string.IsNullOrWhiteSpace(additionalDetail))
+        {
+            metadata["fallbackDetail"] = additionalDetail!;
+        }
+
+        return new ToolExecutionResult
+        {
+            ToolName = fallback.ToolName,
+            Success = fallback.Success,
+            Output = fallback.Output,
+            Citations = new List<SourceCitation>(fallback.Citations),
+            Metadata = metadata,
+            ErrorMessage = fallback.ErrorMessage
+        };
     }
 
     public void Dispose()

@@ -117,6 +117,7 @@ This architecture allows for massive parallelism, resilience, and specialization
     - `WebScraperTool`: Takes a URL and extracts clean, readable text content.
     - `ImageReaderTool`: Takes an image URL or local path and passes it directly to the `gpt-5` model for analysis. The model's response (e.g., description, text extraction) is returned.
     - `FileReaderTool`: Reads content from local files. For PDFs, it will use the Azure AI Document Intelligence service to extract text and structure. For plain text files, it will use standard I/O.
+    - `ComputerUseNavigatorTool`: Drives the Azure computer-use browser, waits for visual stability before capturing frames, and returns JSON that includes both a summarizing narrative and flagged resources (pages, downloads) for follow-up processing.
 3.  **Tool Selection:** The agent's reasoning loop will involve presenting the available tools to the LLM and asking it to choose the best tool and provide the necessary arguments for the current sub-task.
 
 ### 4.6. Parallel Research & Branching
@@ -131,6 +132,7 @@ This architecture allows for massive parallelism, resilience, and specialization
 1.  **Workspace:** For each main research query, create a unique directory on the local file system.
 2.  **File Storage:** When the agent gathers files (images, PDFs, etc.), they will be saved to this directory with a manifest file (`manifest.json`) that tracks the original source URL, download timestamp, and a local file ID.
 3.  **File Processing:** The `FileReaderTool` and `ImageReaderTool` will operate on files within this local registry. The extracted text and analysis will be stored in the long-term memory, linked back to the source file.
+4.  **Flagged Resource Pipeline:** Whenever the computer-use navigator flags additional pages or downloadable assets, the orchestrator will queue them for the `WebScraperTool` and `FileReaderTool` automatically so that mid-session discoveries are captured without extra user input.
 
 ### 4.8. Report Generation
 1.  **Final Synthesis:** This is the last stage of the Orchestrator's pipeline.

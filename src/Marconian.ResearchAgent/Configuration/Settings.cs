@@ -56,14 +56,22 @@ public static class Settings
 
         string googleApiKey = configuration["GOOGLE_API_KEY"]?.Trim() ?? string.Empty;
         string googleSearchEngineId = configuration["GOOGLE_SEARCH_ENGINE_ID"]?.Trim() ?? string.Empty;
-        string? computerUseDeployment = configuration["AZURE_OPENAI_COMPUTER_USE_DEPLOYMENT"]?.Trim();
-        bool computerUseEnabled = true;
+    string? computerUseDeployment = configuration["AZURE_OPENAI_COMPUTER_USE_DEPLOYMENT"]?.Trim();
+    bool computerUseEnabled = true;
+    ComputerUseMode computerUseMode = ComputerUseMode.Hybrid;
 
         string? computerUseEnabledRaw = configuration["COMPUTER_USE_ENABLED"]?.Trim();
         if (!string.IsNullOrWhiteSpace(computerUseEnabledRaw) &&
             !bool.TryParse(computerUseEnabledRaw, out computerUseEnabled))
         {
             throw new InvalidOperationException("COMPUTER_USE_ENABLED must be either 'true' or 'false'.");
+        }
+
+        string? computerUseModeRaw = configuration["COMPUTER_USE_MODE"]?.Trim();
+        if (!string.IsNullOrWhiteSpace(computerUseModeRaw) &&
+            !Enum.TryParse(computerUseModeRaw, ignoreCase: true, out computerUseMode))
+        {
+            throw new InvalidOperationException("COMPUTER_USE_MODE must be either 'Hybrid' or 'Full'.");
         }
 
         if (provider == WebSearchProvider.GoogleApi)
@@ -101,6 +109,7 @@ public static class Settings
             AzureOpenAiComputerUseDeployment = computerUseDeployment,
             WebSearchProvider = provider,
             ComputerUseEnabled = computerUseEnabled,
+            ComputerUseMode = computerUseMode,
             CacheDirectory = ResolveDirectory(configuration["CACHE_DIRECTORY"], Path.Combine("debug", "cache")),
             ReportsDirectory = ResolveDirectory(configuration["REPORTS_DIRECTORY"], Path.Combine("debug", "reports")),
             PrimaryResearchObjective = configuration["PRIMARY_RESEARCH_OBJECTIVE"]?.Trim()
@@ -148,6 +157,7 @@ public static class Settings
         public string? AzureOpenAiComputerUseDeployment { get; init; }
         public WebSearchProvider WebSearchProvider { get; init; } = WebSearchProvider.GoogleApi;
         public bool ComputerUseEnabled { get; init; } = true;
+        public ComputerUseMode ComputerUseMode { get; init; } = ComputerUseMode.Hybrid;
         public required string CacheDirectory { get; init; }
         public required string ReportsDirectory { get; init; }
         public string? PrimaryResearchObjective { get; init; }

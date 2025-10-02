@@ -87,6 +87,22 @@
 ## M13 - Operational Diagnostics
 - [x] Add CLI or scripted diagnostic path to enumerate Cosmos tool outputs for a session
 - [x] Document workflow for inspecting stored scrape content when computer-use is disabled
+## M14 - Hybrid Search Exploration
+- [x] Route hybrid Google API search results through an agent-driven selection step
+- [x] Launch computer-use browsing sessions for each selected citation to capture richer context
+- [x] Persist exploration outputs into memory and reference them in reporting pipelines
+- [x] Expand automated tests to cover hybrid exploration workflow
+## M15 - Navigator Flagging & Follow-up
+- [x] Add deterministic repaint wait helper to computer-use interactions to stabilize screenshots
+- [x] Capture structured flagged resources during exploration sessions
+- [x] Route flagged pages to downstream scraping and queue downloads for file analysis
+- [x] Document flagged resource workflow and update best-practices summary
+
+## M16 - Computer-use Flagged Resource Processing Refinement
+- [ ] Audit flagged resource classification gaps for PDFs and other binaries surfaced by computer-use.
+- [ ] Update follow-up orchestration to funnel flagged web pages into the scraper and flagged PDFs into the Document Intelligence pipeline automatically.
+- [ ] Guard the scraper against binary responses and ensure file registry entries trigger downstream file reading.
+- [ ] Extend automated coverage to validate the new branching logic for pages versus PDFs.
 ## Documentation & Patterns
 - [x] Update `docs/specs.md` if architecture adjustments arise (with justification)
 - [x] Capture architectural patterns in `docs/architectural_patterns.md` when stabilized

@@ -24,4 +24,9 @@
 - The final Markdown reporter template ensures every claim references a `MemoryRecord` identifier, maintaining an auditable trail from output back to raw evidence.
 - After the first draft is emitted, an iterative revision loop asks the LLM for JSON-formatted line edits. A lightweight `MarkdownReportEditor` applies `replace`/`insert` operations so the agent can rework specific lines without regenerating the entire document.
 
+## Computer-Use Exploration Resilience
+- The computer-use service now gates every screenshot behind a visual-stability probe that waits for DOMContentLoaded, polls scroll height and image completion, and blocks until layout settles. This prevents the LLM from acting on half-painted frames and eliminates duplicated, partially rendered captures in diagnostics.
+- Explorations end with a JSON payload capturing a narrative summary plus a `flagged` array of noteworthy pages or downloadable assets. The `ComputerUseNavigatorTool` converts that response into structured `FlaggedResource` records.
+- The `ResearcherAgent` propagates flagged pages into the scraping queue ahead of standard citations and schedules file/download entries for the `FileReaderTool`, ensuring high-value artefacts are harvested even when they were discovered mid-navigation.
+
 
