@@ -24,8 +24,12 @@ public sealed class ComputerUseSearchService : IAsyncDisposable, IComputerUseExp
     private const int DisplayWidth = 1280;
     private const int DisplayHeight = 720;
     private const int MaxIterations = 8;
+    private const int MinSearchIterations = 2;
+    private const int MinExplorationIterations = 3;
+    private const int MaxContinuationAttempts = 2;
 
     private const string SearchInstructions = "You control a Chromium browser. Execute actions one at a time, reviewing a screenshot after each step. Stop once Google search results are visible so the host application can read them.";
+    private const string SearchContinuationPrompt = "Continue the Google search workflow. Ensure organic results are clearly visible by taking additional actions such as scrolling or refining the query. Do not stop yet.";
 
     private const string ExplorationInstructions = """
 You control a Chromium browser. Navigate the page, scroll to gather supporting evidence, follow relevant outbound links, and stop once you can provide a concise summary of the key takeaways.
@@ -35,6 +39,7 @@ When you stop, respond with exactly one JSON object on the final turn matching t
 
 Flag any resources that should be revisited (interesting subpages, downloadable files, data sources). Emit an empty array when nothing is flagged. Do not include text outside the JSON object.
 """;
+    private const string ExplorationContinuationPrompt = "You have not gathered enough evidence yet. Take more browser actions—scroll further, open relevant links, and capture observations—before concluding. Provide the summary only after deeper exploration.";
 
     private static readonly Dictionary<string, string> KeyMapping = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -304,14 +309,20 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
             return;
         }
 
-    await _page.GotoAsync("https://www.google.com/ncr", new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded }).ConfigureAwait(false);
-        await DismissConsentAsync(cancellationToken).ConfigureAwait(false);
+        await _page.GotoAsync("https://www.google.com/ncr", new PageGotoOptions
+        {
+            WaitUntil = WaitUntilState.NetworkIdle,
+            Timeout = 20000
+        }).ConfigureAwait(false);
+
+        await PreparePageForComputerUseAsync(cancellationToken).ConfigureAwait(false);
         await _page.BringToFrontAsync().ConfigureAwait(false);
-        await Task.Delay(250, cancellationToken).ConfigureAwait(false);
+        await Task.Delay(200, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<ComputerUseResponseState> SendInitialRequestAsync(string query, List<string> transcript, CancellationToken cancellationToken)
     {
+        await PreparePageForComputerUseAsync(cancellationToken).ConfigureAwait(false);
         string screenshot = await CaptureScreenshotAsync(cancellationToken).ConfigureAwait(false);
         var payload = new JsonObject
         {
@@ -404,6 +415,66 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
             payload["instructions"] = instructions;
         }
         payload["model"] = _deployment;
+
+        using JsonDocument response = await SendRequestAsync(payload, cancellationToken).ConfigureAwait(false);
+        return ParseResponse(response, transcript);
+    }
+
+    private async Task<ComputerUseResponseState> RequestContinuationAsync(
+        ComputerUseResponseState previous,
+        List<string> transcript,
+        string continuationPrompt,
+        string instructions,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(previous.ResponseId))
+        {
+            return previous;
+        }
+
+        string screenshot = _lastScreenshot ?? await CaptureScreenshotAsync(cancellationToken).ConfigureAwait(false);
+
+        var content = new JsonArray
+        {
+            new JsonObject
+            {
+                ["type"] = "input_text",
+                ["text"] = continuationPrompt
+            }
+        };
+
+        if (!string.IsNullOrEmpty(screenshot))
+        {
+            content.Add(new JsonObject
+            {
+                ["type"] = "input_image",
+                ["image_url"] = $"data:image/png;base64,{screenshot}"
+            });
+        }
+
+        var payload = new JsonObject
+        {
+            ["input"] = new JsonArray
+            {
+                new JsonObject
+                {
+                    ["role"] = "user",
+                    ["content"] = content
+                }
+            },
+            ["tools"] = BuildToolsArray(),
+            ["previous_response_id"] = previous.ResponseId,
+            ["instructions"] = instructions,
+            ["truncation"] = "auto",
+            ["model"] = _deployment
+        };
+
+        _logger.LogDebug("Requesting additional computer-use actions (responseId={ResponseId}).", previous.ResponseId);
+        RecordTimelineEvent("continuation_prompt", new Dictionary<string, object?>
+        {
+            ["responseId"] = previous.ResponseId,
+            ["message"] = continuationPrompt
+        });
 
         using JsonDocument response = await SendRequestAsync(payload, cancellationToken).ConfigureAwait(false);
         return ParseResponse(response, transcript);
@@ -818,6 +889,18 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
             }
         }
 
+        await WaitForVisualStabilityAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task PreparePageForComputerUseAsync(CancellationToken cancellationToken)
+    {
+        if (_page is null)
+        {
+            return;
+        }
+
+        await WaitForVisualStabilityAsync(cancellationToken).ConfigureAwait(false);
+        await DismissConsentAsync(cancellationToken).ConfigureAwait(false);
         await WaitForVisualStabilityAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -1544,13 +1627,13 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
 
             await _page.GotoAsync(url, new PageGotoOptions
             {
-                WaitUntil = WaitUntilState.DOMContentLoaded,
+                WaitUntil = WaitUntilState.NetworkIdle,
                 Timeout = 20000
             }).ConfigureAwait(false);
-            await DismissConsentAsync(cancellationToken).ConfigureAwait(false);
+            await PreparePageForComputerUseAsync(cancellationToken).ConfigureAwait(false);
             await ThrowIfCaptchaDetectedAsync(url, cancellationToken).ConfigureAwait(false);
             await _page.BringToFrontAsync().ConfigureAwait(false);
-            await Task.Delay(300, cancellationToken).ConfigureAwait(false);
+            await Task.Delay(250, cancellationToken).ConfigureAwait(false);
 
             var transcript = new List<string>();
             ComputerUseResponseState response = await SendInitialExplorationRequestAsync(url, objective, transcript, cancellationToken).ConfigureAwait(false);
@@ -1654,7 +1737,8 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
 
     private async Task<ComputerUseResponseState> SendInitialExplorationRequestAsync(string targetUrl, string? objective, List<string> transcript, CancellationToken cancellationToken)
     {
-        string screenshot = await CaptureScreenshotAsync(cancellationToken).ConfigureAwait(false);
+    await PreparePageForComputerUseAsync(cancellationToken).ConfigureAwait(false);
+    string screenshot = await CaptureScreenshotAsync(cancellationToken).ConfigureAwait(false);
         string objectiveClause = string.IsNullOrWhiteSpace(objective)
             ? "Review the currently open page and capture the most important insights."
             : $"Review the currently open page and capture information relevant to \"{objective}\".";

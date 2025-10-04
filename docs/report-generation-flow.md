@@ -1,0 +1,11 @@
+1. A research query is provided to an LLM and the LLM chooses the searches it wants to perform
+2. The LLM returns a list of sites and files for further analysis
+3. Files are downloaded. Content is extracted and written to the index
+4. For every site the playwright flow is started:
+   1.  First the initial full load is performed and consent windows are taken care of
+   2.  Control is given to the computer use model. This model should inspect the site thouroughly and should return a list of pages to be scraped and files to be downloaded. Note that this model can give control back if it notices something like a captcha check or a security or consent form. This is not a finishing of exploration. It should be checked and properly handled if possible and if needed control should be given back afterwards.
+   3.  Pages are scraped and files are downloaded. Content is extracted and written to the index.
+5.  The LLM does an analysis of all the gathered data. Upon this analysis it decides to perform additional searches following steps 1-4 or if it has gathered enough and should proceed to the next stage.
+6.  During this stage an LLM decides first on the outline of the report to be created. This should not be a general action but it should be an iterative process guided by multiple searches over the gathered content. So this is in fact a deep analysis stages that finises with a general outlined report, which also forms a list of all the specific sections that has to be written during the next stage. It should also flag general sections that should be written based on the content of the generated report, like for example a conclusion, which is based on the content of the report itself.
+7.  This is the writing stage, which again is an iterative process. For every section an LLM can perform searches over the data and think about it. If it has gathered enough it can write the section. General sections are skipped in this step.
+8.  General sections are now handled and written based on the context of the other written sections.
