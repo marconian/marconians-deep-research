@@ -1,3 +1,4 @@
+using Marconian.ResearchAgent.Configuration;
 using Marconian.ResearchAgent.Memory;
 using Marconian.ResearchAgent.Models.Memory;
 using Marconian.ResearchAgent.Services.Caching;
@@ -30,8 +31,12 @@ public sealed class ShortTermMemoryManagerTests
             openAiService: openAiMock.Object,
             deploymentName: "chat",
             cacheService: cacheMock.Object,
-            maxEntries: 4,
-            summaryBatchSize: 2);
+            options: new ShortTermMemoryOptions
+            {
+                MaxEntries = 4,
+                SummaryBatchSize = 2,
+                CacheTtlHours = 1
+            });
 
         for (int i = 0; i < 5; i++)
         {

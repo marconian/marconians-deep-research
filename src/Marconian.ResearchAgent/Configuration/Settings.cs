@@ -22,14 +22,22 @@ public static class Settings
         "PRIMARY_RESEARCH_OBJECTIVE"
     ];
 
-    public static AppSettings LoadAndValidate()
+    public static IConfigurationRoot BuildConfiguration()
     {
-        IConfigurationRoot configuration = new ConfigurationBuilder()
+        return new ConfigurationBuilder()
             .SetBasePath(Directory.GetCurrentDirectory())
             .AddJsonFile("appsettings.json", optional: true, reloadOnChange: false)
             .AddJsonFile("appsettings.local.json", optional: true, reloadOnChange: false)
             .AddEnvironmentVariables()
             .Build();
+    }
+
+    public static AppSettings LoadAndValidate()
+        => LoadAndValidate(BuildConfiguration());
+
+    public static AppSettings LoadAndValidate(IConfiguration configuration)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
 
         var missing = new List<string>();
 

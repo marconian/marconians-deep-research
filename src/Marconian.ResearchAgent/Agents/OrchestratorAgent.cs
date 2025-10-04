@@ -7,6 +7,7 @@ using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Marconian.ResearchAgent.Configuration;
 using Marconian.ResearchAgent.Memory;
 using Marconian.ResearchAgent.Models.Agents;
 using Marconian.ResearchAgent.Models.Reporting;
@@ -37,15 +38,14 @@ public sealed class OrchestratorAgent : IAgent
     private readonly ILoggerFactory _loggerFactory;
     private readonly ICacheService? _cacheService;
     private readonly ResearchFlowTracker? _flowTracker;
+    private readonly OrchestratorOptions _options;
+    private readonly ResearcherOptions _researcherOptions;
+    private readonly ShortTermMemoryOptions _shortTermOptions;
     private readonly int _maxRevisionPasses;
     private readonly JsonSerializerOptions _revisionOptions = new(JsonSerializerDefaults.Web)
     {
         PropertyNameCaseInsensitive = true
     };
-    private const int MaxResearchPasses = 3;
-    private const int MaxFollowupQuestions = 3;
-    private const int MaxSectionEvidenceCharacters = 2400;
-
     public OrchestratorState CurrentState { get; private set; } = OrchestratorState.Planning;
 
     public OrchestratorAgent(
@@ -58,7 +58,9 @@ public sealed class OrchestratorAgent : IAgent
         ICacheService? cacheService = null,
         ResearchFlowTracker? flowTracker = null,
         string? reportsDirectory = null,
-        int maxReportRevisionPasses = 2)
+        OrchestratorOptions? orchestratorOptions = null,
+        ResearcherOptions? researcherOptions = null,
+        ShortTermMemoryOptions? shortTermMemoryOptions = null)
     {
         _openAiService = openAiService ?? throw new ArgumentNullException(nameof(openAiService));
         _longTermMemoryManager = longTermMemoryManager ?? throw new ArgumentNullException(nameof(longTermMemoryManager));
@@ -76,7 +78,53 @@ public sealed class OrchestratorAgent : IAgent
         _loggerFactory = loggerFactory ?? NullLoggerFactory.Instance;
         _cacheService = cacheService;
         _flowTracker = flowTracker;
-        _maxRevisionPasses = Math.Max(0, maxReportRevisionPasses);
+        _options = SanitizeOrchestratorOptions(orchestratorOptions);
+        _researcherOptions = SanitizeResearcherOptions(researcherOptions);
+        _shortTermOptions = shortTermMemoryOptions is null
+            ? new ShortTermMemoryOptions()
+            : new ShortTermMemoryOptions
+            {
+                MaxEntries = shortTermMemoryOptions.MaxEntries,
+                SummaryBatchSize = shortTermMemoryOptions.SummaryBatchSize,
+                CacheTtlHours = shortTermMemoryOptions.CacheTtlHours
+            };
+        _maxRevisionPasses = Math.Max(0, _options.MaxReportRevisionPasses);
+    }
+
+    private static OrchestratorOptions SanitizeOrchestratorOptions(OrchestratorOptions? options)
+    {
+        var resolved = options is null
+            ? new OrchestratorOptions()
+            : new OrchestratorOptions
+            {
+                MaxResearchPasses = options.MaxResearchPasses,
+                MaxFollowupQuestions = options.MaxFollowupQuestions,
+                MaxSectionEvidenceCharacters = options.MaxSectionEvidenceCharacters,
+                MaxReportRevisionPasses = options.MaxReportRevisionPasses
+            };
+
+        resolved.MaxResearchPasses = Math.Max(1, resolved.MaxResearchPasses);
+        resolved.MaxFollowupQuestions = Math.Max(0, resolved.MaxFollowupQuestions);
+        resolved.MaxSectionEvidenceCharacters = Math.Max(500, resolved.MaxSectionEvidenceCharacters);
+        resolved.MaxReportRevisionPasses = Math.Max(0, resolved.MaxReportRevisionPasses);
+        return resolved;
+    }
+
+    private static ResearcherOptions SanitizeResearcherOptions(ResearcherOptions? options)
+    {
+        var resolved = options is null
+            ? new ResearcherOptions()
+            : new ResearcherOptions
+            {
+                MaxSearchIterations = options.MaxSearchIterations,
+                MaxContinuationQueries = options.MaxContinuationQueries,
+                RelatedMemoryTake = options.RelatedMemoryTake
+            };
+
+        resolved.MaxSearchIterations = Math.Max(1, resolved.MaxSearchIterations);
+        resolved.MaxContinuationQueries = Math.Max(0, resolved.MaxContinuationQueries);
+        resolved.RelatedMemoryTake = Math.Max(0, resolved.RelatedMemoryTake);
+        return resolved;
     }
 
     public async Task<AgentExecutionResult> ExecuteTaskAsync(AgentTask task, CancellationToken cancellationToken = default)
@@ -347,7 +395,7 @@ public sealed class OrchestratorAgent : IAgent
     {
         ResearchAggregationResult aggregation = _aggregator.Aggregate(accumulatedResults);
 
-        for (int pass = 0; pass < MaxResearchPasses; pass++)
+    for (int pass = 0; pass < _options.MaxResearchPasses; pass++)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
@@ -382,7 +430,7 @@ public sealed class OrchestratorAgent : IAgent
                 .Select(static question => question.Trim())
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .Where(question => !plan.Branches.Any(branch => string.Equals(branch.Question, question, StringComparison.OrdinalIgnoreCase)))
-                .Take(MaxFollowupQuestions)
+                .Take(_options.MaxFollowupQuestions)
                 .ToList();
 
             if (newQuestions.Count == 0)
@@ -417,7 +465,7 @@ public sealed class OrchestratorAgent : IAgent
         int passNumber,
         CancellationToken cancellationToken)
     {
-        if (passNumber >= MaxResearchPasses)
+    if (passNumber >= _options.MaxResearchPasses)
         {
             return new ResearchContinuationDecision(false, Array.Empty<string>());
         }
@@ -438,8 +486,8 @@ public sealed class OrchestratorAgent : IAgent
             findingBuilder.AppendLine($"Finding: {finding.Title}");
             if (!string.IsNullOrWhiteSpace(finding.Content))
             {
-                string content = finding.Content.Length > MaxSectionEvidenceCharacters
-                    ? finding.Content[..MaxSectionEvidenceCharacters]
+                string content = finding.Content.Length > _options.MaxSectionEvidenceCharacters
+                    ? finding.Content[.._options.MaxSectionEvidenceCharacters]
                     : finding.Content;
                 findingBuilder.AppendLine(content);
             }
@@ -454,21 +502,28 @@ public sealed class OrchestratorAgent : IAgent
 
         if (findingBuilder.Length == 0)
         {
-            findingBuilder.AppendLine("No consolidated findings yet.");
+            findingBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.ContinuationNoFindings);
         }
 
         var promptBuilder = new StringBuilder();
-        promptBuilder.AppendLine($"Research objective: {task.Objective}");
-        promptBuilder.AppendLine($"Current pass: {passNumber} of {MaxResearchPasses}.");
-        promptBuilder.AppendLine("Current branch status:");
+        promptBuilder.AppendLine(string.Format(
+            CultureInfo.InvariantCulture,
+            SystemPrompts.Templates.Orchestrator.ContinuationObjectiveLine,
+            task.Objective ?? string.Empty));
+        promptBuilder.AppendLine(string.Format(
+            CultureInfo.InvariantCulture,
+            SystemPrompts.Templates.Orchestrator.ContinuationPassLine,
+            passNumber,
+            _options.MaxResearchPasses));
+        promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.ContinuationBranchHeader);
         promptBuilder.AppendLine(planSummaryBuilder.ToString());
-        promptBuilder.AppendLine("Consolidated findings so far:");
+        promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.ContinuationFindingsHeader);
         promptBuilder.AppendLine(findingBuilder.ToString());
-        promptBuilder.AppendLine("Should the research continue? If important gaps remain, propose up to three highly specific follow-up questions.");
-        promptBuilder.AppendLine("Respond with JSON: {\"continue\": boolean, \"followUpQuestions\": [string...]}. Explain nothing else.");
+        promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.ContinuationDecisionInstruction);
+        promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.ContinuationResponseInstruction);
 
         var request = new OpenAiChatRequest(
-            SystemPrompt: "You are a research director who decides when an investigation should continue and proposes precise follow-up questions when needed.",
+            SystemPrompt: SystemPrompts.Orchestrator.ContinuationDirector,
             Messages: new[]
             {
                 new OpenAiChatMessage("user", promptBuilder.ToString())
@@ -491,10 +546,15 @@ public sealed class OrchestratorAgent : IAgent
     private async Task<ResearchPlan> GeneratePlanAsync(AgentTask task, CancellationToken cancellationToken)
     {
         var request = new OpenAiChatRequest(
-            SystemPrompt: "You are a strategist decomposing complex research projects into parallelizable branches.",
+            SystemPrompt: SystemPrompts.Orchestrator.PlanningStrategist,
             Messages: new[]
             {
-                new OpenAiChatMessage("user", $"Break the following research objective into 3-5 focused sub-questions suitable for parallel investigation. Respond with a numbered list only.\nObjective: {task.Objective}")
+                new OpenAiChatMessage(
+                    "user",
+                    string.Format(
+                        CultureInfo.InvariantCulture,
+                        SystemPrompts.Templates.Orchestrator.PlanningRequest,
+                        task.Objective ?? string.Empty))
             },
             DeploymentName: _chatDeploymentName,
             MaxOutputTokens: 300);
@@ -504,13 +564,13 @@ public sealed class OrchestratorAgent : IAgent
         var branchQuestions = ParseQuestions(response);
         if (branchQuestions.Count == 0)
         {
-            branchQuestions.Add(task.Objective);
+            branchQuestions.Add(task.Objective ?? string.Empty);
         }
 
         return new ResearchPlan
         {
             ResearchSessionId = task.ResearchSessionId,
-            RootQuestion = task.Objective,
+            RootQuestion = task.Objective ?? string.Empty,
             Branches = branchQuestions.Select(question => new ResearchBranchPlan
             {
                 Question = question
@@ -557,7 +617,9 @@ public sealed class OrchestratorAgent : IAgent
                         _cacheService,
                         _flowTracker,
                         researcherLogger,
-                        shortTermLogger);
+                        shortTermLogger,
+                        options: _researcherOptions,
+                        shortTermOptions: _shortTermOptions);
 
                     AgentExecutionResult result = await researcher.ExecuteTaskAsync(branchTask, cancellationToken).ConfigureAwait(false);
                     _flowTracker?.RecordBranchCompleted(branch.BranchId, result.Success, result.Summary);
@@ -638,10 +700,16 @@ public sealed class OrchestratorAgent : IAgent
         }
 
         var request = new OpenAiChatRequest(
-            SystemPrompt: "You synthesize multiple research findings into a cohesive narrative with citations.",
+            SystemPrompt: SystemPrompts.Orchestrator.SynthesisAuthor,
             Messages: new[]
             {
-                new OpenAiChatMessage("user", $"Primary question: {rootTask.Objective}\n\nFindings:\n{evidenceBuilder}\n\nWrite a cohesive synthesis referencing findings as [Source #]. Conclude with overall confidence."),
+                new OpenAiChatMessage(
+                    "user",
+                    string.Format(
+                        CultureInfo.InvariantCulture,
+                        SystemPrompts.Templates.Orchestrator.SynthesisRequest,
+                        rootTask.Objective ?? string.Empty,
+                        evidenceBuilder.ToString()))
             },
             DeploymentName: _chatDeploymentName,
             MaxOutputTokens: 600);
@@ -657,16 +725,21 @@ public sealed class OrchestratorAgent : IAgent
     {
         var findings = aggregationResult.Findings ?? Array.Empty<ResearchFinding>();
         var promptBuilder = new StringBuilder();
-        promptBuilder.AppendLine($"Objective: {rootTask.Objective}");
-        promptBuilder.AppendLine("Synthesis overview:");
-        promptBuilder.AppendLine(string.IsNullOrWhiteSpace(synthesis) ? "(No synthesis provided.)" : synthesis.Trim());
+        promptBuilder.AppendLine(string.Format(
+            CultureInfo.InvariantCulture,
+            SystemPrompts.Templates.Common.ObjectiveLine,
+            rootTask.Objective ?? string.Empty));
+        promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.SynthesisOverviewHeader);
+        promptBuilder.AppendLine(string.IsNullOrWhiteSpace(synthesis)
+            ? SystemPrompts.Templates.Orchestrator.SynthesisNoSynthesis
+            : synthesis.Trim());
         promptBuilder.AppendLine();
-        promptBuilder.AppendLine("Findings (use IDs when referencing support):");
+        promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.SynthesisFindingsHeader);
 
         foreach (var finding in findings.Take(10))
         {
-            string content = finding.Content.Length > MaxSectionEvidenceCharacters
-                ? finding.Content[..MaxSectionEvidenceCharacters]
+            string content = finding.Content.Length > _options.MaxSectionEvidenceCharacters
+                ? finding.Content[.._options.MaxSectionEvidenceCharacters]
                 : finding.Content;
             promptBuilder.AppendLine($"- Id: {finding.Id}");
             promptBuilder.AppendLine($"  Title: {finding.Title}");
@@ -677,13 +750,13 @@ public sealed class OrchestratorAgent : IAgent
 
         if (findings.Count == 0)
         {
-            promptBuilder.AppendLine("(No findings available. Create a generic outline.)");
+            promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.SynthesisNoFindings);
         }
 
-        promptBuilder.AppendLine("Design a structured outline for the final report. Return JSON with fields: 'notes' (string), 'sections' (array), and 'layout' (array). Each section entry must include 'sectionId', 'title', 'summary', and 'supportingFindingIds' referencing the provided IDs. The layout array should describe the Markdown heading hierarchy: every node must include 'nodeId', 'headingType' (h1-h4), 'title', optional 'sectionId' matching a section entry, and 'children' (array). Include an executive summary node, thematic body nodes, and a final sources node (without sectionId) so citations can be appended. No extra commentary.");
+        promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.OutlineInstruction);
 
         var request = new OpenAiChatRequest(
-            SystemPrompt: "You are a veteran research editor who designs structured report outlines grounded in provided evidence.",
+            SystemPrompt: SystemPrompts.Orchestrator.OutlineEditor,
             Messages: new[]
             {
                 new OpenAiChatMessage("user", promptBuilder.ToString())
@@ -875,93 +948,113 @@ public sealed class OrchestratorAgent : IAgent
         }
 
         var promptBuilder = new StringBuilder();
-        promptBuilder.AppendLine($"Objective: {rootTask.Objective}");
-        promptBuilder.AppendLine($"Section: {sectionPlan.Title}");
+        promptBuilder.AppendLine(string.Format(
+            CultureInfo.InvariantCulture,
+            SystemPrompts.Templates.Common.ObjectiveLine,
+            rootTask.Objective ?? string.Empty));
+        promptBuilder.AppendLine(string.Format(
+            CultureInfo.InvariantCulture,
+            SystemPrompts.Templates.Common.SectionLine,
+            sectionPlan.Title));
         if (!string.IsNullOrWhiteSpace(sectionPlan.Summary))
         {
-            promptBuilder.AppendLine($"Section goals: {sectionPlan.Summary}");
+            promptBuilder.AppendLine(string.Format(
+                CultureInfo.InvariantCulture,
+                SystemPrompts.Templates.Common.SectionGoalsLine,
+                sectionPlan.Summary));
         }
 
         if (!string.IsNullOrWhiteSpace(outline.Notes))
         {
-            promptBuilder.AppendLine("Outline notes:");
+            promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.OutlineNotesHeader);
             promptBuilder.AppendLine(outline.Notes!.Trim());
         }
 
         if (context is not null)
         {
-            promptBuilder.AppendLine("Section location within outline:");
+            promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.OutlineSectionLocationHeader);
             promptBuilder.AppendLine(string.Join(" > ", context.HeadingPath));
 
             if (!string.IsNullOrWhiteSpace(context.ParentTitle))
             {
-                promptBuilder.AppendLine($"Parent section: {context.ParentTitle}");
+                promptBuilder.AppendLine(string.Format(
+                    CultureInfo.InvariantCulture,
+                    SystemPrompts.Templates.Common.ParentSectionLine,
+                    context.ParentTitle));
             }
 
             if (!string.IsNullOrWhiteSpace(context.ParentSummary))
             {
-                promptBuilder.AppendLine($"Parent focus: {context.ParentSummary}");
+                promptBuilder.AppendLine(string.Format(
+                    CultureInfo.InvariantCulture,
+                    SystemPrompts.Templates.Common.ParentFocusLine,
+                    context.ParentSummary));
             }
 
             if (context.SiblingTitles.Count > 0)
             {
-                promptBuilder.AppendLine("Sibling sections:");
+                promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.OutlineSiblingHeader);
                 foreach (string sibling in context.SiblingTitles)
                 {
-                    promptBuilder.AppendLine($"- {sibling}");
+                    promptBuilder.Append("- ");
+                    promptBuilder.AppendLine(sibling);
                 }
             }
 
             if (context.ChildTitles.Count > 0)
             {
-                promptBuilder.AppendLine("Subtopics to set up:");
+                promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.OutlineSubtopicsHeader);
                 foreach (string child in context.ChildTitles)
                 {
-                    promptBuilder.AppendLine($"- {child}");
+                    promptBuilder.Append("- ");
+                    promptBuilder.AppendLine(child);
                 }
             }
         }
 
         if (outline.Layout.Count > 0)
         {
-            promptBuilder.AppendLine("Full outline structure:");
+            promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.OutlineStructureHeader);
             promptBuilder.AppendLine(RenderLayoutSummary(outline.Layout));
         }
 
         if (priorDrafts.Count > 0)
         {
-            promptBuilder.AppendLine("Previously drafted sections (for coherence):");
+            promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.OutlinePreviousSectionsHeader);
             foreach (var prior in priorDrafts.TakeLast(3))
             {
-                promptBuilder.AppendLine($"- {prior.Title}: {SummarizeForPrompt(prior.Content, 320)}");
+                promptBuilder.Append("- ");
+                promptBuilder.Append(prior.Title);
+                promptBuilder.Append(": ");
+                promptBuilder.AppendLine(SummarizeForPrompt(prior.Content, 320));
             }
         }
 
         if (!string.IsNullOrWhiteSpace(synthesis))
         {
-            promptBuilder.AppendLine("Overall synthesis context:");
+            promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.OutlineSynthesisContextHeader);
             promptBuilder.AppendLine(synthesis.Trim());
         }
 
-        promptBuilder.AppendLine("Evidence:");
+        promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.OutlineEvidenceHeader);
         foreach (var finding in relevantFindings)
         {
-            string evidence = finding.Content.Length > MaxSectionEvidenceCharacters
-                ? finding.Content[..MaxSectionEvidenceCharacters]
+            string evidence = finding.Content.Length > _options.MaxSectionEvidenceCharacters
+                ? finding.Content[.._options.MaxSectionEvidenceCharacters]
                 : finding.Content;
             promptBuilder.AppendLine($"- {finding.Title} (confidence {finding.Confidence:F2}): {evidence}");
         }
 
         if (relevantFindings.Count == 0)
         {
-            promptBuilder.AppendLine("(No direct evidence; provide contextual overview.)");
+            promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.OutlineNoEvidence);
         }
 
         promptBuilder.AppendLine();
-        promptBuilder.AppendLine("Write a polished Markdown narrative (2-4 paragraphs) for this section that stays consistent with the overall outline and surrounding sections. Incorporate transitions to the parent and child topics when appropriate, stay factual, and only use the supplied evidence. Do not include headings or citation brackets. Return only the body text.");
+        promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.SectionWritingInstruction);
 
         var request = new OpenAiChatRequest(
-            SystemPrompt: "You craft concise, evidence-grounded research report sections.",
+            SystemPrompt: SystemPrompts.Orchestrator.SectionAuthor,
             Messages: new[]
             {
                 new OpenAiChatMessage("user", promptBuilder.ToString())
@@ -1124,14 +1217,17 @@ public sealed class OrchestratorAgent : IAgent
             string enumerated = editor.EnumerateLines();
 
             var promptBuilder = new StringBuilder();
-            promptBuilder.AppendLine($"Objective: {rootTask.Objective}");
-            promptBuilder.AppendLine("Existing report lines:");
+            promptBuilder.AppendLine(string.Format(
+                CultureInfo.InvariantCulture,
+                SystemPrompts.Templates.Common.ObjectiveLine,
+                rootTask.Objective ?? string.Empty));
+            promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.ReportLinesHeader);
             promptBuilder.AppendLine(enumerated);
             promptBuilder.AppendLine();
-            promptBuilder.AppendLine("Suggest up to three targeted edits to improve clarity, add missing citations, or fix structural issues. Return a JSON array of objects with properties 'action' ('replace' | 'insert_before' | 'insert_after'), 'line' (1-based) and 'content'. If no changes are needed, return an empty JSON array.");
+            promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.ReportRevisionInstruction);
 
             var request = new OpenAiChatRequest(
-                SystemPrompt: "You are an editor that refines Markdown research reports with precise, line-targeted edits.",
+                SystemPrompt: SystemPrompts.Orchestrator.ReportEditor,
                 Messages: new[]
                 {
                     new OpenAiChatMessage("user", promptBuilder.ToString())
@@ -1537,7 +1633,7 @@ public sealed class OrchestratorAgent : IAgent
                 .Where(static question => !string.IsNullOrWhiteSpace(question))
                 .Select(static question => question.Trim())
                 .Distinct(StringComparer.OrdinalIgnoreCase)
-                .Take(MaxFollowupQuestions)
+                .Take(_options.MaxFollowupQuestions)
                 .ToList() ?? new List<string>();
 
             decision = new ResearchContinuationDecision(parsed.Continue, questions);

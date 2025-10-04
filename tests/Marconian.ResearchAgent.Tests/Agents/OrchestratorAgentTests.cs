@@ -1,4 +1,5 @@
 using Marconian.ResearchAgent.Agents;
+using Marconian.ResearchAgent.Configuration;
 using Marconian.ResearchAgent.Memory;
 using Marconian.ResearchAgent.Models.Agents;
 using Marconian.ResearchAgent.Models.Memory;
@@ -79,7 +80,7 @@ public sealed class OrchestratorAgentTests
         var openAiMock = new Mock<IAzureOpenAiService>();
         openAiMock
             .Setup(service => service.GenerateTextAsync(It.IsAny<OpenAiChatRequest>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(() => responseQueue.Dequeue());
+            .ReturnsAsync(() => responseQueue.Count > 0 ? responseQueue.Dequeue() : "Fallback response");
         openAiMock
             .Setup(service => service.GenerateEmbeddingAsync(It.IsAny<OpenAiEmbeddingRequest>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new List<float> { 0.1f, 0.2f, 0.3f });
@@ -108,7 +109,7 @@ public sealed class OrchestratorAgentTests
                 NullLoggerFactory.Instance,
                 cacheService: null,
                 reportsDirectory: reportsDir,
-                maxReportRevisionPasses: 0);
+                orchestratorOptions: new OrchestratorOptions { MaxReportRevisionPasses = 0 });
 
             var task = new AgentTask
             {
@@ -121,7 +122,13 @@ public sealed class OrchestratorAgentTests
 
             AgentExecutionResult result = await orchestrator.ExecuteTaskAsync(task, CancellationToken.None);
 
-            Assert.That(result.Success, Is.True);
+            Assert.That(result.Success, Is.True, () =>
+            {
+                string errorSummary = result.Errors.Count == 0
+                    ? "No errors captured."
+                    : string.Join(" | ", result.Errors);
+                return $"Execution reported failure. Errors: {errorSummary}";
+            });
             Assert.That(orchestrator.CurrentState, Is.EqualTo(OrchestratorState.Completed));
             Assert.That(result.Summary, Is.EqualTo("Synthesis summary"));
             Assert.That(result.Metadata.TryGetValue("reportPath", out var reportPath), Is.True);

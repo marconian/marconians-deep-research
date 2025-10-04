@@ -16,9 +16,10 @@ public sealed class LongTermMemoryManagerTests
     public async Task StoreFindingAsync_PersistsRecordWithEmbedding()
     {
         var cosmosMock = new Mock<ICosmosMemoryService>();
-        cosmosMock.SetupGet(service => service.VectorDimensions).Returns(3072);
         var openAiMock = new Mock<IAzureOpenAiService>();
         var embedding = new List<float> { 0.1f, 0.2f, 0.3f };
+
+    cosmosMock.SetupGet(service => service.VectorDimensions).Returns(embedding.Count);
 
         openAiMock
             .Setup(service => service.GenerateEmbeddingAsync(It.IsAny<OpenAiEmbeddingRequest>(), It.IsAny<CancellationToken>()))
@@ -61,10 +62,11 @@ public sealed class LongTermMemoryManagerTests
     [Test]
     public async Task SearchRelevantAsync_DelegatesToCosmosSimilarity()
     {
-        var cosmosMock = new Mock<ICosmosMemoryService>();
-        cosmosMock.SetupGet(service => service.VectorDimensions).Returns(3072);
+    var cosmosMock = new Mock<ICosmosMemoryService>();
         var openAiMock = new Mock<IAzureOpenAiService>();
         var embedding = new List<float> { 0.42f, 0.99f };
+
+    cosmosMock.SetupGet(service => service.VectorDimensions).Returns(embedding.Count);
 
         openAiMock
             .Setup(service => service.GenerateEmbeddingAsync(It.IsAny<OpenAiEmbeddingRequest>(), It.IsAny<CancellationToken>()))

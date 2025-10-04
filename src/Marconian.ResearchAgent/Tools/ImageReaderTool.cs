@@ -1,6 +1,8 @@
 using System.Drawing;
+using System.Globalization;
 using System.Linq;
 using System.Net.Http;
+using Marconian.ResearchAgent.Configuration;
 using Marconian.ResearchAgent.Models.Files;
 using Marconian.ResearchAgent.Models.Reporting;
 using Marconian.ResearchAgent.Models.Tools;
@@ -182,10 +184,17 @@ public sealed class ImageReaderTool : ITool, IDisposable
         string base64 = Convert.ToBase64String(memoryStream.ToArray());
 
         var request = new OpenAiChatRequest(
-            SystemPrompt: "You are a computer vision specialist who describes images and highlights important findings concisely.",
+            SystemPrompt: SystemPrompts.Tools.ImageDescription,
             Messages: new[]
             {
-                new OpenAiChatMessage("user", $"The image has metadata {metadata} and content type {contentType}. Analyze the scene and describe key details. The image data is provided as base64 below.\nBASE64:{base64}")
+                new OpenAiChatMessage(
+                    "user",
+                    string.Format(
+                        CultureInfo.InvariantCulture,
+                        SystemPrompts.Templates.Tools.ImageAnalysis,
+                        metadata,
+                        contentType,
+                        base64))
             },
             DeploymentName: _visionDeploymentName,
             MaxOutputTokens: 300);

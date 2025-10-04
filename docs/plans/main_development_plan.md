@@ -63,10 +63,8 @@
 - [x] Execute `dotnet build --configuration Release` and confirm success
 
 ## M9 - Enhancements from Latest Requests
-- [x] Extend logging coverage by threading `ILogger` through core agents, services, and tools with contextual scopes
-- [x] Update Cosmos persistence to operate in gateway mode and provision vector indexing for similarity search
-- [x] Document and implement persistent research state schema (sessions, branches, tool telemetry) in Cosmos
-- [x] Enhance Markdown report workflow to support iterative editing (targeted line inspection and in-place updates)
+- [x] Centralize agent system prompts under shared configuration constants (2025-10-05)
+- [x] Surface agent iteration/summarization limits via configurable options and appsettings template (2025-10-05)
 - [ ] Conduct a self-driven research run of the app (once dependencies configured) to validate new capabilities and gather insights
 - [x] Reflect resulting architectural adjustments in `docs/architectural_patterns.md` and specifications as needed
 

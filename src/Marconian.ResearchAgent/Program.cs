@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using System.Collections.Generic;
 using System.Globalization;
@@ -79,10 +80,11 @@ internal static class Program
         try
         {
 
+            IConfigurationRoot configuration = Settings.BuildConfiguration();
             Settings.AppSettings settings;
             try
             {
-                settings = Settings.LoadAndValidate();
+                settings = Settings.LoadAndValidate(configuration);
                 defaultReportDirectory = settings.ReportsDirectory;
                 Directory.CreateDirectory(defaultReportDirectory);
                 logger.LogInformation("Configuration loaded successfully.");
@@ -389,6 +391,10 @@ internal static class Program
                 }
             }
 
+            var orchestratorOptions = configuration.GetSection("Orchestrator").Get<OrchestratorOptions>() ?? new OrchestratorOptions();
+            var researcherOptions = configuration.GetSection("Researcher").Get<ResearcherOptions>() ?? new ResearcherOptions();
+            var shortTermOptions = configuration.GetSection("ShortTermMemory").Get<ShortTermMemoryOptions>() ?? new ShortTermMemoryOptions();
+
             var orchestrator = new OrchestratorAgent(
                 openAiService,
                 longTermMemory,
@@ -397,7 +403,10 @@ internal static class Program
                 loggerFactory.CreateLogger<OrchestratorAgent>(),
                 loggerFactory,
                 cacheService,
-                reportsDirectory: reportDirectory);
+                reportsDirectory: reportDirectory,
+                orchestratorOptions: orchestratorOptions,
+                researcherOptions: researcherOptions,
+                shortTermMemoryOptions: shortTermOptions);
 
             logger.LogInformation("Loading existing research sessions from Cosmos DB.");
             var existingSessionRecords = await cosmosService.QueryByTypeAsync(SessionRecordType, 100, cts.Token).ConfigureAwait(false);

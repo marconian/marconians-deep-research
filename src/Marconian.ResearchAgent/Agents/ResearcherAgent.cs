@@ -5,6 +5,7 @@ using System.Globalization;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
+using Marconian.ResearchAgent.Configuration;
 using Marconian.ResearchAgent.Memory;
 using Marconian.ResearchAgent.Models.Agents;
 using Marconian.ResearchAgent.Models.Memory;
@@ -22,8 +23,6 @@ namespace Marconian.ResearchAgent.Agents;
 
 public sealed class ResearcherAgent : IAgent
 {
-    private const int MaxSearchIterations = 3;
-    private const int MaxContinuationQueries = 2;
     private readonly IAzureOpenAiService _openAiService;
     private readonly LongTermMemoryManager _longTermMemoryManager;
     private readonly IReadOnlyList<ITool> _tools;
@@ -32,6 +31,8 @@ public sealed class ResearcherAgent : IAgent
     private readonly ILogger<ResearcherAgent> _logger;
     private readonly ILogger<ShortTermMemoryManager> _shortTermLogger;
     private readonly ResearchFlowTracker? _flowTracker;
+    private readonly ResearcherOptions _options;
+    private readonly ShortTermMemoryOptions _shortTermOptions;
 
     public ResearcherAgent(
         IAzureOpenAiService openAiService,
@@ -41,7 +42,9 @@ public sealed class ResearcherAgent : IAgent
         ICacheService? cacheService = null,
         ResearchFlowTracker? flowTracker = null,
         ILogger<ResearcherAgent>? logger = null,
-        ILogger<ShortTermMemoryManager>? shortTermLogger = null)
+        ILogger<ShortTermMemoryManager>? shortTermLogger = null,
+        ResearcherOptions? options = null,
+        ShortTermMemoryOptions? shortTermOptions = null)
     {
         _openAiService = openAiService ?? throw new ArgumentNullException(nameof(openAiService));
         _longTermMemoryManager = longTermMemoryManager ?? throw new ArgumentNullException(nameof(longTermMemoryManager));
@@ -53,6 +56,40 @@ public sealed class ResearcherAgent : IAgent
         _flowTracker = flowTracker;
         _logger = logger ?? NullLogger<ResearcherAgent>.Instance;
         _shortTermLogger = shortTermLogger ?? NullLogger<ShortTermMemoryManager>.Instance;
+        _options = SanitizeOptions(options);
+        _shortTermOptions = SanitizeShortTermOptions(shortTermOptions);
+    }
+
+    private static ResearcherOptions SanitizeOptions(ResearcherOptions? options)
+    {
+        var resolved = options is null
+            ? new ResearcherOptions()
+            : new ResearcherOptions
+            {
+                MaxSearchIterations = options.MaxSearchIterations,
+                MaxContinuationQueries = options.MaxContinuationQueries,
+                RelatedMemoryTake = options.RelatedMemoryTake
+            };
+
+        resolved.MaxSearchIterations = Math.Max(1, resolved.MaxSearchIterations);
+        resolved.MaxContinuationQueries = Math.Max(0, resolved.MaxContinuationQueries);
+        resolved.RelatedMemoryTake = Math.Max(0, resolved.RelatedMemoryTake);
+        return resolved;
+    }
+
+    private static ShortTermMemoryOptions SanitizeShortTermOptions(ShortTermMemoryOptions? options)
+    {
+        if (options is null)
+        {
+            return new ShortTermMemoryOptions();
+        }
+
+        return new ShortTermMemoryOptions
+        {
+            MaxEntries = options.MaxEntries,
+            SummaryBatchSize = options.SummaryBatchSize,
+            CacheTtlHours = options.CacheTtlHours
+        };
     }
 
     public async Task<AgentExecutionResult> ExecuteTaskAsync(AgentTask task, CancellationToken cancellationToken = default)
@@ -67,10 +104,11 @@ public sealed class ResearcherAgent : IAgent
             _openAiService,
             _chatDeploymentName,
             _cacheService,
+            options: _shortTermOptions,
             logger: _shortTermLogger);
 
         await shortTermMemory.InitializeAsync(cancellationToken).ConfigureAwait(false);
-        await shortTermMemory.AppendAsync("user", task.Objective, cancellationToken).ConfigureAwait(false);
+    await shortTermMemory.AppendAsync("user", task.Objective ?? string.Empty, cancellationToken).ConfigureAwait(false);
 
         var toolOutputs = new List<ToolExecutionResult>();
         var errors = new List<string>();
@@ -79,8 +117,9 @@ public sealed class ResearcherAgent : IAgent
     var scrapedPageUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     var processedFileUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+        int memoryTake = Math.Max(0, _options.RelatedMemoryTake);
         IReadOnlyList<MemorySearchResult> relatedMemories = await _longTermMemoryManager
-            .SearchRelevantAsync(task.ResearchSessionId, task.Objective, 3, cancellationToken)
+            .SearchRelevantAsync(task.ResearchSessionId, task.Objective ?? string.Empty, memoryTake, cancellationToken)
             .ConfigureAwait(false);
 
         if (relatedMemories.Count > 0)
@@ -98,7 +137,7 @@ public sealed class ResearcherAgent : IAgent
 
         if (TryGetTool<WebSearchTool>(out _))
         {
-            while (!string.IsNullOrWhiteSpace(nextQuery) && iteration < MaxSearchIterations)
+            while (!string.IsNullOrWhiteSpace(nextQuery) && iteration < _options.MaxSearchIterations)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 iteration++;
@@ -127,7 +166,7 @@ public sealed class ResearcherAgent : IAgent
                         cancellationToken).ConfigureAwait(false);
                 }
 
-                if (iteration >= MaxSearchIterations)
+                if (iteration >= _options.MaxSearchIterations)
                 {
                     nextQuery = null;
                     break;
@@ -193,10 +232,16 @@ public sealed class ResearcherAgent : IAgent
         await shortTermMemory.AppendAsync("assistant", aggregatedEvidence, cancellationToken).ConfigureAwait(false);
 
         var synthesisRequest = new OpenAiChatRequest(
-            SystemPrompt: "You are an expert research analyst. Produce concise findings based strictly on provided evidence and prior memories.",
+            SystemPrompt: SystemPrompts.Researcher.Analyst,
             Messages: new[]
             {
-                new OpenAiChatMessage("user", $"Research question: {task.Objective}\n\nEvidence:\n{aggregatedEvidence}\n\nWrite a 3-4 sentence answer summarizing factual findings and note confidence level (High/Medium/Low)."),
+                new OpenAiChatMessage(
+                    "user",
+                    string.Format(
+                        CultureInfo.InvariantCulture,
+                        SystemPrompts.Templates.Researcher.AnalystInstruction,
+                        task.Objective ?? string.Empty,
+                        aggregatedEvidence))
             },
             DeploymentName: _chatDeploymentName,
             MaxOutputTokens: 400);
@@ -207,7 +252,7 @@ public sealed class ResearcherAgent : IAgent
         double confidence = InferConfidence(summary);
         var finding = new ResearchFinding
         {
-            Title = task.Objective,
+            Title = task.Objective ?? string.Empty,
             Content = summary,
             Citations = CollectCitations(toolOutputs, relatedMemories),
             Confidence = confidence
@@ -566,7 +611,7 @@ public sealed class ResearcherAgent : IAgent
         IReadOnlyList<MemorySearchResult> relatedMemories,
         CancellationToken cancellationToken)
     {
-        if (executedQueries.Count >= MaxSearchIterations)
+        if (executedQueries.Count >= _options.MaxSearchIterations)
         {
             return new IterationDecision(IterationAction.Stop, Array.Empty<string>(), "Reached search iteration limit.");
         }
@@ -578,21 +623,27 @@ public sealed class ResearcherAgent : IAgent
         }
 
         var prompt = new StringBuilder();
-        prompt.AppendLine($"Objective: {task.Objective}");
-        prompt.AppendLine("Search queries executed so far:");
+        prompt.AppendLine(string.Format(
+            CultureInfo.InvariantCulture,
+            SystemPrompts.Templates.Researcher.SupervisorObjectiveLine,
+            task.Objective ?? string.Empty));
+        prompt.AppendLine(SystemPrompts.Templates.Researcher.SupervisorHistoryHeader);
         for (int index = 0; index < executedQueries.Count; index++)
         {
             prompt.AppendLine($"{index + 1}. {executedQueries[index]}");
         }
 
         prompt.AppendLine();
-        prompt.AppendLine("Evidence gathered so far (truncated):");
+        prompt.AppendLine(SystemPrompts.Templates.Researcher.SupervisorEvidenceHeader);
         prompt.AppendLine(evidenceSnapshot);
         prompt.AppendLine();
-        prompt.AppendLine("Decide whether the researcher should run additional searches. Respond using strict JSON: {\"action\":\"continue|stop\",\"queries\":[string],\"reason\":string}. Provide at most 2 new queries when continuing.");
+        prompt.AppendLine(string.Format(
+            CultureInfo.InvariantCulture,
+            SystemPrompts.Templates.Researcher.SupervisorDecisionInstruction,
+            _options.MaxContinuationQueries));
 
         var decisionRequest = new OpenAiChatRequest(
-            SystemPrompt: "You supervise an autonomous researcher. Recommend whether more web searches are required based on the current evidence. Prefer stopping when major questions are answered.",
+            SystemPrompt: SystemPrompts.Researcher.Supervisor,
             Messages: new[]
             {
                 new OpenAiChatMessage("user", prompt.ToString())
@@ -634,7 +685,7 @@ public sealed class ResearcherAgent : IAgent
                     }
 
                     string? query = queryElement.GetString();
-                    if (string.IsNullOrWhiteSpace(query) || queries.Count >= MaxContinuationQueries)
+                    if (string.IsNullOrWhiteSpace(query) || queries.Count >= _options.MaxContinuationQueries)
                     {
                         continue;
                     }
@@ -730,7 +781,7 @@ public sealed class ResearcherAgent : IAgent
         {
             AgentId = task.TaskId,
             ResearchSessionId = task.ResearchSessionId,
-            Instruction = task.Objective,
+            Instruction = task.Objective ?? string.Empty,
             Parameters = parameters
         };
 
@@ -890,14 +941,16 @@ public sealed class ResearcherAgent : IAgent
 
         if (relatedMemories.Count > 0)
         {
-            builder.AppendLine("Relevant prior memories:");
+            builder.AppendLine(SystemPrompts.Templates.Common.RelevantMemoriesHeader);
             foreach (var memory in relatedMemories)
             {
                 builder.AppendLine($"- {memory.Record.Content}");
             }
         }
 
-        return builder.Length == 0 ? "No successful evidence collected." : builder.ToString();
+        return builder.Length == 0
+            ? SystemPrompts.Templates.Common.NoEvidenceCollected
+            : builder.ToString();
     }
 
     private static List<SourceCitation> CollectCitations(IEnumerable<ToolExecutionResult> toolOutputs, IReadOnlyList<MemorySearchResult> relatedMemories)
@@ -946,28 +999,41 @@ public sealed class ResearcherAgent : IAgent
         }
 
         var prompt = new StringBuilder();
-        prompt.AppendLine($"Research objective: {task.Objective}");
-        prompt.AppendLine("Review the search results below and choose up to three that warrant a deeper computer-use browsing session. Favor sources that appear authoritative, comprehensive, or directly aligned with the objective.");
+        prompt.AppendLine(string.Format(
+            CultureInfo.InvariantCulture,
+            SystemPrompts.Templates.Researcher.TriageObjectiveLine,
+            task.Objective ?? string.Empty));
+        prompt.AppendLine(SystemPrompts.Templates.Researcher.TriageGuidance);
         prompt.AppendLine();
 
         for (int index = 0; index < searchResult.Citations.Count; index++)
         {
             var citation = searchResult.Citations[index];
             string title = string.IsNullOrWhiteSpace(citation.Title) ? "Untitled" : citation.Title;
-            prompt.AppendLine($"{index + 1}. {title}");
+            prompt.AppendLine(string.Format(
+                CultureInfo.InvariantCulture,
+                SystemPrompts.Templates.Researcher.TriageResultLine,
+                index + 1,
+                title));
             if (!string.IsNullOrWhiteSpace(citation.Url))
             {
-                prompt.AppendLine($"   URL: {citation.Url}");
+                prompt.AppendLine(string.Format(
+                    CultureInfo.InvariantCulture,
+                    SystemPrompts.Templates.Researcher.TriageUrlLine,
+                    citation.Url));
             }
             if (!string.IsNullOrWhiteSpace(citation.Snippet))
             {
-                prompt.AppendLine($"   Snippet: {citation.Snippet}");
+                prompt.AppendLine(string.Format(
+                    CultureInfo.InvariantCulture,
+                    SystemPrompts.Templates.Researcher.TriageSnippetLine,
+                    citation.Snippet));
             }
             prompt.AppendLine();
         }
 
         var selectionRequest = new OpenAiChatRequest(
-            SystemPrompt: "You triage search results for an autonomous researcher. Always reply with strict JSON in the schema {\"selected\":[int],\"notes\":\"string\"}. Indices are 1-based. Include at least one entry when possible.",
+            SystemPrompt: SystemPrompts.Researcher.SearchTriage,
             Messages: new[]
             {
                 new OpenAiChatMessage("user", prompt.ToString())

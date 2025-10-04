@@ -1,5 +1,6 @@
 using System.Linq;
 using System.Text;
+using Marconian.ResearchAgent.Configuration;
 using Marconian.ResearchAgent.Models.Memory;
 using Marconian.ResearchAgent.Services.Caching;
 using Marconian.ResearchAgent.Services.OpenAI;
@@ -19,6 +20,7 @@ public sealed class ShortTermMemoryManager
     private readonly int _maxEntries;
     private readonly int _summaryBatchSize;
     private readonly ILogger<ShortTermMemoryManager> _logger;
+    private readonly TimeSpan _cacheTtl;
 
     public ShortTermMemoryManager(
         string agentId,
@@ -26,8 +28,7 @@ public sealed class ShortTermMemoryManager
         IAzureOpenAiService openAiService,
         string deploymentName,
         ICacheService? cacheService = null,
-        int maxEntries = 40,
-        int summaryBatchSize = 6,
+        ShortTermMemoryOptions? options = null,
         ILogger<ShortTermMemoryManager>? logger = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(agentId);
@@ -39,9 +40,29 @@ public sealed class ShortTermMemoryManager
         _cacheService = cacheService;
         _deploymentName = deploymentName;
         _cacheKey = $"stm:{researchSessionId}:{agentId}";
-        _maxEntries = Math.Max(summaryBatchSize + 2, maxEntries);
-        _summaryBatchSize = Math.Clamp(summaryBatchSize, 3, Math.Max(3, maxEntries / 2));
         _logger = logger ?? NullLogger<ShortTermMemoryManager>.Instance;
+
+        ShortTermMemoryOptions resolved = options is null
+            ? new ShortTermMemoryOptions()
+            : new ShortTermMemoryOptions
+            {
+                MaxEntries = options.MaxEntries,
+                SummaryBatchSize = options.SummaryBatchSize,
+                CacheTtlHours = options.CacheTtlHours
+            };
+
+        int sanitizedMaxEntries = Math.Max(3, resolved.MaxEntries);
+        int rawSummaryBatch = Math.Max(1, resolved.SummaryBatchSize);
+        _maxEntries = Math.Max(rawSummaryBatch + 2, sanitizedMaxEntries);
+        int sanitizedSummaryBatch = Math.Clamp(rawSummaryBatch, 3, Math.Max(3, sanitizedMaxEntries / 2));
+        _summaryBatchSize = sanitizedSummaryBatch;
+        double ttlHours = resolved.CacheTtlHours;
+        if (!double.IsFinite(ttlHours) || ttlHours <= 0)
+        {
+            ttlHours = 6;
+        }
+
+        _cacheTtl = TimeSpan.FromHours(Math.Clamp(ttlHours, 0.25, 168));
     }
 
     public IReadOnlyList<ShortTermMemoryEntry> Entries => _entries.AsReadOnly();
@@ -106,9 +127,9 @@ public sealed class ShortTermMemoryManager
 
         var itemsToSummarize = _entries.Take(batchCount).ToList();
         _logger.LogDebug("Summarizing {Count} short-term memory entries to control context length.", itemsToSummarize.Count);
-        var summaryPrompt = new StringBuilder();
-        summaryPrompt.AppendLine("Summarize the following agent interaction history into key bullet points that maintain factual accuracy.");
-        summaryPrompt.AppendLine("Focus on decisions, context, and follow-up questions.");
+    var summaryPrompt = new StringBuilder();
+    summaryPrompt.AppendLine(SystemPrompts.Templates.Memory.ShortTermSummaryIntro);
+    summaryPrompt.AppendLine(SystemPrompts.Templates.Memory.ShortTermSummaryFocus);
         summaryPrompt.AppendLine();
 
         foreach (var entry in itemsToSummarize)
@@ -118,7 +139,7 @@ public sealed class ShortTermMemoryManager
         }
 
         var request = new OpenAiChatRequest(
-            SystemPrompt: "You compress agent working memories without losing vital details.",
+            SystemPrompt: SystemPrompts.Memory.ShortTermCompressor,
             Messages: new[]
             {
                 new OpenAiChatMessage("user", summaryPrompt.ToString())
@@ -145,8 +166,8 @@ public sealed class ShortTermMemoryManager
             return;
         }
 
-        await _cacheService.SetAsync(_cacheKey, _entries, TimeSpan.FromHours(6), cancellationToken).ConfigureAwait(false);
-        _logger.LogTrace("Persisted {Count} short-term memory entries to the hybrid cache with TTL 6h.", _entries.Count);
+        await _cacheService.SetAsync(_cacheKey, _entries, _cacheTtl, cancellationToken).ConfigureAwait(false);
+        _logger.LogTrace("Persisted {Count} short-term memory entries to the hybrid cache with TTL {Ttl}.", _entries.Count, _cacheTtl);
     }
 }
 
