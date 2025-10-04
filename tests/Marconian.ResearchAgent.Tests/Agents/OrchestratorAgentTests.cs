@@ -1,4 +1,5 @@
 using System.Linq;
+using System.Reflection;
 using Marconian.ResearchAgent.Agents;
 using Marconian.ResearchAgent.Configuration;
 using Marconian.ResearchAgent.Memory;
@@ -58,6 +59,59 @@ public sealed class OrchestratorAgentTests
 
             Assert.That(result.Success, Is.False);
             Assert.That(orchestrator.CurrentState, Is.EqualTo(OrchestratorState.Failed));
+        }
+        finally
+        {
+            Directory.Delete(reportsDir, true);
+        }
+    }
+
+    [Test]
+    public void Constructor_ShouldSanitizeResearcherParallelismOptions()
+    {
+        var openAiMock = new Mock<IAzureOpenAiService>();
+        openAiMock
+            .Setup(service => service.GenerateEmbeddingAsync(It.IsAny<OpenAiEmbeddingRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<float> { 0.2f, 0.3f, 0.4f });
+
+        var cosmosMock = CreateCosmosMock();
+        var memoryManager = new LongTermMemoryManager(cosmosMock.Object, openAiMock.Object, "embedding", NullLogger<LongTermMemoryManager>.Instance);
+
+        var researcherOptions = new ResearcherOptions
+        {
+            Parallelism = new ResearcherParallelismOptions
+            {
+                NavigatorDegreeOfParallelism = 0,
+                ScraperDegreeOfParallelism = 0,
+                FileReaderDegreeOfParallelism = -5
+            }
+        };
+
+        string reportsDir = CreateTempDirectory();
+        try
+        {
+            var orchestrator = new OrchestratorAgent(
+                openAiMock.Object,
+                memoryManager,
+                () => Array.Empty<ITool>(),
+                "chat",
+                NullLogger<OrchestratorAgent>.Instance,
+                NullLoggerFactory.Instance,
+                cacheService: null,
+                reportsDirectory: reportsDir,
+                orchestratorOptions: null,
+                researcherOptions: researcherOptions);
+
+            var field = typeof(OrchestratorAgent).GetField("_researcherOptions", BindingFlags.NonPublic | BindingFlags.Instance);
+            Assert.That(field, Is.Not.Null);
+            var sanitized = field!.GetValue(orchestrator) as ResearcherOptions;
+            Assert.That(sanitized, Is.Not.Null);
+            Assert.Multiple(() =>
+            {
+                Assert.That(sanitized!.Parallelism.NavigatorDegreeOfParallelism, Is.EqualTo(1));
+                Assert.That(sanitized.Parallelism.ScraperDegreeOfParallelism, Is.EqualTo(1));
+                Assert.That(sanitized.Parallelism.FileReaderDegreeOfParallelism, Is.EqualTo(1));
+            });
         }
         finally
         {

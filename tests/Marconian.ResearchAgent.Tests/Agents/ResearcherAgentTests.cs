@@ -7,6 +7,7 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Threading;
+using System.Reflection;
 using Marconian.ResearchAgent.Agents;
 using Marconian.ResearchAgent.Configuration;
 using Marconian.ResearchAgent.Memory;
@@ -265,6 +266,50 @@ public sealed class ResearcherAgentTests
                 flaggedPdfUrl,
                 It.IsAny<CancellationToken>()),
             Times.Once);
+    }
+
+    [Test]
+    public void Constructor_ShouldSanitizeParallelismOptions()
+    {
+        var openAiMock = new Mock<IAzureOpenAiService>();
+        openAiMock
+            .Setup(service => service.GenerateEmbeddingAsync(It.IsAny<OpenAiEmbeddingRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<float> { 0.1f, 0.2f, 0.3f });
+
+        var cosmosMock = CreateCosmosMock();
+        var memoryManager = new LongTermMemoryManager(cosmosMock.Object, openAiMock.Object, "embedding", NullLogger<LongTermMemoryManager>.Instance);
+
+        var options = new ResearcherOptions
+        {
+            Parallelism = new ResearcherParallelismOptions
+            {
+                NavigatorDegreeOfParallelism = 0,
+                ScraperDegreeOfParallelism = -2,
+                FileReaderDegreeOfParallelism = 0
+            }
+        };
+
+        var agent = new ResearcherAgent(
+            openAiMock.Object,
+            memoryManager,
+            Enumerable.Empty<ITool>(),
+            "chat",
+            cacheService: null,
+            flowTracker: null,
+            logger: NullLogger<ResearcherAgent>.Instance,
+            shortTermLogger: NullLogger<ShortTermMemoryManager>.Instance,
+            options: options);
+
+        var field = typeof(ResearcherAgent).GetField("_parallelismOptions", BindingFlags.NonPublic | BindingFlags.Instance);
+        Assert.That(field, Is.Not.Null, "Parallelism field should exist.");
+        var sanitized = field!.GetValue(agent) as ResearcherParallelismOptions;
+        Assert.That(sanitized, Is.Not.Null);
+        Assert.Multiple(() =>
+        {
+            Assert.That(sanitized!.NavigatorDegreeOfParallelism, Is.EqualTo(1));
+            Assert.That(sanitized.ScraperDegreeOfParallelism, Is.EqualTo(1));
+            Assert.That(sanitized.FileReaderDegreeOfParallelism, Is.EqualTo(1));
+        });
     }
 
     private static Mock<ICosmosMemoryService> CreateCosmosMock()

@@ -120,12 +120,38 @@ public sealed class OrchestratorAgent : IAgent
             {
                 MaxSearchIterations = options.MaxSearchIterations,
                 MaxContinuationQueries = options.MaxContinuationQueries,
-                RelatedMemoryTake = options.RelatedMemoryTake
+                RelatedMemoryTake = options.RelatedMemoryTake,
+                Parallelism = options.Parallelism is null
+                    ? new ResearcherParallelismOptions()
+                    : new ResearcherParallelismOptions
+                    {
+                        NavigatorDegreeOfParallelism = options.Parallelism.NavigatorDegreeOfParallelism,
+                        ScraperDegreeOfParallelism = options.Parallelism.ScraperDegreeOfParallelism,
+                        FileReaderDegreeOfParallelism = options.Parallelism.FileReaderDegreeOfParallelism
+                    }
             };
 
         resolved.MaxSearchIterations = Math.Max(1, resolved.MaxSearchIterations);
         resolved.MaxContinuationQueries = Math.Max(0, resolved.MaxContinuationQueries);
         resolved.RelatedMemoryTake = Math.Max(0, resolved.RelatedMemoryTake);
+        resolved.Parallelism = SanitizeParallelism(resolved.Parallelism);
+        return resolved;
+    }
+
+    private static ResearcherParallelismOptions SanitizeParallelism(ResearcherParallelismOptions? options)
+    {
+        var resolved = options is null
+            ? new ResearcherParallelismOptions()
+            : new ResearcherParallelismOptions
+            {
+                NavigatorDegreeOfParallelism = options.NavigatorDegreeOfParallelism,
+                ScraperDegreeOfParallelism = options.ScraperDegreeOfParallelism,
+                FileReaderDegreeOfParallelism = options.FileReaderDegreeOfParallelism
+            };
+
+        resolved.NavigatorDegreeOfParallelism = Math.Max(1, resolved.NavigatorDegreeOfParallelism);
+        resolved.ScraperDegreeOfParallelism = Math.Max(1, resolved.ScraperDegreeOfParallelism);
+        resolved.FileReaderDegreeOfParallelism = Math.Max(1, resolved.FileReaderDegreeOfParallelism);
         return resolved;
     }
 

@@ -1,10 +1,12 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 using Marconian.ResearchAgent.Configuration;
 using Marconian.ResearchAgent.Memory;
 using Marconian.ResearchAgent.Models.Agents;
@@ -33,6 +35,7 @@ public sealed class ResearcherAgent : IAgent
     private readonly ResearchFlowTracker? _flowTracker;
     private readonly ResearcherOptions _options;
     private readonly ShortTermMemoryOptions _shortTermOptions;
+    private readonly ResearcherParallelismOptions _parallelismOptions;
 
     public ResearcherAgent(
         IAzureOpenAiService openAiService,
@@ -58,6 +61,7 @@ public sealed class ResearcherAgent : IAgent
         _shortTermLogger = shortTermLogger ?? NullLogger<ShortTermMemoryManager>.Instance;
         _options = SanitizeOptions(options);
         _shortTermOptions = SanitizeShortTermOptions(shortTermOptions);
+        _parallelismOptions = _options.Parallelism;
     }
 
     private static ResearcherOptions SanitizeOptions(ResearcherOptions? options)
@@ -68,12 +72,38 @@ public sealed class ResearcherAgent : IAgent
             {
                 MaxSearchIterations = options.MaxSearchIterations,
                 MaxContinuationQueries = options.MaxContinuationQueries,
-                RelatedMemoryTake = options.RelatedMemoryTake
+                RelatedMemoryTake = options.RelatedMemoryTake,
+                Parallelism = options.Parallelism is null
+                    ? new ResearcherParallelismOptions()
+                    : new ResearcherParallelismOptions
+                    {
+                        NavigatorDegreeOfParallelism = options.Parallelism.NavigatorDegreeOfParallelism,
+                        ScraperDegreeOfParallelism = options.Parallelism.ScraperDegreeOfParallelism,
+                        FileReaderDegreeOfParallelism = options.Parallelism.FileReaderDegreeOfParallelism
+                    }
             };
 
         resolved.MaxSearchIterations = Math.Max(1, resolved.MaxSearchIterations);
         resolved.MaxContinuationQueries = Math.Max(0, resolved.MaxContinuationQueries);
         resolved.RelatedMemoryTake = Math.Max(0, resolved.RelatedMemoryTake);
+        resolved.Parallelism = SanitizeParallelism(resolved.Parallelism);
+        return resolved;
+    }
+
+    private static ResearcherParallelismOptions SanitizeParallelism(ResearcherParallelismOptions? options)
+    {
+        var resolved = options is null
+            ? new ResearcherParallelismOptions()
+            : new ResearcherParallelismOptions
+            {
+                NavigatorDegreeOfParallelism = options.NavigatorDegreeOfParallelism,
+                ScraperDegreeOfParallelism = options.ScraperDegreeOfParallelism,
+                FileReaderDegreeOfParallelism = options.FileReaderDegreeOfParallelism
+            };
+
+        resolved.NavigatorDegreeOfParallelism = Math.Max(1, resolved.NavigatorDegreeOfParallelism);
+        resolved.ScraperDegreeOfParallelism = Math.Max(1, resolved.ScraperDegreeOfParallelism);
+        resolved.FileReaderDegreeOfParallelism = Math.Max(1, resolved.FileReaderDegreeOfParallelism);
         return resolved;
     }
 
@@ -92,6 +122,24 @@ public sealed class ResearcherAgent : IAgent
         };
     }
 
+    private static async Task AppendToShortTermAsync(
+        ShortTermMemoryManager shortTermMemory,
+        SemaphoreSlim shortTermLock,
+        string role,
+        string content,
+        CancellationToken cancellationToken)
+    {
+        await shortTermLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await shortTermMemory.AppendAsync(role, content, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            shortTermLock.Release();
+        }
+    }
+
     public async Task<AgentExecutionResult> ExecuteTaskAsync(AgentTask task, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(task);
@@ -108,14 +156,17 @@ public sealed class ResearcherAgent : IAgent
             logger: _shortTermLogger);
 
         await shortTermMemory.InitializeAsync(cancellationToken).ConfigureAwait(false);
-    await shortTermMemory.AppendAsync("user", task.Objective ?? string.Empty, cancellationToken).ConfigureAwait(false);
+        using var shortTermLock = new SemaphoreSlim(1, 1);
+        await AppendToShortTermAsync(shortTermMemory, shortTermLock, "user", task.Objective ?? string.Empty, cancellationToken).ConfigureAwait(false);
 
         var toolOutputs = new List<ToolExecutionResult>();
         var errors = new List<string>();
-    var flaggedResourceUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-    var navigatorVisitedUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-    var scrapedPageUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-    var processedFileUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var toolOutputsLock = new object();
+        var errorsLock = new object();
+        var flaggedResourceUrls = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
+        var navigatorVisitedUrls = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
+        var scrapedPageUrls = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
+        var processedFileUrls = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
 
         int memoryTake = Math.Max(0, _options.RelatedMemoryTake);
         IReadOnlyList<MemorySearchResult> relatedMemories = await _longTermMemoryManager
@@ -125,7 +176,7 @@ public sealed class ResearcherAgent : IAgent
         if (relatedMemories.Count > 0)
         {
             string memorySummary = string.Join('\n', relatedMemories.Select(m => $"- {m.Record.Content}"));
-            await shortTermMemory.AppendAsync("memory", memorySummary, cancellationToken).ConfigureAwait(false);
+            await AppendToShortTermAsync(shortTermMemory, shortTermLock, "memory", memorySummary, cancellationToken).ConfigureAwait(false);
             _flowTracker?.RecordBranchNote(task.TaskId, $"Loaded {relatedMemories.Count} related memories.");
             _logger.LogDebug("Loaded {Count} related memories into short-term context for task {TaskId}.", relatedMemories.Count, task.TaskId);
         }
@@ -150,19 +201,22 @@ public sealed class ResearcherAgent : IAgent
                 else
                 {
                     executedQueryOrder.Add(query);
-                    await shortTermMemory.AppendAsync("assistant", $"---\nSearch iteration {iteration}: {query}", cancellationToken).ConfigureAwait(false);
+                    await AppendToShortTermAsync(shortTermMemory, shortTermLock, "assistant", $"---\nSearch iteration {iteration}: {query}", cancellationToken).ConfigureAwait(false);
 
                     await RunSearchIterationAsync(
                         task,
                         query,
                         iteration,
                         shortTermMemory,
+                        shortTermLock,
                         navigatorVisitedUrls,
                         scrapedPageUrls,
                         processedFileUrls,
                         flaggedResourceUrls,
                         toolOutputs,
                         errors,
+                        toolOutputsLock,
+                        errorsLock,
                         cancellationToken).ConfigureAwait(false);
                 }
 
@@ -187,7 +241,7 @@ public sealed class ResearcherAgent : IAgent
 
                     if (!string.IsNullOrWhiteSpace(candidate))
                     {
-                        await shortTermMemory.AppendAsync("assistant", $"Queuing additional search: {candidate} ({decision.Reason ?? "no reason provided"}).", cancellationToken).ConfigureAwait(false);
+                        await AppendToShortTermAsync(shortTermMemory, shortTermLock, "assistant", $"Queuing additional search: {candidate} ({decision.Reason ?? "no reason provided"}).", cancellationToken).ConfigureAwait(false);
                         nextQuery = candidate;
                         continue;
                     }
@@ -195,7 +249,7 @@ public sealed class ResearcherAgent : IAgent
 
                 if (!string.IsNullOrWhiteSpace(decision.Reason))
                 {
-                    await shortTermMemory.AppendAsync("assistant", $"Stopping search iterations: {decision.Reason}", cancellationToken).ConfigureAwait(false);
+                    await AppendToShortTermAsync(shortTermMemory, shortTermLock, "assistant", $"Stopping search iterations: {decision.Reason}", cancellationToken).ConfigureAwait(false);
                 }
 
                 nextQuery = null;
@@ -203,7 +257,7 @@ public sealed class ResearcherAgent : IAgent
         }
         else
         {
-            await shortTermMemory.AppendAsync("assistant", "Search tool unavailable; proceeding with provided materials only.", cancellationToken).ConfigureAwait(false);
+            await AppendToShortTermAsync(shortTermMemory, shortTermLock, "assistant", "Search tool unavailable; proceeding with provided materials only.", cancellationToken).ConfigureAwait(false);
         }
 
         if ((task.Parameters.ContainsKey("imageFileId") || task.Parameters.ContainsKey("imageUrl")) && TryGetTool<ImageReaderTool>(out var imageReader))
@@ -225,11 +279,14 @@ public sealed class ResearcherAgent : IAgent
                 toolOutputs,
                 errors,
                 shortTermMemory,
+                shortTermLock,
+                toolOutputsLock,
+                errorsLock,
                 cancellationToken).ConfigureAwait(false);
         }
 
         string aggregatedEvidence = BuildEvidenceSummary(toolOutputs, relatedMemories);
-        await shortTermMemory.AppendAsync("assistant", aggregatedEvidence, cancellationToken).ConfigureAwait(false);
+    await AppendToShortTermAsync(shortTermMemory, shortTermLock, "assistant", aggregatedEvidence, cancellationToken).ConfigureAwait(false);
 
         var synthesisRequest = new OpenAiChatRequest(
             SystemPrompt: SystemPrompts.Researcher.Analyst,
@@ -247,7 +304,7 @@ public sealed class ResearcherAgent : IAgent
             MaxOutputTokens: 400);
 
         string summary = await _openAiService.GenerateTextAsync(synthesisRequest, cancellationToken).ConfigureAwait(false);
-        await shortTermMemory.AppendAsync("assistant", summary, cancellationToken).ConfigureAwait(false);
+    await AppendToShortTermAsync(shortTermMemory, shortTermLock, "assistant", summary, cancellationToken).ConfigureAwait(false);
 
         double confidence = InferConfidence(summary);
         var finding = new ResearchFinding
@@ -276,17 +333,20 @@ public sealed class ResearcherAgent : IAgent
         string query,
         int iteration,
         ShortTermMemoryManager shortTermMemory,
-        HashSet<string> navigatorVisitedUrls,
-        HashSet<string> scrapedPageUrls,
-        HashSet<string> processedFileUrls,
-        HashSet<string> flaggedResourceUrls,
+        SemaphoreSlim shortTermLock,
+        ConcurrentDictionary<string, byte> navigatorVisitedUrls,
+        ConcurrentDictionary<string, byte> scrapedPageUrls,
+        ConcurrentDictionary<string, byte> processedFileUrls,
+        ConcurrentDictionary<string, byte> flaggedResourceUrls,
         List<ToolExecutionResult> toolOutputs,
         List<string> errors,
+        object toolOutputsLock,
+        object errorsLock,
         CancellationToken cancellationToken)
     {
         if (!TryGetTool<WebSearchTool>(out var searchTool))
         {
-            await shortTermMemory.AppendAsync("assistant", "Search capability unavailable; stopping iteration early.", cancellationToken).ConfigureAwait(false);
+            await AppendToShortTermAsync(shortTermMemory, shortTermLock, "assistant", "Search capability unavailable; stopping iteration early.", cancellationToken).ConfigureAwait(false);
             _logger.LogWarning("Search tool not registered; cannot execute iteration {Iteration} for task {TaskId}.", iteration, task.TaskId);
             return;
         }
@@ -301,11 +361,14 @@ public sealed class ResearcherAgent : IAgent
             toolOutputs,
             errors,
             shortTermMemory,
+            shortTermLock,
+            toolOutputsLock,
+            errorsLock,
             cancellationToken).ConfigureAwait(false);
 
         if (!searchResult.Success)
         {
-            await shortTermMemory.AppendAsync("assistant", $"Iteration {iteration} search for '{query}' failed: {searchResult.ErrorMessage ?? "unknown error"}.", cancellationToken).ConfigureAwait(false);
+            await AppendToShortTermAsync(shortTermMemory, shortTermLock, "assistant", $"Iteration {iteration} search for '{query}' failed: {searchResult.ErrorMessage ?? "unknown error"}.", cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -316,12 +379,12 @@ public sealed class ResearcherAgent : IAgent
 
         if (baseCitations.Count == 0)
         {
-            await shortTermMemory.AppendAsync("assistant", "Search returned no actionable results; moving to next iteration.", cancellationToken).ConfigureAwait(false);
+            await AppendToShortTermAsync(shortTermMemory, shortTermLock, "assistant", "Search returned no actionable results; moving to next iteration.", cancellationToken).ConfigureAwait(false);
             return;
         }
 
         var citationsForFollowUp = baseCitations.Take(3).ToList();
-        var flaggedResources = new List<FlaggedResource>();
+        var flaggedResourceTuples = new ConcurrentBag<(int Index, FlaggedResource Resource)>();
 
         if (TryGetTool<ComputerUseNavigatorTool>(out var navigatorTool))
         {
@@ -345,66 +408,94 @@ public sealed class ResearcherAgent : IAgent
                 selectionMessage += $" Rationale: {selection.Notes}";
             }
 
-            await shortTermMemory.AppendAsync("assistant", selectionMessage, cancellationToken).ConfigureAwait(false);
+            await AppendToShortTermAsync(shortTermMemory, shortTermLock, "assistant", selectionMessage, cancellationToken).ConfigureAwait(false);
             _flowTracker?.RecordBranchNote(task.TaskId, selectionMessage);
 
-            foreach (var citation in citationsForFollowUp)
+            int navigatorDegree = Math.Max(1, _parallelismOptions.NavigatorDegreeOfParallelism);
+            using var navigatorSemaphore = new SemaphoreSlim(navigatorDegree, navigatorDegree);
+            var navigatorTasks = new List<Task>();
+
+            for (int index = 0; index < citationsForFollowUp.Count; index++)
             {
+                var citation = citationsForFollowUp[index];
                 if (string.IsNullOrWhiteSpace(citation.Url))
                 {
                     continue;
                 }
 
-                if (!navigatorVisitedUrls.Add(citation.Url))
+                if (!navigatorVisitedUrls.TryAdd(citation.Url, 0))
                 {
                     _logger.LogDebug("Skipping navigator revisit for {Url}.", citation.Url);
                     continue;
                 }
 
-                var navParameters = new Dictionary<string, string>
-                {
-                    ["url"] = citation.Url,
-                    ["objective"] = task.Objective
-                };
+                navigatorTasks.Add(ProcessNavigatorAsync(citation, index));
+            }
 
-                ToolExecutionResult navResult = await ExecuteToolAsync(
-                    task,
-                    navigatorTool,
-                    CreateContext(task, navParameters),
-                    toolOutputs,
-                    errors,
-                    shortTermMemory,
-                    cancellationToken).ConfigureAwait(false);
+            await Task.WhenAll(navigatorTasks).ConfigureAwait(false);
 
-                if (navResult.FlaggedResources.Count == 0)
+            async Task ProcessNavigatorAsync(SourceCitation citation, int citationIndex)
+            {
+                await navigatorSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try
                 {
-                    continue;
+                    var navParameters = new Dictionary<string, string>
+                    {
+                        ["url"] = citation.Url!,
+                        ["objective"] = task.Objective ?? string.Empty
+                    };
+
+                    ToolExecutionResult navResult = await ExecuteToolAsync(
+                        task,
+                        navigatorTool,
+                        CreateContext(task, navParameters),
+                        toolOutputs,
+                        errors,
+                        shortTermMemory,
+                        shortTermLock,
+                        toolOutputsLock,
+                        errorsLock,
+                        cancellationToken).ConfigureAwait(false);
+
+                    if (navResult.FlaggedResources.Count == 0)
+                    {
+                        return;
+                    }
+
+                    foreach (var resource in navResult.FlaggedResources)
+                    {
+                        if (string.IsNullOrWhiteSpace(resource.Url))
+                        {
+                            continue;
+                        }
+
+                        if (flaggedResourceUrls.TryAdd(resource.Url, 0))
+                        {
+                            flaggedResourceTuples.Add((citationIndex, resource));
+                        }
+                    }
                 }
-
-                foreach (var resource in navResult.FlaggedResources)
+                finally
                 {
-                    if (string.IsNullOrWhiteSpace(resource.Url))
-                    {
-                        continue;
-                    }
-
-                    if (flaggedResourceUrls.Add(resource.Url))
-                    {
-                        flaggedResources.Add(resource);
-                    }
+                    navigatorSemaphore.Release();
                 }
             }
         }
         else
         {
             const string message = "Computer-use navigator unavailable; will proceed directly to scraping and downloads.";
-            await shortTermMemory.AppendAsync("assistant", message, cancellationToken).ConfigureAwait(false);
+            await AppendToShortTermAsync(shortTermMemory, shortTermLock, "assistant", message, cancellationToken).ConfigureAwait(false);
             _flowTracker?.RecordBranchNote(task.TaskId, message);
         }
 
         var splitCitations = SplitCitations(citationsForFollowUp);
         var citationsForPages = splitCitations.Pages;
         var documentCitations = splitCitations.Documents;
+
+        var flaggedResources = flaggedResourceTuples
+            .OrderBy(static tuple => tuple.Index)
+            .Select(static tuple => tuple.Resource)
+            .ToList();
 
         if (flaggedResources.Count > 0)
         {
@@ -428,14 +519,14 @@ public sealed class ResearcherAgent : IAgent
             }
 
             string flaggedSummary = noteBuilder.ToString().TrimEnd();
-            await shortTermMemory.AppendAsync("assistant", flaggedSummary, cancellationToken).ConfigureAwait(false);
+            await AppendToShortTermAsync(shortTermMemory, shortTermLock, "assistant", flaggedSummary, cancellationToken).ConfigureAwait(false);
             _flowTracker?.RecordBranchNote(task.TaskId, flaggedSummary);
         }
 
-    var flaggedPageCitations = new List<SourceCitation>();
-    var flaggedPageUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-    var flaggedFileResources = new List<FlaggedResource>();
-    var flaggedFileUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var flaggedPageCitations = new List<SourceCitation>();
+        var flaggedPageUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var flaggedFileResources = new List<FlaggedResource>();
+        var flaggedFileUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var resource in flaggedResources)
         {
@@ -471,7 +562,7 @@ public sealed class ResearcherAgent : IAgent
                     continue;
                 }
 
-                if (!scrapedPageUrls.Add(citation.Url))
+                if (!scrapedPageUrls.TryAdd(citation.Url, 0))
                 {
                     continue;
                 }
@@ -483,31 +574,48 @@ public sealed class ResearcherAgent : IAgent
                 }
             }
 
+            int scraperDegree = Math.Max(1, _parallelismOptions.ScraperDegreeOfParallelism);
+            using var scraperSemaphore = new SemaphoreSlim(scraperDegree, scraperDegree);
+            var scraperTasks = new List<Task>();
+
             foreach (var citation in scrapeCandidates)
             {
-                if (string.IsNullOrWhiteSpace(citation.Url))
+                scraperTasks.Add(ProcessScrapeAsync(citation));
+            }
+
+            await Task.WhenAll(scraperTasks).ConfigureAwait(false);
+
+            async Task ProcessScrapeAsync(SourceCitation citation)
+            {
+                await scraperSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try
                 {
-                    continue;
+                    var scrapeParameters = new Dictionary<string, string>
+                    {
+                        ["url"] = citation.Url!
+                    };
+
+                    if (task.Parameters.TryGetValue("render", out var renderFlag))
+                    {
+                        scrapeParameters["render"] = renderFlag;
+                    }
+
+                    await ExecuteToolAsync(
+                        task,
+                        scraperTool,
+                        CreateContext(task, scrapeParameters),
+                        toolOutputs,
+                        errors,
+                        shortTermMemory,
+                        shortTermLock,
+                        toolOutputsLock,
+                        errorsLock,
+                        cancellationToken).ConfigureAwait(false);
                 }
-
-                var scrapeParameters = new Dictionary<string, string>
+                finally
                 {
-                    ["url"] = citation.Url
-                };
-
-                if (task.Parameters.TryGetValue("render", out var renderFlag))
-                {
-                    scrapeParameters["render"] = renderFlag;
+                    scraperSemaphore.Release();
                 }
-
-                await ExecuteToolAsync(
-                    task,
-                    scraperTool,
-                    CreateContext(task, scrapeParameters),
-                    toolOutputs,
-                    errors,
-                    shortTermMemory,
-                    cancellationToken).ConfigureAwait(false);
             }
         }
 
@@ -528,7 +636,7 @@ public sealed class ResearcherAgent : IAgent
                     requestKey = $"fileId:{fileId}";
                 }
 
-                if (requestKey is null || processedFileUrls.Add(requestKey))
+                if (requestKey is null || processedFileUrls.TryAdd(requestKey, 0))
                 {
                     fileReadRequests.Add(new Dictionary<string, string>(task.Parameters));
                     if (requestKey is not null)
@@ -540,7 +648,7 @@ public sealed class ResearcherAgent : IAgent
 
             foreach (var resource in flaggedFileResources)
             {
-                if (string.IsNullOrWhiteSpace(resource.Url) || !processedFileUrls.Add(resource.Url) || !requestKeys.Add(resource.Url))
+                if (string.IsNullOrWhiteSpace(resource.Url) || !processedFileUrls.TryAdd(resource.Url, 0) || !requestKeys.Add(resource.Url))
                 {
                     continue;
                 }
@@ -566,7 +674,7 @@ public sealed class ResearcherAgent : IAgent
 
             foreach (var citation in documentCitations)
             {
-                if (string.IsNullOrWhiteSpace(citation.Url) || !processedFileUrls.Add(citation.Url) || !requestKeys.Add(citation.Url))
+                if (string.IsNullOrWhiteSpace(citation.Url) || !processedFileUrls.TryAdd(citation.Url, 0) || !requestKeys.Add(citation.Url))
                 {
                     continue;
                 }
@@ -590,16 +698,38 @@ public sealed class ResearcherAgent : IAgent
                 fileReadRequests.Add(parameters);
             }
 
+            int fileReaderDegree = Math.Max(1, _parallelismOptions.FileReaderDegreeOfParallelism);
+            using var fileReaderSemaphore = new SemaphoreSlim(fileReaderDegree, fileReaderDegree);
+            var fileReaderTasks = new List<Task>();
+
             foreach (var request in fileReadRequests)
             {
-                await ExecuteToolAsync(
-                    task,
-                    fileReader,
-                    CreateContext(task, request),
-                    toolOutputs,
-                    errors,
-                    shortTermMemory,
-                    cancellationToken).ConfigureAwait(false);
+                fileReaderTasks.Add(ProcessFileReadAsync(request));
+            }
+
+            await Task.WhenAll(fileReaderTasks).ConfigureAwait(false);
+
+            async Task ProcessFileReadAsync(Dictionary<string, string> request)
+            {
+                await fileReaderSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    await ExecuteToolAsync(
+                        task,
+                        fileReader,
+                        CreateContext(task, request),
+                        toolOutputs,
+                        errors,
+                        shortTermMemory,
+                        shortTermLock,
+                        toolOutputsLock,
+                        errorsLock,
+                        cancellationToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    fileReaderSemaphore.Release();
+                }
             }
         }
     }
@@ -850,6 +980,9 @@ public sealed class ResearcherAgent : IAgent
         List<ToolExecutionResult> outputs,
         List<string> errors,
         ShortTermMemoryManager shortTermMemory,
+        SemaphoreSlim shortTermLock,
+        object outputsLock,
+        object errorsLock,
         CancellationToken cancellationToken)
     {
         const int maxAttempts = 2;
@@ -887,7 +1020,10 @@ public sealed class ResearcherAgent : IAgent
             await Task.Delay(backoff, cancellationToken).ConfigureAwait(false);
         }
 
-        outputs.Add(result);
+        lock (outputsLock)
+        {
+            outputs.Add(result);
+        }
         _flowTracker?.RecordToolExecution(task.TaskId, result);
 
         if (result.Success && !string.IsNullOrWhiteSpace(result.Output))
@@ -907,10 +1043,13 @@ public sealed class ResearcherAgent : IAgent
             _logger.LogDebug("Persisted output from tool {Tool} for task {TaskId}.", tool.Name, task.TaskId);
         }
 
-        await shortTermMemory.AppendAsync("tool", $"{tool.Name} => {(result.Success ? "success" : "failure")}", cancellationToken).ConfigureAwait(false);
+        await AppendToShortTermAsync(shortTermMemory, shortTermLock, "tool", $"{tool.Name} => {(result.Success ? "success" : "failure")}", cancellationToken).ConfigureAwait(false);
         if (!result.Success && result.ErrorMessage is not null)
         {
-            errors.Add($"{tool.Name}: {result.ErrorMessage}");
+            lock (errorsLock)
+            {
+                errors.Add($"{tool.Name}: {result.ErrorMessage}");
+            }
             _flowTracker?.RecordBranchNote(task.TaskId, $"{tool.Name}: {result.ErrorMessage}");
             _logger.LogWarning("Tool {Tool} failed for task {TaskId}: {Error}.", tool.Name, task.TaskId, result.ErrorMessage);
         }
