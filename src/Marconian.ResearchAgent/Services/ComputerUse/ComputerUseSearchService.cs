@@ -23,23 +23,93 @@ public sealed class ComputerUseSearchService : IAsyncDisposable, IComputerUseExp
     private const string ResponsesApiVersion = "2024-08-01-preview";
     private const int DisplayWidth = 1280;
     private const int DisplayHeight = 720;
-    private const int MaxIterations = 8;
-    private const int MinSearchIterations = 2;
-    private const int MinExplorationIterations = 3;
-    private const int MaxContinuationAttempts = 2;
-
-    private const string SearchInstructions = "You control a Chromium browser. Execute actions one at a time, reviewing a screenshot after each step. Stop once Google search results are visible so the host application can read them.";
-    private const string SearchContinuationPrompt = "Continue the Google search workflow. Ensure organic results are clearly visible by taking additional actions such as scrolling or refining the query. Do not stop yet.";
-
+    private const int MaxIterations = 12;
+    private const int MaxContinuationAttempts = 3;
     private const string ExplorationInstructions = """
-You control a Chromium browser. Navigate the page, scroll to gather supporting evidence, follow relevant outbound links, and stop once you can provide a concise summary of the key takeaways.
-
-When you stop, respond with exactly one JSON object on the final turn matching this schema:
-{"summary":"...","flagged":[{"type":"page|file|download","title":"...","url":"...","notes":"optional context","mimeType":"optional mime"}]}
-
-Flag any resources that should be revisited (interesting subpages, downloadable files, data sources). Emit an empty array when nothing is flagged. Do not include text outside the JSON object.
+You control a Chromium browser. Navigate the page, scroll to gather supporting evidence, follow relevant outbound links, and stop once you can provide the structured summary (summary text, findings list, flagged resources). Respond only by calling the submit_summary function once you are ready to conclude.
 """;
-    private const string ExplorationContinuationPrompt = "You have not gathered enough evidence yet. Take more browser actions—scroll further, open relevant links, and capture observations—before concluding. Provide the summary only after deeper exploration.";
+
+    private const string ExplorationSummaryPrompt = "You have finished gathering observations. Call the submit_summary function with a concise summary, at least three findings, and any notable resources. Do not perform further computer actions.";
+    private const string ExplorationSummaryInstructions = "You have completed browsing. Finish by calling the submit_summary function with the final structured summary.";
+    private const string SearchInstructions = """
+You control a Chromium browser. Investigate the query, open promising results, and gather enough evidence to justify conclusions. When you are confident in your findings, call the submit_summary function exactly once with the structured summary payload (summary string, findings array, flagged resources array).
+""";
+    private const string ExplorationContinuationPrompt = "Continue exploring the current page or follow promising links to gather more evidence before calling submit_summary.";
+
+    private const string SummaryFunctionName = "submit_summary";
+    private const int MinExplorationIterations = 3;
+
+    private static readonly JsonObject SummaryFunctionDefinition = new()
+    {
+        ["type"] = "function",
+        ["name"] = SummaryFunctionName,
+        ["description"] = "Finalize the exploration by returning the structured findings and flagged resources.",
+        ["strict"] = true,
+        ["parameters"] = new JsonObject
+        {
+            ["type"] = "object",
+            ["additionalProperties"] = false,
+            ["properties"] = new JsonObject
+            {
+                ["summary"] = new JsonObject
+                {
+                    ["type"] = "string",
+                    ["description"] = "Concise narrative synthesis of the exploration findings."
+                },
+                ["findings"] = new JsonObject
+                {
+                    ["type"] = "array",
+                    ["description"] = "Bullet-style findings extracted from the exploration.",
+                    ["minItems"] = 3,
+                    ["items"] = new JsonObject
+                    {
+                        ["type"] = "string"
+                    }
+                },
+                ["flagged"] = new JsonObject
+                {
+                    ["type"] = "array",
+                    ["description"] = "Resources (pages, files, downloads) worth revisiting.",
+                    ["items"] = new JsonObject
+                    {
+                        ["type"] = "object",
+                        ["additionalProperties"] = false,
+                        ["properties"] = new JsonObject
+                        {
+                            ["type"] = new JsonObject
+                            {
+                                ["type"] = "string",
+                                ["enum"] = new JsonArray("page", "file", "download"),
+                                ["description"] = "Resource type classification."
+                            },
+                            ["title"] = new JsonObject
+                            {
+                                ["type"] = "string",
+                                ["description"] = "Human-readable title for the resource."
+                            },
+                            ["url"] = new JsonObject
+                            {
+                                ["type"] = "string",
+                                ["description"] = "Fully-qualified URL pointing to the resource."
+                            },
+                            ["notes"] = new JsonObject
+                            {
+                                ["type"] = new JsonArray("string", "null"),
+                                ["description"] = "Optional contextual notes for the resource."
+                            },
+                            ["mimeType"] = new JsonObject
+                            {
+                                ["type"] = new JsonArray("string", "null"),
+                                ["description"] = "Optional MIME type if known (e.g., application/pdf)."
+                            }
+                        },
+                        ["required"] = new JsonArray("type", "title", "url", "notes", "mimeType")
+                    }
+                }
+            },
+            ["required"] = new JsonArray("summary", "findings", "flagged")
+        }
+    };
 
     private static readonly Dictionary<string, string> KeyMapping = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -111,6 +181,8 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
         new("not now", RegexOptions.IgnoreCase | RegexOptions.Compiled),
         new("accept all", RegexOptions.IgnoreCase | RegexOptions.Compiled) // fallback if reject unavailable
     };
+
+    private bool _supportsSummaryFunction = true;
 
     private const string ConsentDismissScript = @"() => {
         const selectors = ['#bnp_btn_reject', '#bnp_btn_decline', '[aria-label*=""Reject"" i]', '[aria-label*=""Decline"" i]'];
@@ -346,7 +418,7 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
                     }
                 }
             },
-                ["instructions"] = SearchInstructions,
+            ["instructions"] = SearchInstructions,
             ["tools"] = BuildToolsArray(),
             ["reasoning"] = new JsonObject { ["generate_summary"] = "concise" },
             ["temperature"] = 0.2,
@@ -420,6 +492,70 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
         return ParseResponse(response, transcript);
     }
 
+    private async Task<ComputerUseResponseState> SendSummaryFunctionOutputAsync(
+        ComputerUseResponseState previous,
+        List<string> transcript,
+        string callId,
+        string? rawJsonPayload,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(previous.ResponseId))
+        {
+            return previous;
+        }
+
+        string? outputValue = rawJsonPayload;
+        if (string.IsNullOrWhiteSpace(outputValue))
+        {
+            if (previous.SummaryPayload is not null)
+            {
+                outputValue = JsonSerializer.Serialize(previous.SummaryPayload, SerializerOptions);
+            }
+            else
+            {
+                outputValue = "{\"status\":\"received\"}";
+            }
+        }
+
+        string finalOutputValue = outputValue!;
+
+        var payload = new JsonObject
+        {
+            ["input"] = new JsonArray
+            {
+                new JsonObject
+                {
+                    ["type"] = "function_call_output",
+                    ["call_id"] = callId,
+                    ["output"] = finalOutputValue
+                }
+            },
+            ["tools"] = BuildToolsArray(),
+            ["previous_response_id"] = previous.ResponseId,
+            ["truncation"] = "auto",
+            ["model"] = _deployment
+        };
+
+        _logger.LogInformation("Submitting function_call_output for {FunctionName} (callId={CallId}).", SummaryFunctionName, callId);
+        RecordTimelineEvent("summary_acknowledged", new Dictionary<string, object?>
+        {
+            ["callId"] = callId,
+            ["payloadLength"] = finalOutputValue.Length
+        });
+
+        try
+        {
+            using JsonDocument response = await SendRequestAsync(payload, cancellationToken).ConfigureAwait(false);
+            return ParseResponse(response, transcript);
+        }
+        catch (ComputerUseSummaryFunctionException ex)
+        {
+            _supportsSummaryFunction = false;
+            _logger.LogWarning(ex, "Summary function disabled after acknowledgement failure; falling back to transcript-only summarization.");
+            return previous;
+        }
+    }
+
     private async Task<ComputerUseResponseState> RequestContinuationAsync(
         ComputerUseResponseState previous,
         List<string> transcript,
@@ -432,8 +568,6 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
             return previous;
         }
 
-        string screenshot = _lastScreenshot ?? await CaptureScreenshotAsync(cancellationToken).ConfigureAwait(false);
-
         var content = new JsonArray
         {
             new JsonObject
@@ -442,15 +576,6 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
                 ["text"] = continuationPrompt
             }
         };
-
-        if (!string.IsNullOrEmpty(screenshot))
-        {
-            content.Add(new JsonObject
-            {
-                ["type"] = "input_image",
-                ["image_url"] = $"data:image/png;base64,{screenshot}"
-            });
-        }
 
         var payload = new JsonObject
         {
@@ -476,13 +601,22 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
             ["message"] = continuationPrompt
         });
 
-        using JsonDocument response = await SendRequestAsync(payload, cancellationToken).ConfigureAwait(false);
-        return ParseResponse(response, transcript);
+        try
+        {
+            using JsonDocument response = await SendRequestAsync(payload, cancellationToken).ConfigureAwait(false);
+            return ParseResponse(response, transcript);
+        }
+        catch (ComputerUseSummaryFunctionException ex) when (_supportsSummaryFunction)
+        {
+            _supportsSummaryFunction = false;
+            _logger.LogWarning(ex, "Summary function disabled after unsupported response; falling back to transcript-only summarization.");
+            return previous;
+        }
     }
 
     private JsonArray BuildToolsArray()
     {
-        return new JsonArray
+        var tools = new JsonArray
         {
             new JsonObject
             {
@@ -492,6 +626,13 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
                 ["environment"] = "browser"
             }
         };
+
+        if (_supportsSummaryFunction)
+        {
+            tools.Add(SummaryFunctionDefinition.DeepClone());
+        }
+
+        return tools;
     }
 
     private async Task<JsonDocument> SendRequestAsync(JsonNode payload, CancellationToken cancellationToken)
@@ -535,6 +676,17 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
 
             if (!canRetry)
             {
+                bool summaryFunctionIssue = response.StatusCode == HttpStatusCode.BadRequest &&
+                    (responseContent.Contains("\"text.format\"", StringComparison.OrdinalIgnoreCase) ||
+                     responseContent.Contains("computer_use_summary", StringComparison.OrdinalIgnoreCase) ||
+                     responseContent.Contains(SummaryFunctionName, StringComparison.OrdinalIgnoreCase) ||
+                     responseContent.Contains("\"type\":\"function\"", StringComparison.OrdinalIgnoreCase));
+
+                if (summaryFunctionIssue)
+                {
+                    throw new ComputerUseSummaryFunctionException(responseContent);
+                }
+
                 response.EnsureSuccessStatusCode();
             }
         }
@@ -550,6 +702,23 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
         bool completed = string.Equals(status, "completed", StringComparison.OrdinalIgnoreCase);
 
         ComputerCall? call = null;
+        ExplorationPayload? summaryPayload = null;
+        string? summaryRawJson = null;
+        string? summaryCallId = null;
+        List<string>? capturedSegments = null;
+
+        void ProcessSummaryCandidate(JsonElement candidate)
+        {
+            if (TryExtractSummaryFunction(candidate, out ExplorationPayload? payload, out string? rawJson, out string? callId))
+            {
+                summaryPayload = payload;
+                summaryRawJson = rawJson;
+                if (!string.IsNullOrWhiteSpace(callId))
+                {
+                    summaryCallId = callId;
+                }
+            }
+        }
 
         if (root.TryGetProperty("output", out JsonElement outputElement) && outputElement.ValueKind == JsonValueKind.Array)
         {
@@ -561,8 +730,76 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
                     string? text = item.TryGetProperty("text", out var textElement) ? textElement.GetString() : null;
                     if (!string.IsNullOrWhiteSpace(text))
                     {
-                        transcript.Add(text.Trim());
+                        string trimmed = text.Trim();
+                        transcript.Add(trimmed);
+                        (capturedSegments ??= new List<string>()).Add(trimmed);
                     }
+                }
+                else if (string.Equals(type, "output_text", StringComparison.OrdinalIgnoreCase))
+                {
+                    string? text = item.TryGetProperty("text", out var textElement) ? textElement.GetString() : null;
+                    if (!string.IsNullOrWhiteSpace(text))
+                    {
+                        string trimmed = text.Trim();
+                        transcript.Add(trimmed);
+                        (capturedSegments ??= new List<string>()).Add(trimmed);
+                    }
+                }
+                else if (string.Equals(type, "message", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (item.TryGetProperty("content", out var contentElement) && contentElement.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (JsonElement content in contentElement.EnumerateArray())
+                        {
+                            string? contentType = content.TryGetProperty("type", out var ct) ? ct.GetString() : null;
+                            if (string.Equals(contentType, "text", StringComparison.OrdinalIgnoreCase))
+                            {
+                                string? text = content.TryGetProperty("text", out var contentText) ? contentText.GetString() : null;
+                                if (!string.IsNullOrWhiteSpace(text))
+                                {
+                                    string trimmed = text.Trim();
+                                    transcript.Add(trimmed);
+                                    (capturedSegments ??= new List<string>()).Add(trimmed);
+                                }
+                            }
+                            else if (string.Equals(contentType, "reasoning", StringComparison.OrdinalIgnoreCase))
+                            {
+                                if (content.TryGetProperty("text", out var reasoningText) && reasoningText.ValueKind == JsonValueKind.String)
+                                {
+                                    string? reasoning = reasoningText.GetString();
+                                    if (!string.IsNullOrWhiteSpace(reasoning))
+                                    {
+                                        string trimmed = reasoning.Trim();
+                                        transcript.Add(trimmed);
+                                        (capturedSegments ??= new List<string>()).Add(trimmed);
+                                    }
+                                }
+                                else if (content.TryGetProperty("summary", out var reasoningSummary) && reasoningSummary.ValueKind == JsonValueKind.Array)
+                                {
+                                    foreach (JsonElement reason in reasoningSummary.EnumerateArray())
+                                    {
+                                        string? reasoning = reason.ValueKind switch
+                                        {
+                                            JsonValueKind.String => reason.GetString(),
+                                            JsonValueKind.Object when reason.TryGetProperty("text", out var reasonText) => reasonText.GetString(),
+                                            _ => null
+                                        };
+
+                                        if (!string.IsNullOrWhiteSpace(reasoning))
+                                        {
+                                            string trimmed = reasoning.Trim();
+                                            transcript.Add(trimmed);
+                                            (capturedSegments ??= new List<string>()).Add(trimmed);
+                                        }
+                                    }
+                                }
+                            }
+
+                            ProcessSummaryCandidate(content);
+                        }
+                    }
+
+                    ProcessSummaryCandidate(item);
                 }
                 else if (string.Equals(type, "reasoning", StringComparison.OrdinalIgnoreCase))
                 {
@@ -580,6 +817,7 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
                             if (!string.IsNullOrWhiteSpace(reasoningText))
                             {
                                 transcript.Add(reasoningText.Trim());
+                                (capturedSegments ??= new List<string>()).Add(reasoningText.Trim());
                             }
                         }
                     }
@@ -613,10 +851,173 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
                         }
                     }
                 }
+                else
+                {
+                    ProcessSummaryCandidate(item);
+                }
             }
         }
 
-        return new ComputerUseResponseState(responseId, call, completed);
+        if (capturedSegments is not null && capturedSegments.Count > 0)
+        {
+            string[] logged = capturedSegments
+                .Select(segment => segment.Length > 512 ? segment[..512] + "…" : segment)
+                .ToArray();
+
+            RecordTimelineEvent("model_text", new Dictionary<string, object?>
+            {
+                ["count"] = capturedSegments.Count,
+                ["segments"] = logged
+            });
+
+            foreach (string snippet in logged)
+            {
+                _logger.LogDebug("Computer-use model text: {Snippet}", snippet);
+            }
+        }
+
+        if (summaryPayload is not null)
+        {
+            RecordTimelineEvent("submit_summary", new Dictionary<string, object?>
+            {
+                ["summary"] = summaryPayload.Summary,
+                ["findings"] = summaryPayload.Findings?.Count ?? 0,
+                ["flagged"] = summaryPayload.Flagged?.Count ?? 0,
+                ["raw"] = summaryRawJson
+            });
+
+            _logger.LogInformation("Captured submit_summary payload with {FindingsCount} findings and {FlaggedCount} flagged resources.",
+                summaryPayload.Findings?.Count ?? 0,
+                summaryPayload.Flagged?.Count ?? 0);
+        }
+
+        return new ComputerUseResponseState(responseId, call, completed, summaryCallId)
+        {
+            SummaryPayload = summaryPayload,
+            SummaryRawJson = summaryRawJson
+        };
+    }
+
+    private bool TryExtractSummaryFunction(JsonElement element, out ExplorationPayload? payload, out string? rawJson, out string? callId)
+    {
+        payload = null;
+        rawJson = null;
+        callId = null;
+
+        if (element.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+
+        string? name = null;
+        JsonElement? argumentsElement = null;
+        string? callIdCandidate = ResolveCallId(element);
+
+        if (element.TryGetProperty("name", out var directName) && directName.ValueKind == JsonValueKind.String)
+        {
+            name = directName.GetString();
+        }
+
+        if (element.TryGetProperty("arguments", out var directArgs) && directArgs.ValueKind != JsonValueKind.Undefined)
+        {
+            argumentsElement = directArgs;
+        }
+
+        if (argumentsElement is null && element.TryGetProperty("function", out var functionElement) && functionElement.ValueKind == JsonValueKind.Object)
+        {
+            if (string.IsNullOrWhiteSpace(name) && functionElement.TryGetProperty("name", out var functionName) && functionName.ValueKind == JsonValueKind.String)
+            {
+                name = functionName.GetString();
+            }
+
+            if (functionElement.TryGetProperty("arguments", out var functionArgs) && functionArgs.ValueKind != JsonValueKind.Undefined)
+            {
+                argumentsElement = functionArgs;
+            }
+
+            callIdCandidate ??= ResolveCallId(functionElement);
+        }
+
+        if (argumentsElement is null && element.TryGetProperty("tool", out var toolElement) && toolElement.ValueKind == JsonValueKind.Object)
+        {
+            if (string.IsNullOrWhiteSpace(name) && toolElement.TryGetProperty("name", out var toolName) && toolName.ValueKind == JsonValueKind.String)
+            {
+                name = toolName.GetString();
+            }
+
+            if (toolElement.TryGetProperty("arguments", out var toolArgs) && toolArgs.ValueKind != JsonValueKind.Undefined)
+            {
+                argumentsElement = toolArgs;
+            }
+
+            callIdCandidate ??= ResolveCallId(toolElement);
+        }
+
+        if (!string.Equals(name, SummaryFunctionName, StringComparison.OrdinalIgnoreCase) || argumentsElement is null)
+        {
+            return false;
+        }
+
+        string? rawArguments = argumentsElement.Value.ValueKind switch
+        {
+            JsonValueKind.String => argumentsElement.Value.GetString(),
+            JsonValueKind.Object or JsonValueKind.Array => argumentsElement.Value.GetRawText(),
+            _ => null
+        };
+
+        if (string.IsNullOrWhiteSpace(rawArguments))
+        {
+            return false;
+        }
+
+        try
+        {
+            ExplorationPayload? parsed = JsonSerializer.Deserialize<ExplorationPayload>(rawArguments, SerializerOptions);
+            if (parsed is null)
+            {
+                return false;
+            }
+
+            payload = parsed;
+            rawJson = rawArguments;
+            callId = callIdCandidate;
+            return true;
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogWarning(ex, "Failed to parse submit_summary payload: {Payload}", rawArguments);
+            return false;
+        }
+
+        static string? ResolveCallId(JsonElement candidate)
+        {
+            if (candidate.ValueKind != JsonValueKind.Object)
+            {
+                return null;
+            }
+
+            if (candidate.TryGetProperty("call_id", out var callId) && callId.ValueKind == JsonValueKind.String)
+            {
+                return callId.GetString();
+            }
+
+            if (candidate.TryGetProperty("tool_call_id", out var toolCallId) && toolCallId.ValueKind == JsonValueKind.String)
+            {
+                return toolCallId.GetString();
+            }
+
+            if (candidate.TryGetProperty("id", out var idElement) && idElement.ValueKind == JsonValueKind.String)
+            {
+                return idElement.GetString();
+            }
+
+            if (candidate.TryGetProperty("callId", out var camelCase) && camelCase.ValueKind == JsonValueKind.String)
+            {
+                return camelCase.GetString();
+            }
+
+            return null;
+        }
     }
 
     private static ComputerUseAction? ParseAction(JsonElement element)
@@ -1513,7 +1914,12 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
 
         try
         {
-            var payload = JsonSerializer.Serialize(_timelineEntries, SerializerOptions);
+            var serializerOptions = new JsonSerializerOptions(SerializerOptions)
+            {
+                WriteIndented = true
+            };
+
+            var payload = JsonSerializer.Serialize(_timelineEntries, serializerOptions);
             await File.WriteAllTextAsync(_timelinePath, payload, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
@@ -1583,7 +1989,12 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
         }
     }
 
-    private sealed record ComputerUseResponseState(string? ResponseId, ComputerCall? Call, bool Completed);
+    private sealed record ComputerUseResponseState(string? ResponseId, ComputerCall? Call, bool Completed, string? SummaryFunctionCallId)
+    {
+        public ExplorationPayload? SummaryPayload { get; init; }
+
+        public string? SummaryRawJson { get; init; }
+    }
 
     private sealed record ComputerCall(string CallId, ComputerUseAction Action, IReadOnlyList<ComputerUseSafetyCheck> PendingSafetyChecks);
 
@@ -1638,22 +2049,235 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
             var transcript = new List<string>();
             ComputerUseResponseState response = await SendInitialExplorationRequestAsync(url, objective, transcript, cancellationToken).ConfigureAwait(false);
             int iteration = 0;
+            int continuationAttempts = 0;
+            bool summaryRequested = false;
+            string? lastResponseId = response.ResponseId;
+            ExplorationPayload? summaryPayload = response.SummaryPayload;
+            string? summaryRawJson = response.SummaryRawJson;
+            string? summaryCallId = response.SummaryFunctionCallId;
+            string? acknowledgedSummaryCallId = null;
 
-            while (response.Call is not null && iteration < MaxIterations)
+            void UpdateSummary(ComputerUseResponseState state)
             {
-                iteration++;
-                await HandleComputerCallAsync(response.Call, cancellationToken).ConfigureAwait(false);
-                response = await SendFollowupRequestAsync(response, transcript, cancellationToken, ExplorationInstructions).ConfigureAwait(false);
-
-                if (response.Call is null || response.Completed)
+                if (state.SummaryPayload is not null)
                 {
-                    break;
+                    summaryPayload = state.SummaryPayload;
+                    summaryRawJson = state.SummaryRawJson;
                 }
+
+                if (!string.IsNullOrWhiteSpace(state.SummaryFunctionCallId))
+                {
+                    summaryCallId = state.SummaryFunctionCallId;
+                }
+            }
+
+            async Task TryAcknowledgeSummaryAsync()
+            {
+                if (!_supportsSummaryFunction)
+                {
+                    return;
+                }
+
+                if (string.IsNullOrWhiteSpace(summaryCallId) ||
+                    string.Equals(summaryCallId, acknowledgedSummaryCallId, StringComparison.Ordinal))
+                {
+                    return;
+                }
+
+                ComputerUseResponseState ackSource = response;
+                if (string.IsNullOrWhiteSpace(ackSource.ResponseId) && !string.IsNullOrWhiteSpace(lastResponseId))
+                {
+                    ackSource = ackSource with { ResponseId = lastResponseId };
+                }
+
+                if (string.IsNullOrWhiteSpace(ackSource.ResponseId))
+                {
+                    return;
+                }
+
+                string callId = summaryCallId!;
+                string? rawJson = summaryRawJson;
+
+                ackSource = await SendSummaryFunctionOutputAsync(ackSource, transcript, callId, rawJson, cancellationToken).ConfigureAwait(false);
+                response = ackSource;
+
+                acknowledgedSummaryCallId = callId;
+                UpdateSummary(response);
+
+                if (!string.IsNullOrWhiteSpace(response.ResponseId))
+                {
+                    lastResponseId = response.ResponseId;
+                }
+                else if (!string.IsNullOrWhiteSpace(lastResponseId))
+                {
+                    response = response with { ResponseId = lastResponseId };
+                }
+            }
+
+            UpdateSummary(response);
+            await TryAcknowledgeSummaryAsync().ConfigureAwait(false);
+
+            while (iteration < MaxIterations)
+            {
+                if (response.Call is not null)
+                {
+                    iteration++;
+                    await HandleComputerCallAsync(response.Call, cancellationToken).ConfigureAwait(false);
+                    response = await SendFollowupRequestAsync(response, transcript, cancellationToken, ExplorationInstructions).ConfigureAwait(false);
+                    UpdateSummary(response);
+                    await TryAcknowledgeSummaryAsync().ConfigureAwait(false);
+                    if (!string.IsNullOrWhiteSpace(response.ResponseId))
+                    {
+                        lastResponseId = response.ResponseId;
+                    }
+                    else if (!string.IsNullOrWhiteSpace(lastResponseId))
+                    {
+                        response = response with { ResponseId = lastResponseId };
+                    }
+                    continue;
+                }
+
+                bool shouldRequestMore = ShouldRequestExplorationContinuation(iteration, transcript);
+                string? effectiveResponseId = !string.IsNullOrWhiteSpace(response.ResponseId) ? response.ResponseId : lastResponseId;
+                bool canRequestActions = !string.IsNullOrWhiteSpace(effectiveResponseId) && continuationAttempts < MaxContinuationAttempts;
+
+                if (shouldRequestMore && canRequestActions)
+                {
+                    continuationAttempts++;
+                    _logger.LogInformation(
+                        "Forcing additional computer-use exploration (attempt {Attempt}, iteration {Iteration}, segments={Segments}).",
+                        continuationAttempts,
+                        iteration,
+                        transcript.Count);
+
+                    var continuationState = !string.IsNullOrWhiteSpace(response.ResponseId)
+                        ? response
+                        : response with { ResponseId = effectiveResponseId };
+
+                    response = await RequestContinuationAsync(
+                            continuationState,
+                            transcript,
+                            ExplorationContinuationPrompt,
+                            ExplorationInstructions,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                    UpdateSummary(response);
+                    await TryAcknowledgeSummaryAsync().ConfigureAwait(false);
+                    if (!string.IsNullOrWhiteSpace(response.ResponseId))
+                    {
+                        lastResponseId = response.ResponseId;
+                    }
+                    else if (!string.IsNullOrWhiteSpace(effectiveResponseId))
+                    {
+                        response = response with { ResponseId = effectiveResponseId };
+                    }
+                    continue;
+                }
+
+                bool needsSummary = !summaryRequested && ShouldRequestExplorationSummary(transcript);
+                bool canRequestSummary = !string.IsNullOrWhiteSpace(effectiveResponseId);
+
+                if (needsSummary && canRequestSummary)
+                {
+                    summaryRequested = true;
+                    _logger.LogInformation(
+                        "Requesting computer-use exploration summary (iteration {Iteration}, segments={Segments}).",
+                        iteration,
+                        transcript.Count);
+
+                    var summaryState = !string.IsNullOrWhiteSpace(response.ResponseId)
+                        ? response
+                        : response with { ResponseId = effectiveResponseId };
+
+                    response = await RequestContinuationAsync(
+                            summaryState,
+                            transcript,
+                            ExplorationSummaryPrompt,
+                            ExplorationSummaryInstructions,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                    UpdateSummary(response);
+                    await TryAcknowledgeSummaryAsync().ConfigureAwait(false);
+                    if (!string.IsNullOrWhiteSpace(response.ResponseId))
+                    {
+                        lastResponseId = response.ResponseId;
+                    }
+                    else if (!string.IsNullOrWhiteSpace(effectiveResponseId))
+                    {
+                        response = response with { ResponseId = effectiveResponseId };
+                    }
+                    continue;
+                }
+
+                break;
             }
 
             if (iteration >= MaxIterations && response.Call is not null)
             {
                 _logger.LogWarning("Computer-use exploration for url '{Url}' reached iteration limit before completion.", url);
+            }
+
+            if (!summaryRequested && !string.IsNullOrWhiteSpace(lastResponseId))
+            {
+                try
+                {
+                    _logger.LogInformation(
+                        "Requesting computer-use exploration summary after action loop (segments={Segments}).",
+                        transcript.Count);
+
+                    var summaryState = response with { ResponseId = lastResponseId };
+                    ComputerUseResponseState summaryResponse = await RequestContinuationAsync(
+                            summaryState,
+                            transcript,
+                            ExplorationSummaryPrompt,
+                            ExplorationSummaryInstructions,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                    UpdateSummary(summaryResponse);
+                    response = summaryResponse;
+                    await TryAcknowledgeSummaryAsync().ConfigureAwait(false);
+
+                    if (!string.IsNullOrWhiteSpace(summaryResponse.ResponseId))
+                    {
+                        lastResponseId = summaryResponse.ResponseId;
+                    }
+
+                    if (summaryResponse.Call is not null && iteration < MaxIterations)
+                    {
+                        response = summaryResponse;
+                        summaryRequested = true;
+
+                        while (response.Call is not null && iteration < MaxIterations)
+                        {
+                            iteration++;
+                            await HandleComputerCallAsync(response.Call, cancellationToken).ConfigureAwait(false);
+                            response = await SendFollowupRequestAsync(response, transcript, cancellationToken, ExplorationInstructions).ConfigureAwait(false);
+                            UpdateSummary(response);
+                            await TryAcknowledgeSummaryAsync().ConfigureAwait(false);
+
+                            if (!string.IsNullOrWhiteSpace(response.ResponseId))
+                            {
+                                lastResponseId = response.ResponseId;
+                            }
+                            else if (!string.IsNullOrWhiteSpace(lastResponseId))
+                            {
+                                response = response with { ResponseId = lastResponseId };
+                            }
+                        }
+                    }
+                    else
+                    {
+                        summaryRequested = true;
+                    }
+                }
+                catch (HttpRequestException ex)
+                {
+                    _logger.LogWarning(ex, "Summary request failed; continuing with collected transcript only.");
+                }
+                catch (InvalidOperationException ex)
+                {
+                    _logger.LogWarning(ex, "Summary request failed; continuing with collected transcript only.");
+                }
             }
 
             string? finalUrl = null;
@@ -1668,10 +2292,38 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
                 _logger.LogDebug(ex, "Failed to capture final page metadata for exploration '{Url}'.", url);
             }
 
-            ExplorationStructuredOutput structured = ParseExplorationStructuredOutput(transcript);
+            ExplorationStructuredOutput structured = ParseExplorationStructuredOutput(transcript, summaryPayload, summaryRawJson);
             string summary = !string.IsNullOrWhiteSpace(structured.Summary)
                 ? structured.Summary!
                 : ExtractExplorationSummary(transcript);
+
+            if (string.IsNullOrWhiteSpace(summary) || summary.Length < 80)
+            {
+                string? fallbackSummary = await CapturePageSynopsisAsync(cancellationToken).ConfigureAwait(false);
+                if (!string.IsNullOrWhiteSpace(fallbackSummary))
+                {
+                    summary = fallbackSummary;
+                }
+            }
+
+            IReadOnlyList<string> findings = ExtractExplorationFindings(structured.Findings, summary, transcript);
+
+            if (findings.Count == 0 && !string.IsNullOrWhiteSpace(summary))
+            {
+                findings = ExtractExplorationFindings(Array.Empty<string>(), summary, transcript);
+            }
+
+            if (_logger.IsEnabled(LogLevel.Information))
+            {
+                if (!string.IsNullOrWhiteSpace(structured.RawJson))
+                {
+                    _logger.LogInformation("Structured exploration output JSON: {Structured}", structured.RawJson);
+                }
+                else
+                {
+                    _logger.LogInformation("Structured exploration output JSON unavailable; falling back to transcript findings.");
+                }
+            }
 
             if (structured.FlaggedResources.Count > 0)
             {
@@ -1689,14 +2341,24 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
                 });
             }
 
+            if (findings.Count > 0)
+            {
+                RecordTimelineEvent("exploration_findings", new Dictionary<string, object?>
+                {
+                    ["count"] = findings.Count,
+                    ["items"] = findings.ToArray()
+                });
+            }
+
             RecordTimelineEvent("exploration_complete", new Dictionary<string, object?>
             {
                 ["requestedUrl"] = url,
                 ["finalUrl"] = finalUrl,
-                ["summary"] = summary
+                ["summary"] = summary,
+                ["findings"] = findings.ToArray()
             });
 
-            return new ComputerUseExplorationResult(url, finalUrl, pageTitle, summary, transcript.ToArray(), structured.FlaggedResources);
+            return new ComputerUseExplorationResult(url, finalUrl, pageTitle, summary, structured.RawJson, findings, transcript.ToArray(), structured.FlaggedResources);
         }
         catch (OperationCanceledException)
         {
@@ -1737,13 +2399,14 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
 
     private async Task<ComputerUseResponseState> SendInitialExplorationRequestAsync(string targetUrl, string? objective, List<string> transcript, CancellationToken cancellationToken)
     {
-    await PreparePageForComputerUseAsync(cancellationToken).ConfigureAwait(false);
-    string screenshot = await CaptureScreenshotAsync(cancellationToken).ConfigureAwait(false);
-        string objectiveClause = string.IsNullOrWhiteSpace(objective)
-            ? "Review the currently open page and capture the most important insights."
-            : $"Review the currently open page and capture information relevant to \"{objective}\".";
-
-        string userInstruction = string.Concat(objectiveClause, " Scroll as needed before summarizing your findings. The requested page is ", targetUrl, ". Provide a concise summary with bullet points and note any important sections or outbound links.");
+        await PreparePageForComputerUseAsync(cancellationToken).ConfigureAwait(false);
+        string screenshot = await CaptureScreenshotAsync(cancellationToken).ConfigureAwait(false);
+        string focusSubject = string.IsNullOrWhiteSpace(objective) ? "the topic" : $"\"{objective}\"";
+        string userInstruction =
+            $"Review the currently open page and gather concrete insights related to {focusSubject}. " +
+            "If the page is a navigation hub or search form, use it to reach the relevant content before summarizing. " +
+            "Scroll as needed, open helpful links, and capture evidence. " +
+            $"The requested page is {targetUrl}. When you are ready to conclude, call the submit_summary function exactly once with a concise summary, at least three findings, and any important resources or outbound links.";
 
         var payload = new JsonObject
         {
@@ -1767,7 +2430,7 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
                     }
                 }
             },
-                ["instructions"] = ExplorationInstructions,
+            ["instructions"] = ExplorationInstructions,
             ["tools"] = BuildToolsArray(),
             ["reasoning"] = new JsonObject { ["generate_summary"] = "concise" },
             ["temperature"] = 0.2,
@@ -1780,39 +2443,118 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
         return ParseResponse(response, transcript);
     }
 
-    private ExplorationStructuredOutput ParseExplorationStructuredOutput(IReadOnlyList<string> transcript)
+    private static bool ShouldRequestExplorationContinuation(int iteration, IReadOnlyList<string> transcript)
+    {
+        if (iteration < MinExplorationIterations)
+        {
+            return true;
+        }
+
+        int informativeSegments = 0;
+        int nonEmptySegments = 0;
+
+        foreach (string segment in transcript)
+        {
+            if (string.IsNullOrWhiteSpace(segment))
+            {
+                continue;
+            }
+
+            nonEmptySegments++;
+            if (segment.Length >= 80)
+            {
+                informativeSegments++;
+            }
+        }
+
+        if (informativeSegments == 0)
+        {
+            return true;
+        }
+
+        return nonEmptySegments < 3;
+    }
+
+    private static bool ShouldRequestExplorationSummary(IReadOnlyList<string> transcript)
     {
         if (transcript.Count == 0)
         {
-            return new ExplorationStructuredOutput(null, Array.Empty<FlaggedResource>());
+            return true;
+        }
+
+        for (int index = transcript.Count - 1; index >= 0; index--)
+        {
+            string segment = transcript[index];
+            if (string.IsNullOrWhiteSpace(segment))
+            {
+                continue;
+            }
+
+            if (segment.Length >= 120)
+            {
+                return false;
+            }
+
+            break;
+        }
+
+        int nonEmptySegments = transcript.Count(static segment => !string.IsNullOrWhiteSpace(segment));
+        return nonEmptySegments < 3;
+    }
+
+    private ExplorationStructuredOutput ParseExplorationStructuredOutput(IReadOnlyList<string> transcript, ExplorationPayload? summaryPayload, string? summaryRawJson)
+    {
+        if (summaryPayload is not null)
+        {
+            return ConvertPayloadToStructuredOutput(summaryPayload, summaryRawJson);
+        }
+
+        if (transcript.Count == 0)
+        {
+            return new ExplorationStructuredOutput(null, Array.Empty<string>(), Array.Empty<FlaggedResource>(), null);
         }
 
         for (int index = transcript.Count - 1; index >= 0; index--)
         {
             string entry = transcript[index];
-            if (!TryParseExplorationPayload(entry, out var payload))
+            if (!TryParseExplorationPayload(entry, out var payload, out string? rawJson))
             {
                 continue;
             }
 
-            List<FlaggedResource> flagged = payload.Flagged is null
-                ? new List<FlaggedResource>()
-                : payload.Flagged
-                    .Select(TryConvertResource)
-                    .Where(static resource => resource is not null)
-                    .Select(static resource => resource!)
-                    .DistinctBy(static resource => resource.Url, StringComparer.OrdinalIgnoreCase)
-                    .ToList();
-
-            return new ExplorationStructuredOutput(payload.Summary, flagged);
+            return ConvertPayloadToStructuredOutput(payload, rawJson);
         }
 
-        return new ExplorationStructuredOutput(null, Array.Empty<FlaggedResource>());
+        return new ExplorationStructuredOutput(null, Array.Empty<string>(), Array.Empty<FlaggedResource>(), null);
     }
 
-    private bool TryParseExplorationPayload(string entry, out ExplorationPayload payload)
+    private static ExplorationStructuredOutput ConvertPayloadToStructuredOutput(ExplorationPayload payload, string? rawJson)
+    {
+        IReadOnlyList<string> findings = payload.Findings is { Count: > 0 }
+            ? payload.Findings
+                .Select(static item => item?.Trim())
+                .Where(static item => !string.IsNullOrWhiteSpace(item))
+                .Select(static item => item!.Length > 320 ? item[..320] + "…" : item)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray()
+            : Array.Empty<string>();
+
+        List<FlaggedResource> flagged = payload.Flagged is null
+            ? new List<FlaggedResource>()
+            : payload.Flagged
+                .Select(TryConvertResource)
+                .Where(static resource => resource is not null)
+                .Select(static resource => resource!)
+                .DistinctBy(static resource => resource.Url, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+        return new ExplorationStructuredOutput(payload.Summary, findings, flagged, rawJson);
+    }
+
+    private bool TryParseExplorationPayload(string entry, out ExplorationPayload payload, out string? rawJson)
     {
         payload = new ExplorationPayload();
+        rawJson = null;
         if (string.IsNullOrWhiteSpace(entry))
         {
             return false;
@@ -1835,12 +2577,17 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
                 return false;
             }
 
-            if (string.IsNullOrWhiteSpace(parsed.Summary) && (parsed.Flagged is null || parsed.Flagged.Count == 0))
+            bool hasSummary = !string.IsNullOrWhiteSpace(parsed.Summary);
+            bool hasFindings = parsed.Findings is { Count: > 0 };
+            bool hasFlagged = parsed.Flagged is { Count: > 0 };
+
+            if (!hasSummary && !hasFindings && !hasFlagged)
             {
                 return false;
             }
 
             payload = parsed;
+            rawJson = candidate;
             return true;
         }
         catch (JsonException ex)
@@ -1941,11 +2688,176 @@ Flag any resources that should be revisited (interesting subpages, downloadable 
         return fallback;
     }
 
-    private sealed record ExplorationStructuredOutput(string? Summary, IReadOnlyList<FlaggedResource> FlaggedResources);
+    private static IReadOnlyList<string> ExtractExplorationFindings(
+        IReadOnlyList<string> structuredFindings,
+        string? summary,
+        IReadOnlyList<string> transcript)
+    {
+        if (structuredFindings.Count > 0)
+        {
+            return structuredFindings;
+        }
+
+        static IReadOnlyList<string> ParseBulletLines(string? text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return Array.Empty<string>();
+            }
+
+            var items = new List<string>();
+            string[] lines = text.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            foreach (string raw in lines)
+            {
+                string candidate = raw.Trim();
+                if (candidate.StartsWith("- ", StringComparison.Ordinal) || candidate.StartsWith("•", StringComparison.Ordinal) || candidate.StartsWith("* ", StringComparison.Ordinal))
+                {
+                    candidate = candidate.TrimStart('-', '•', '*', ' ').Trim();
+                }
+
+                if (string.IsNullOrWhiteSpace(candidate))
+                {
+                    continue;
+                }
+
+                string normalized = candidate.Length > 320 ? candidate[..320] + "…" : candidate;
+                items.Add(normalized);
+            }
+
+            return items.Count == 0
+                ? Array.Empty<string>()
+                : items.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        }
+
+        IReadOnlyList<string> fromSummary = ParseBulletLines(summary);
+        if (fromSummary.Count > 0)
+        {
+            return fromSummary;
+        }
+
+        foreach (string segment in transcript.Reverse())
+        {
+            IReadOnlyList<string> parsed = ParseBulletLines(segment);
+            if (parsed.Count > 0)
+            {
+                return parsed;
+            }
+        }
+
+        return Array.Empty<string>();
+    }
+
+    private async Task<string?> CapturePageSynopsisAsync(CancellationToken cancellationToken)
+    {
+        if (_page is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            const string script = @"() => {
+                const candidates = [
+                    document.querySelector('article'),
+                    document.querySelector('main'),
+                    document.querySelector('#mw-content-text'),
+                    document.querySelector('.mw-parser-output')
+                ].filter(Boolean);
+
+                const seen = new Set();
+
+                for (const root of candidates) {
+                    if (!root) {
+                        continue;
+                    }
+
+                    const paragraphs = Array.from(root.querySelectorAll('p'))
+                        .map(p => (p.innerText || '').trim())
+                        .filter(text => text.length > 0);
+
+                    if (paragraphs.length === 0) {
+                        continue;
+                    }
+
+                    const unique = [];
+                    for (const paragraph of paragraphs) {
+                        if (seen.has(paragraph)) {
+                            continue;
+                        }
+                        seen.add(paragraph);
+                        unique.push(paragraph);
+                    }
+
+                    if (unique.length > 0) {
+                        return unique.slice(0, 3).join('\n');
+                    }
+                }
+
+                return null;
+            }";
+
+            string? raw = await _page.EvaluateAsync<string?>(script).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                return null;
+            }
+
+            string[] lines = raw
+                .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+            if (lines.Length == 0)
+            {
+                return null;
+            }
+
+            var builder = new StringBuilder();
+            builder.AppendLine("Key observations gathered from page text:");
+
+            int count = 0;
+            foreach (string line in lines)
+            {
+                if (count >= 3)
+                {
+                    break;
+                }
+
+                string cleaned = line.Trim();
+                if (cleaned.Length == 0)
+                {
+                    continue;
+                }
+
+                if (!char.IsUpper(cleaned[0]))
+                {
+                    cleaned = char.ToUpperInvariant(cleaned[0]) + cleaned[1..];
+                }
+
+                if (!cleaned.EndsWith(".", StringComparison.Ordinal))
+                {
+                    cleaned += ".";
+                }
+
+                builder.Append("- ");
+                builder.AppendLine(cleaned);
+                count++;
+            }
+
+            return count == 0 ? null : builder.ToString().TrimEnd();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to capture fallback page summary.");
+            return null;
+        }
+    }
+
+    private sealed record ExplorationStructuredOutput(string? Summary, IReadOnlyList<string> Findings, IReadOnlyList<FlaggedResource> FlaggedResources, string? RawJson);
 
     private sealed class ExplorationPayload
     {
         public string? Summary { get; set; }
+
+        public List<string>? Findings { get; set; }
 
         public List<ExplorationPayloadResource>? Flagged { get; set; }
     }
@@ -1973,6 +2885,17 @@ public sealed class ComputerUseSearchBlockedException : InvalidOperationExceptio
     }
 }
 
+public sealed class ComputerUseSummaryFunctionException : InvalidOperationException
+{
+    public ComputerUseSummaryFunctionException(string responseContent)
+        : base($"Summary function is not supported by the deployment response: {responseContent}")
+    {
+        ResponseContent = responseContent;
+    }
+
+    public string ResponseContent { get; }
+}
+
 public sealed record ComputerUseSearchResult(
     IReadOnlyList<ComputerUseSearchResultItem> Items,
     IReadOnlyList<string> Transcript,
@@ -1985,6 +2908,8 @@ public sealed record ComputerUseExplorationResult(
     string? FinalUrl,
     string? PageTitle,
     string? Summary,
+    string? StructuredSummaryJson,
+    IReadOnlyList<string> Findings,
     IReadOnlyList<string> Transcript,
     IReadOnlyList<FlaggedResource> FlaggedResources);
 

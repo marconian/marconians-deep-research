@@ -767,9 +767,9 @@ internal static class Program
 
     private static string BuildExplorationSummary(ComputerUseExplorationResult exploration)
     {
-        if (!string.IsNullOrWhiteSpace(exploration.Summary))
+        if (!string.IsNullOrWhiteSpace(exploration.StructuredSummaryJson))
         {
-            return exploration.Summary!;
+            return exploration.StructuredSummaryJson!.Trim();
         }
 
         if (exploration.Transcript.Count == 0)

@@ -28,5 +28,6 @@
 - The computer-use service now gates every screenshot behind a visual-stability probe that waits for DOMContentLoaded, polls scroll height and image completion, and blocks until layout settles. This prevents the LLM from acting on half-painted frames and eliminates duplicated, partially rendered captures in diagnostics.
 - Explorations end with a JSON payload capturing a narrative summary plus a `flagged` array of noteworthy pages or downloadable assets. The `ComputerUseNavigatorTool` converts that response into structured `FlaggedResource` records.
 - The `ResearcherAgent` propagates flagged pages into the scraping queue ahead of standard citations and schedules file/download entries for the `FileReaderTool`, ensuring high-value artefacts are harvested even when they were discovered mid-navigation.
+- Summary completions emitted through the `submit_summary` function are now acknowledged automatically via a `function_call_output` payload, unlocking Azure's function-calling responses while adding a `summary_acknowledged` timeline event for postmortem traces.
 
 

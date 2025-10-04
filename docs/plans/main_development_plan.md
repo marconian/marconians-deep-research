@@ -92,6 +92,10 @@
 - [x] Launch computer-use browsing sessions for each selected citation to capture richer context
 - [x] Persist exploration outputs into memory and reference them in reporting pipelines
 - [x] Expand automated tests to cover hybrid exploration workflow
+
+## M14.1 - Structured Exploration Summaries
+- [x] Propagate structured summary findings into CLI exploration summaries (2025-10-02)
+- [x] Surface raw structured JSON output in diagnostics and CLI (2025-10-04)
 ## M15 - Navigator Flagging & Follow-up
 - [x] Add deterministic repaint wait helper to computer-use interactions to stabilize screenshots
 - [x] Capture structured flagged resources during exploration sessions

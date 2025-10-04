@@ -64,7 +64,9 @@ public sealed class ResearcherAgentTests
                 "https://example.com/2",
                 "Result Two",
                 "Key findings from result two",
+                "{\"summary\":\"Key findings from result two\",\"findings\":[\"Scrolled page\",\"Captured section\"],\"flagged\":[]}",
                 new[] { "Scrolled page", "Captured section" },
+                new[] { "Visited https://example.com/2" },
                 Array.Empty<FlaggedResource>())
         };
 
@@ -156,7 +158,9 @@ public sealed class ResearcherAgentTests
                 "https://example.com/1",
                 "Result One",
                 "Key findings",
+                "{\"summary\":\"Key findings\",\"findings\":[\"Scrolled\",\"Captured section\"],\"flagged\":[]}",
                 new[] { "Scrolled", "Captured section" },
+                new[] { "Visited https://example.com/1" },
                 new[]
                 {
                     new FlaggedResource(FlaggedResourceType.Page, "Regulatory report", flaggedPdfUrl, null, "Computer-use suggested download")
@@ -306,7 +310,9 @@ public sealed class ResearcherAgentTests
                 "https://example.com/1",
                 "Result One",
                 "Key findings",
+                "{\"summary\":\"Key findings\",\"findings\":[\"Scrolled\",\"Captured section\"],\"flagged\":[]}",
                 new[] { "Scrolled", "Captured section" },
+                new[] { "Visited https://example.com/1" },
                 new[]
                 {
                     new FlaggedResource(FlaggedResourceType.Page, "Supporting dataset", "https://flagged.example/dataset", null, "Contains statistics table")
@@ -376,6 +382,8 @@ public sealed class ResearcherAgentTests
             "https://example.com",
             "Example",
             "Summary",
+            "{\"summary\":\"Summary\",\"findings\":[],\"flagged\":[]}",
+            Array.Empty<string>(),
             Array.Empty<string>(),
             Array.Empty<FlaggedResource>());
 
