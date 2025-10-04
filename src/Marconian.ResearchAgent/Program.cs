@@ -379,6 +379,12 @@ internal static class Program
                     Console.Error.WriteLine($"Computer-use exploration blocked: {blocked.Message}");
                     return 1;
                 }
+                catch (ComputerUseOperationTimeoutException timeout)
+                {
+                    logger.LogError(timeout, "Computer-use diagnosis timed out for {Url}", url);
+                    Console.Error.WriteLine($"Computer-use exploration timed out: {timeout.Message}");
+                    return 1;
+                }
                 catch (OperationCanceledException)
                 {
                     throw;

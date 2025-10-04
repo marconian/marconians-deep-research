@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -218,6 +219,7 @@ You control a Chromium browser. Investigate the query, open promising results, a
     };
 
     private readonly HttpClient _httpClient;
+    private readonly ComputerUseTimeoutOptions _timeouts;
     private readonly string _endpoint;
     private readonly string _deployment;
     private readonly string _apiKey;
@@ -241,7 +243,8 @@ You control a Chromium browser. Investigate the query, open promising results, a
         string apiKey,
         string deployment,
         HttpClient httpClient,
-        ILogger<ComputerUseSearchService>? logger = null)
+        ILogger<ComputerUseSearchService>? logger = null,
+        ComputerUseTimeoutOptions? timeouts = null)
     {
         if (string.IsNullOrWhiteSpace(endpoint))
         {
@@ -263,6 +266,7 @@ You control a Chromium browser. Investigate the query, open promising results, a
         _deployment = deployment;
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _logger = logger ?? NullLogger<ComputerUseSearchService>.Instance;
+        _timeouts = timeouts ?? ComputerUseTimeoutOptions.Default;
     }
 
     public async Task InitializeAsync(CancellationToken cancellationToken = default)
@@ -294,6 +298,7 @@ You control a Chromium browser. Investigate the query, open promising results, a
             }).ConfigureAwait(false);
 
             _page = await _context.NewPageAsync().ConfigureAwait(false);
+            ApplyDefaultTimeouts();
             // Use Google NCR (no country redirect) to reduce regional consent variance.
             await _page.GotoAsync("https://www.google.com/ncr", new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded }).ConfigureAwait(false);
             _initialized = true;
@@ -304,16 +309,105 @@ You control a Chromium browser. Investigate the query, open promising results, a
         }
     }
 
+    private void ApplyDefaultTimeouts()
+    {
+        if (!ShouldApplyTimeout(_timeouts.DefaultActionTimeout) && !ShouldApplyTimeout(_timeouts.NavigationTimeout))
+        {
+            return;
+        }
+
+        if (ShouldApplyTimeout(_timeouts.DefaultActionTimeout))
+        {
+            float timeout = ClampTimeout(_timeouts.DefaultActionTimeout, 500, 60000);
+            _context?.SetDefaultTimeout(timeout);
+            _page?.SetDefaultTimeout(timeout);
+        }
+
+        if (ShouldApplyTimeout(_timeouts.NavigationTimeout))
+        {
+            float timeout = ClampTimeout(_timeouts.NavigationTimeout, 1000, 180000);
+            _context?.SetDefaultNavigationTimeout(timeout);
+            _page?.SetDefaultNavigationTimeout(timeout);
+        }
+    }
+
     public async Task<ComputerUseSearchResult> SearchAsync(string query, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(query);
 
-        await InitializeAsync(cancellationToken).ConfigureAwait(false);
-        await _operationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        CancellationToken effectiveToken = cancellationToken;
+        CancellationTokenSource? timeoutCts = null;
+        Stopwatch? stopwatch = null;
+        bool lockAcquired = false;
+
+        if (ShouldApplyTimeout(_timeouts.SearchOperationTimeout))
+        {
+            timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(_timeouts.SearchOperationTimeout);
+            effectiveToken = timeoutCts.Token;
+            stopwatch = Stopwatch.StartNew();
+        }
 
         try
         {
-            // Start a new session for this query to correlate artifacts.
+            await InitializeAsync(effectiveToken).ConfigureAwait(false);
+            await _operationLock.WaitAsync(effectiveToken).ConfigureAwait(false);
+            lockAcquired = true;
+
+            return await ExecuteSearchCoreAsync(query, effectiveToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException ex) when (timeoutCts is not null && timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            stopwatch?.Stop();
+            await HandleOperationTimeoutAsync("search", _timeouts.SearchOperationTimeout, ex).ConfigureAwait(false);
+            throw new ComputerUseOperationTimeoutException($"Computer-use search timed out after {_timeouts.SearchOperationTimeout.TotalSeconds:F0} seconds.", ex);
+        }
+        finally
+        {
+            stopwatch?.Stop();
+
+            try
+            {
+                if (lockAcquired)
+                {
+                    try
+                    {
+                        await PersistTimelineAsync(query, cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug(ex, "Failed to persist computer-use timeline for query '{Query}'.", query);
+                    }
+                }
+            }
+            finally
+            {
+                if (lockAcquired)
+                {
+                    _operationLock.Release();
+                }
+
+                timeoutCts?.Dispose();
+            }
+        }
+    }
+
+    private async Task HandleOperationTimeoutAsync(string operation, TimeSpan timeout, Exception cause)
+    {
+        double seconds = Math.Round(timeout.TotalSeconds, 2);
+        _logger.LogWarning(cause, "Computer-use {Operation} timed out after {TimeoutSeconds} seconds. Resetting Playwright session.", operation, seconds);
+        RecordTimelineEvent("operation_timeout", new Dictionary<string, object?>
+        {
+            ["operation"] = operation,
+            ["timeoutSeconds"] = seconds
+        });
+        await ResetBrowserSessionAsync().ConfigureAwait(false);
+    }
+
+    private async Task<ComputerUseSearchResult> ExecuteSearchCoreAsync(string query, CancellationToken cancellationToken)
+    {
+        try
+        {
             _currentSessionId = Guid.NewGuid().ToString("N");
             _screenshotSequence = 0;
             InitializeTimeline(query);
@@ -359,18 +453,76 @@ You control a Chromium browser. Investigate the query, open promising results, a
             _logger.LogWarning(ex, "Computer-use search failed for query '{Query}'.", query);
             throw;
         }
+    }
+
+    public async Task<ComputerUseExplorationResult> ExploreAsync(string url, string? objective = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(url);
+
+        CancellationToken originalToken = cancellationToken;
+        CancellationToken effectiveToken = cancellationToken;
+        CancellationTokenSource? timeoutCts = null;
+        Stopwatch? stopwatch = null;
+        bool lockAcquired = false;
+
+        if (ShouldApplyTimeout(_timeouts.ExplorationOperationTimeout))
+        {
+            timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(_timeouts.ExplorationOperationTimeout);
+            effectiveToken = timeoutCts.Token;
+            stopwatch = Stopwatch.StartNew();
+        }
+
+        try
+        {
+            await InitializeAsync(effectiveToken).ConfigureAwait(false);
+            await _operationLock.WaitAsync(effectiveToken).ConfigureAwait(false);
+            lockAcquired = true;
+
+            return await ExecuteExplorationCoreAsync(url, objective, effectiveToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException ex) when (timeoutCts is not null && timeoutCts.IsCancellationRequested && !originalToken.IsCancellationRequested)
+        {
+            stopwatch?.Stop();
+            await HandleOperationTimeoutAsync("exploration", _timeouts.ExplorationOperationTimeout, ex).ConfigureAwait(false);
+            throw new ComputerUseOperationTimeoutException($"Computer-use exploration timed out after {_timeouts.ExplorationOperationTimeout.TotalSeconds:F0} seconds.", ex);
+        }
         finally
         {
+            stopwatch?.Stop();
+
             try
             {
-                await PersistTimelineAsync(query, cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "Failed to persist computer-use timeline for query '{Query}'.", query);
-            }
+                if (lockAcquired)
+                {
+                    try
+                    {
+                        await PersistTimelineAsync(url, originalToken).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug(ex, "Failed to persist computer-use timeline for exploration '{Url}'.", url);
+                    }
 
-            _operationLock.Release();
+                    try
+                    {
+                        await NavigateToStartAsync(originalToken).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug(ex, "Failed to reset browser after exploration session.");
+                    }
+                }
+            }
+            finally
+            {
+                if (lockAcquired)
+                {
+                    _operationLock.Release();
+                }
+
+                timeoutCts?.Dispose();
+            }
         }
     }
 
@@ -1873,6 +2025,16 @@ You control a Chromium browser. Investigate the query, open promising results, a
         return new string(buffer[..index]);
     }
 
+    private static bool ShouldApplyTimeout(TimeSpan value)
+        => value > TimeSpan.Zero && value != Timeout.InfiniteTimeSpan;
+
+    private static float ClampTimeout(TimeSpan value, double minimum, double maximum)
+    {
+        double milliseconds = value.TotalMilliseconds;
+        double clamped = Math.Clamp(milliseconds, minimum, maximum);
+        return (float)clamped;
+    }
+
     private static (float X, float Y)? ClampCoordinates(double? x, double? y)
     {
         if (x is null || y is null)
@@ -1962,6 +2124,67 @@ You control a Chromium browser. Investigate the query, open promising results, a
 
     private sealed record TimelineEntry(DateTimeOffset TimestampUtc, string Event, Dictionary<string, object?> Data);
 
+    private async Task ResetBrowserSessionAsync()
+    {
+        if (_page is not null)
+        {
+            try
+            {
+                await _page.CloseAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is PlaywrightException or TimeoutException or InvalidOperationException)
+            {
+                _logger.LogDebug(ex, "Failed to close Playwright page during timeout recovery.");
+            }
+        }
+
+        if (_context is not null)
+        {
+            try
+            {
+                await _context.CloseAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is PlaywrightException or TimeoutException or InvalidOperationException)
+            {
+                _logger.LogDebug(ex, "Failed to close Playwright context during timeout recovery.");
+            }
+        }
+
+        if (_browser is not null)
+        {
+            try
+            {
+                await _browser.CloseAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is PlaywrightException or TimeoutException or InvalidOperationException)
+            {
+                _logger.LogDebug(ex, "Failed to close Playwright browser during timeout recovery.");
+            }
+        }
+
+        if (_playwright is not null)
+        {
+            try
+            {
+                _playwright.Dispose();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Failed to dispose Playwright during timeout recovery.");
+            }
+        }
+
+        _page = null;
+        _context = null;
+        _browser = null;
+        _playwright = null;
+        _initialized = false;
+        _lastScreenshot = null;
+        _currentSessionId = null;
+        _timelineEntries = null;
+        _timelinePath = null;
+    }
+
     public async ValueTask DisposeAsync()
     {
         _operationLock.Dispose();
@@ -2038,13 +2261,8 @@ You control a Chromium browser. Investigate the query, open promising results, a
 
     private readonly record struct ViewportSnapshot(double ScrollHeight, int PendingImages);
 
-    public async Task<ComputerUseExplorationResult> ExploreAsync(string url, string? objective = null, CancellationToken cancellationToken = default)
+    private async Task<ComputerUseExplorationResult> ExecuteExplorationCoreAsync(string url, string? objective, CancellationToken cancellationToken)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(url);
-
-        await InitializeAsync(cancellationToken).ConfigureAwait(false);
-        await _operationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-
         try
         {
             _currentSessionId = Guid.NewGuid().ToString("N");
@@ -2414,28 +2632,6 @@ You control a Chromium browser. Investigate the query, open promising results, a
         {
             _logger.LogWarning(ex, "Computer-use exploration failed for url '{Url}'.", url);
             throw;
-        }
-        finally
-        {
-            try
-            {
-                await PersistTimelineAsync(url, cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "Failed to persist computer-use timeline for exploration '{Url}'.", url);
-            }
-
-            try
-            {
-                await NavigateToStartAsync(cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "Failed to reset browser after exploration session.");
-            }
-
-            _operationLock.Release();
         }
     }
 
@@ -2923,6 +3119,14 @@ public sealed class ComputerUseSearchBlockedException : InvalidOperationExceptio
 {
     public ComputerUseSearchBlockedException(string message)
         : base(message)
+    {
+    }
+}
+
+public sealed class ComputerUseOperationTimeoutException : TimeoutException
+{
+    public ComputerUseOperationTimeoutException(string message, Exception innerException)
+        : base(message, innerException)
     {
     }
 }

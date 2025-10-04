@@ -103,17 +103,12 @@ public sealed class ComputerUseNavigatorTool : ITool
         catch (ComputerUseSearchBlockedException blocked)
         {
             _logger.LogWarning(blocked, "Computer-use exploration was blocked for {Url}.", url);
-            return new ToolExecutionResult
-            {
-                ToolName = Name,
-                Success = false,
-                ErrorMessage = $"Computer-use exploration blocked: {blocked.Message}",
-                Metadata = new Dictionary<string, string>
-                {
-                    ["requestedUrl"] = url,
-                    ["blockReason"] = blocked.Message
-                }
-            };
+            return CreateSkippedExplorationResult(url, "Blocked", blocked.Message);
+        }
+        catch (ComputerUseOperationTimeoutException timeout)
+        {
+            _logger.LogWarning(timeout, "Computer-use exploration timed out for {Url}.", url);
+            return CreateSkippedExplorationResult(url, "Timeout", timeout.Message);
         }
         catch (OperationCanceledException)
         {
@@ -122,16 +117,7 @@ public sealed class ComputerUseNavigatorTool : ITool
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Computer-use exploration failed for {Url}.", url);
-            return new ToolExecutionResult
-            {
-                ToolName = Name,
-                Success = false,
-                ErrorMessage = $"Computer-use exploration failed: {ex.Message}",
-                Metadata = new Dictionary<string, string>
-                {
-                    ["requestedUrl"] = url
-                }
-            };
+            return CreateSkippedExplorationResult(url, "Exception", ex.Message);
         }
     }
 
@@ -166,5 +152,40 @@ public sealed class ComputerUseNavigatorTool : ITool
         return builder.Length == 0
             ? "No summary was produced by the exploration session."
             : builder.ToString();
+    }
+
+    private ToolExecutionResult CreateSkippedExplorationResult(string url, string reason, string? detail)
+    {
+        var metadata = new Dictionary<string, string>
+        {
+            ["requestedUrl"] = url,
+            ["computerUseStatus"] = "Skipped",
+            ["skipReason"] = reason
+        };
+
+        if (!string.IsNullOrWhiteSpace(detail))
+        {
+            metadata["detail"] = detail!;
+        }
+
+        string message = reason switch
+        {
+            "Timeout" => "Computer-use exploration skipped after repeated timeouts.",
+            "Blocked" => "Computer-use exploration blocked by site challenge; skipping.",
+            _ => "Computer-use exploration skipped due to automation error."
+        };
+
+        if (!string.IsNullOrWhiteSpace(detail))
+        {
+            message += $" Details: {detail}";
+        }
+
+        return new ToolExecutionResult
+        {
+            ToolName = Name,
+            Success = true,
+            Output = message,
+            Metadata = metadata
+        };
     }
 }

@@ -16,6 +16,8 @@ namespace Marconian.ResearchAgent.Tools;
 
 public sealed class WebSearchTool : ITool, IDisposable
 {
+    private const int MaxComputerUseAttempts = 2;
+
     private readonly HttpClient? _httpClient;
     private readonly bool _ownsHttpClient;
     private readonly ICacheService? _cacheService;
@@ -284,151 +286,121 @@ public sealed class WebSearchTool : ITool, IDisposable
             };
         }
 
-        try
+        ComputerUseSearchResult? searchResult = null;
+        Exception? lastException = null;
+        string? lastFailureReason = null;
+
+        for (int attempt = 1; attempt <= MaxComputerUseAttempts; attempt++)
         {
-            ComputerUseSearchResult searchResult = await _computerUseService.SearchAsync(query, cancellationToken).ConfigureAwait(false);
-            if (searchResult.Items.Count == 0)
+            cancellationToken.ThrowIfCancellationRequested();
+            try
             {
-                string transcriptSummary = searchResult.Transcript.Count == 0 ? "<empty>" : string.Join(" | ", searchResult.Transcript.Take(8));
-                _logger.LogWarning("Computer-use search returned no DOM items for query '{Query}'. Transcript={Transcript}. FinalUrl={Url}", query, transcriptSummary, searchResult.FinalUrl);
-
-                var failureMetadata = new Dictionary<string, string>
-                {
-                    ["query"] = query,
-                    ["provider"] = WebSearchProvider.ComputerUse.ToString()
-                };
-
-                if (!string.IsNullOrWhiteSpace(searchResult.FinalUrl))
-                {
-                    failureMetadata["finalUrl"] = searchResult.FinalUrl;
-                }
-
-                if (searchResult.Transcript.Count > 0)
-                {
-                    failureMetadata["steps"] = transcriptSummary;
-                }
-
+                searchResult = await _computerUseService.SearchAsync(query, cancellationToken).ConfigureAwait(false);
+                lastException = null;
+                break;
+            }
+            catch (ComputerUseSearchBlockedException blockedEx)
+            {
+                _logger.LogWarning(blockedEx, "Computer-use search was blocked by a CAPTCHA challenge for query '{Query}'.", query);
                 if (CanUseHybridFallback())
                 {
-                    _logger.LogInformation("Falling back to {FallbackProvider} search for query '{Query}' after empty computer-use results.", _fallbackProvider, query);
-                    ToolExecutionResult fallback = await ExecuteFallbackAsync(query, "NoResults", cancellationToken).ConfigureAwait(false);
-                    if (fallback.Success)
-                    {
-                        return fallback;
-                    }
-
-                    // merge failure metadata to surface root cause if fallback fails
-                    if (fallback.Metadata is not null)
-                    {
-                        foreach (var kvp in fallback.Metadata)
-                        {
-                            failureMetadata[kvp.Key] = kvp.Value;
-                        }
-                    }
-
-                    return new ToolExecutionResult
-                    {
-                        ToolName = fallback.ToolName,
-                        Success = fallback.Success,
-                        Output = fallback.Output,
-                        Citations = new List<SourceCitation>(fallback.Citations),
-                        Metadata = failureMetadata,
-                        ErrorMessage = fallback.ErrorMessage
-                    };
+                    _logger.LogInformation("Falling back to {FallbackProvider} search for query '{Query}' after CAPTCHA block.", _fallbackProvider, query);
+                    return await ExecuteFallbackAsync(query, "CAPTCHA", cancellationToken, blockedEx.Message).ConfigureAwait(false);
                 }
 
-                return new ToolExecutionResult
-                {
-                    ToolName = Name,
-                    Success = false,
-                    ErrorMessage = "No results found via computer-use search.",
-                    Metadata = failureMetadata
-                };
+                return CreateSkippedResult(query, "Blocked", blockedEx.Message);
+            }
+            catch (ComputerUseOperationTimeoutException timeoutEx)
+            {
+                lastException = timeoutEx;
+                lastFailureReason = "Timeout";
+                _logger.LogWarning(timeoutEx, "Computer-use search attempt {Attempt}/{MaxAttempts} timed out for query '{Query}'.", attempt, MaxComputerUseAttempts, query);
+            }
+            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or PlaywrightException or InvalidOperationException or TimeoutException)
+            {
+                lastException = ex;
+                lastFailureReason = "Exception";
+                _logger.LogWarning(ex, "Computer-use search attempt {Attempt}/{MaxAttempts} failed for query '{Query}'.", attempt, MaxComputerUseAttempts, query);
             }
 
-            var citations = new List<SourceCitation>();
-            var outputBuilder = new StringBuilder();
-            int index = 1;
-            foreach (var item in searchResult.Items.Take(5))
+            if (attempt < MaxComputerUseAttempts)
             {
-                citations.Add(new SourceCitation($"cus:{index}", item.Title, item.Url, item.Snippet));
-                outputBuilder.AppendLine($"{index}. {item.Title}");
-                outputBuilder.AppendLine(item.Url);
-                if (!string.IsNullOrWhiteSpace(item.Snippet))
+                try
                 {
-                    outputBuilder.AppendLine(item.Snippet);
+                    await Task.Delay(TimeSpan.FromMilliseconds(350), cancellationToken).ConfigureAwait(false);
                 }
-                outputBuilder.AppendLine();
-                index++;
+                catch (TaskCanceledException)
+                {
+                    throw;
+                }
             }
-
-            var metadata = new Dictionary<string, string>
-            {
-                ["query"] = query,
-                ["provider"] = WebSearchProvider.ComputerUse.ToString()
-            };
-
-            if (!string.IsNullOrWhiteSpace(searchResult.FinalUrl))
-            {
-                metadata["finalUrl"] = searchResult.FinalUrl;
-            }
-
-            if (searchResult.Transcript.Count > 0)
-            {
-                metadata["steps"] = string.Join(" | ", searchResult.Transcript.Take(8));
-            }
-
-            return new ToolExecutionResult
-            {
-                ToolName = Name,
-                Success = true,
-                Output = outputBuilder.ToString().Trim(),
-                Citations = citations,
-                Metadata = metadata
-            };
         }
-        catch (ComputerUseSearchBlockedException blockedEx)
+
+        if (searchResult is null)
         {
-            _logger.LogWarning(blockedEx, "Computer-use search was blocked by a CAPTCHA challenge for query '{Query}'.", query);
             if (CanUseHybridFallback())
             {
-                _logger.LogInformation("Falling back to {FallbackProvider} search for query '{Query}' after CAPTCHA block.", _fallbackProvider, query);
-                return await ExecuteFallbackAsync(query, "CAPTCHA", cancellationToken, blockedEx.Message).ConfigureAwait(false);
+                _logger.LogInformation("Falling back to {FallbackProvider} search for query '{Query}' after computer-use {Reason}.", _fallbackProvider, query, lastFailureReason ?? "failure");
+                return await ExecuteFallbackAsync(query, lastFailureReason ?? "Exception", cancellationToken, lastException?.Message).ConfigureAwait(false);
             }
 
-            return new ToolExecutionResult
-            {
-                ToolName = Name,
-                Success = false,
-                ErrorMessage = "Computer-use search was blocked by a CAPTCHA challenge from the search engine. No fallback provider was available.",
-                Metadata = new Dictionary<string, string>
-                {
-                    ["query"] = query,
-                    ["provider"] = WebSearchProvider.ComputerUse.ToString(),
-                    ["blockReason"] = blockedEx.Message
-                }
-            };
+            return CreateSkippedResult(query, lastFailureReason ?? "Exception", lastException?.Message);
         }
-        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or PlaywrightException or InvalidOperationException)
+
+        if (searchResult.Items.Count == 0)
         {
-            _logger.LogWarning(ex, "Computer-use search failed for query '{Query}'.", query);
+            string transcriptSummary = searchResult.Transcript.Count == 0 ? "<empty>" : string.Join(" | ", searchResult.Transcript.Take(8));
+            _logger.LogWarning("Computer-use search returned no DOM items for query '{Query}'. Transcript={Transcript}. FinalUrl={Url}", query, transcriptSummary, searchResult.FinalUrl);
+
             if (CanUseHybridFallback())
             {
-                _logger.LogInformation("Falling back to {FallbackProvider} search for query '{Query}' after computer-use failure.", _fallbackProvider, query);
-                return await ExecuteFallbackAsync(query, "Exception", cancellationToken, ex.Message).ConfigureAwait(false);
+                _logger.LogInformation("Falling back to {FallbackProvider} search for query '{Query}' after empty computer-use results.", _fallbackProvider, query);
+                return await ExecuteFallbackAsync(query, "NoResults", cancellationToken, transcriptSummary).ConfigureAwait(false);
             }
-            return new ToolExecutionResult
-            {
-                ToolName = Name,
-                Success = false,
-                ErrorMessage = $"Computer-use search failed: {ex.Message}",
-                Metadata = new Dictionary<string, string>
-                {
-                    ["query"] = query,
-                    ["provider"] = WebSearchProvider.ComputerUse.ToString()
-                }
-            };
+
+            return CreateSkippedResult(query, "NoResults", transcriptSummary);
         }
+
+        var citations = new List<SourceCitation>();
+        var outputBuilder = new StringBuilder();
+        int index = 1;
+        foreach (var item in searchResult.Items.Take(5))
+        {
+            citations.Add(new SourceCitation($"cus:{index}", item.Title, item.Url, item.Snippet));
+            outputBuilder.AppendLine($"{index}. {item.Title}");
+            outputBuilder.AppendLine(item.Url);
+            if (!string.IsNullOrWhiteSpace(item.Snippet))
+            {
+                outputBuilder.AppendLine(item.Snippet);
+            }
+            outputBuilder.AppendLine();
+            index++;
+        }
+
+        var metadata = new Dictionary<string, string>
+        {
+            ["query"] = query,
+            ["provider"] = WebSearchProvider.ComputerUse.ToString()
+        };
+
+        if (!string.IsNullOrWhiteSpace(searchResult.FinalUrl))
+        {
+            metadata["finalUrl"] = searchResult.FinalUrl;
+        }
+
+        if (searchResult.Transcript.Count > 0)
+        {
+            metadata["steps"] = string.Join(" | ", searchResult.Transcript.Take(8));
+        }
+
+        return new ToolExecutionResult
+        {
+            ToolName = Name,
+            Success = true,
+            Output = outputBuilder.ToString().Trim(),
+            Citations = citations,
+            Metadata = metadata
+        };
     }
 
     private async Task<ToolExecutionResult> ExecuteHybridAsync(string query, string normalizedQuery, CancellationToken cancellationToken)
@@ -486,6 +458,45 @@ public sealed class WebSearchTool : ITool, IDisposable
         _computerUseMode == ComputerUseMode.Hybrid &&
         _fallbackProvider == WebSearchProvider.GoogleApi &&
         HasGoogleCredentials();
+
+    private ToolExecutionResult CreateSkippedResult(string query, string reason, string? detail)
+    {
+        var metadata = new Dictionary<string, string>
+        {
+            ["query"] = query,
+            ["provider"] = WebSearchProvider.ComputerUse.ToString(),
+            ["computerUseStatus"] = "Skipped",
+            ["skipReason"] = reason
+        };
+
+        if (!string.IsNullOrWhiteSpace(detail))
+        {
+            metadata["detail"] = detail!;
+        }
+
+        string message = reason switch
+        {
+            "Timeout" => "Computer-use search skipped after repeated timeouts.",
+            "NoResults" => "Computer-use search produced no DOM results; skipping.",
+            "Blocked" => "Computer-use search blocked by challenge; skipping.",
+            _ => "Computer-use search skipped due to automation failure."
+        };
+
+        if (!string.IsNullOrWhiteSpace(detail))
+        {
+            message += $" Details: {detail}";
+        }
+
+        return new ToolExecutionResult
+        {
+            ToolName = Name,
+            Success = true,
+            Output = message,
+            Metadata = metadata,
+            Citations = new List<SourceCitation>(),
+            FlaggedResources = new List<FlaggedResource>()
+        };
+    }
 
     private async Task<ToolExecutionResult> ExecuteFallbackAsync(
         string query,
