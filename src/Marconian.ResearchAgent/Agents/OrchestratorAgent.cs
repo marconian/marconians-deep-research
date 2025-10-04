@@ -42,6 +42,9 @@ public sealed class OrchestratorAgent : IAgent
     {
         PropertyNameCaseInsensitive = true
     };
+    private const int MaxResearchPasses = 3;
+    private const int MaxFollowupQuestions = 3;
+    private const int MaxSectionEvidenceCharacters = 2400;
 
     public OrchestratorState CurrentState { get; private set; } = OrchestratorState.Planning;
 
@@ -82,10 +85,12 @@ public sealed class OrchestratorAgent : IAgent
         string diagramPath = Path.Combine(_reportsDirectory, $"flow_{task.ResearchSessionId}_{DateTimeOffset.UtcNow:yyyyMMdd_HHmmss}.md");
         _flowTracker?.ConfigureSession(task.ResearchSessionId, task.Objective ?? string.Empty, diagramPath);
 
-    ResearchPlan? plan = null;
-        List<ResearchBranchResult> branchResults = new();
+        ResearchPlan? plan = null;
+        var branchResults = new List<ResearchBranchResult>();
         ResearchAggregationResult? aggregationResult = null;
         string? synthesis = null;
+        ReportOutline? outline = null;
+        var sectionDrafts = new List<ReportSectionDraft>();
         string? reportPath = null;
         int revisionsApplied = 0;
 
@@ -110,18 +115,16 @@ public sealed class OrchestratorAgent : IAgent
                 cancellationToken).ConfigureAwait(false);
 
             CurrentState = OrchestratorState.ExecutingResearchBranches;
-            branchResults = await ExecuteBranchesAsync(task, plan, cancellationToken).ConfigureAwait(false);
-            _logger.LogInformation("Completed branch execution with {SuccessCount} successful findings out of {Total} branches.",
-                branchResults.Count(result => result.Finding is not null),
+            aggregationResult = await RunResearchWorkflowAsync(task, plan, branchResults, cancellationToken).ConfigureAwait(false);
+
+            _logger.LogInformation("Completed research workflow with {FindingCount} aggregated findings across {BranchCount} branches.",
+                aggregationResult.Findings.Count,
                 branchResults.Count);
             await _longTermMemoryManager.UpsertSessionStateAsync(
                 task.ResearchSessionId,
                 "branches_completed",
                 $"Branches: {branchResults.Count}",
                 cancellationToken).ConfigureAwait(false);
-
-            aggregationResult = _aggregator.Aggregate(branchResults);
-            _flowTracker?.RecordAggregation(aggregationResult.Findings.Count);
 
             CurrentState = OrchestratorState.SynthesizingResults;
             synthesis = await SynthesizeAsync(task, plan, aggregationResult, cancellationToken).ConfigureAwait(false);
@@ -132,7 +135,16 @@ public sealed class OrchestratorAgent : IAgent
                 cancellationToken).ConfigureAwait(false);
 
             CurrentState = OrchestratorState.GeneratingReport;
-            reportPath = await GenerateReportAsync(task, aggregationResult, synthesis, cancellationToken).ConfigureAwait(false);
+            outline = await GenerateOutlineAsync(task, aggregationResult, synthesis, cancellationToken).ConfigureAwait(false);
+            _flowTracker?.RecordOutline(outline);
+
+            sectionDrafts = await DraftReportSectionsAsync(task, outline, aggregationResult, synthesis, cancellationToken).ConfigureAwait(false);
+            foreach (var draft in sectionDrafts)
+            {
+                _flowTracker?.RecordSectionDraft(draft);
+            }
+
+            reportPath = await GenerateReportAsync(task, aggregationResult, synthesis, outline, sectionDrafts, cancellationToken).ConfigureAwait(false);
             _flowTracker?.RecordReportDraft(reportPath);
             _logger.LogInformation("Initial report generated at {ReportPath}.", reportPath);
 
@@ -151,7 +163,6 @@ public sealed class OrchestratorAgent : IAgent
                     ? Math.Clamp(aggregationResult.Findings.Average(f => f.Confidence), 0d, 1d)
                     : 0.5d
             };
-
             await _longTermMemoryManager.StoreFindingAsync(
                 task.ResearchSessionId,
                 finalFinding,
@@ -173,6 +184,7 @@ public sealed class OrchestratorAgent : IAgent
                 new Dictionary<string, string>
                 {
                     ["reportPath"] = reportPath ?? string.Empty,
+                    ["outlineId"] = outline?.OutlineId ?? string.Empty,
                     ["revisionsApplied"] = revisionsApplied.ToString(CultureInfo.InvariantCulture)
                 },
                 cancellationToken).ConfigureAwait(false);
@@ -189,6 +201,7 @@ public sealed class OrchestratorAgent : IAgent
             {
                 _flowTracker?.RecordArtifacts(reportPath);
             }
+
             return new AgentExecutionResult
             {
                 Success = true,
@@ -240,6 +253,156 @@ public sealed class OrchestratorAgent : IAgent
             }
         }
     }
+
+    private async Task<ResearchAggregationResult> RunResearchWorkflowAsync(
+        AgentTask task,
+        ResearchPlan plan,
+        List<ResearchBranchResult> accumulatedResults,
+        CancellationToken cancellationToken)
+    {
+        ResearchAggregationResult aggregation = _aggregator.Aggregate(accumulatedResults);
+
+        for (int pass = 0; pass < MaxResearchPasses; pass++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var pendingBranches = plan.Branches.Where(static branch => branch.Status == ResearchBranchStatus.Pending).ToList();
+            if (pendingBranches.Count > 0)
+            {
+                IReadOnlyList<ResearchBranchResult> newResults = await ExecuteBranchesAsync(task, plan, cancellationToken).ConfigureAwait(false);
+                if (newResults.Count > 0)
+                {
+                    accumulatedResults.AddRange(newResults);
+                }
+            }
+
+            aggregation = _aggregator.Aggregate(accumulatedResults);
+            _flowTracker?.RecordAggregation(aggregation.Findings.Count);
+
+            ResearchContinuationDecision decision = await EvaluateResearchContinuationAsync(
+                    task,
+                    plan,
+                    aggregation,
+                    pass + 1,
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            if (!decision.ShouldContinue)
+            {
+                break;
+            }
+
+            var newQuestions = decision.NewQuestions
+                .Where(static question => !string.IsNullOrWhiteSpace(question))
+                .Select(static question => question.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Where(question => !plan.Branches.Any(branch => string.Equals(branch.Question, question, StringComparison.OrdinalIgnoreCase)))
+                .Take(MaxFollowupQuestions)
+                .ToList();
+
+            if (newQuestions.Count == 0)
+            {
+                _logger.LogDebug("No additional research questions proposed for session {SessionId} after pass {Pass}.", task.ResearchSessionId, pass + 1);
+                break;
+            }
+
+            foreach (string question in newQuestions)
+            {
+                plan.Branches.Add(new ResearchBranchPlan
+                {
+                    Question = question
+                });
+            }
+
+            _flowTracker?.RecordPlan(plan);
+            await _longTermMemoryManager.UpsertSessionStateAsync(
+                task.ResearchSessionId,
+                "plan_extended",
+                string.Join(" | ", newQuestions),
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        return aggregation;
+    }
+
+    private async Task<ResearchContinuationDecision> EvaluateResearchContinuationAsync(
+        AgentTask task,
+        ResearchPlan plan,
+        ResearchAggregationResult aggregation,
+        int passNumber,
+        CancellationToken cancellationToken)
+    {
+        if (passNumber >= MaxResearchPasses)
+        {
+            return new ResearchContinuationDecision(false, Array.Empty<string>());
+        }
+
+        var planSummaryBuilder = new StringBuilder();
+        foreach (var branch in plan.Branches)
+        {
+            planSummaryBuilder.Append("- ");
+            planSummaryBuilder.Append(branch.Question);
+            planSummaryBuilder.Append(" (status: ");
+            planSummaryBuilder.Append(branch.Status);
+            planSummaryBuilder.AppendLine(")");
+        }
+
+        var findingBuilder = new StringBuilder();
+        foreach (var finding in aggregation.Findings.Take(6))
+        {
+            findingBuilder.AppendLine($"Finding: {finding.Title}");
+            if (!string.IsNullOrWhiteSpace(finding.Content))
+            {
+                string content = finding.Content.Length > MaxSectionEvidenceCharacters
+                    ? finding.Content[..MaxSectionEvidenceCharacters]
+                    : finding.Content;
+                findingBuilder.AppendLine(content);
+            }
+
+            if (finding.Citations.Count > 0)
+            {
+                findingBuilder.AppendLine($"Citations: {string.Join(", ", finding.Citations.Select(c => c.SourceId))}");
+            }
+
+            findingBuilder.AppendLine();
+        }
+
+        if (findingBuilder.Length == 0)
+        {
+            findingBuilder.AppendLine("No consolidated findings yet.");
+        }
+
+        var promptBuilder = new StringBuilder();
+        promptBuilder.AppendLine($"Research objective: {task.Objective}");
+        promptBuilder.AppendLine($"Current pass: {passNumber} of {MaxResearchPasses}.");
+        promptBuilder.AppendLine("Current branch status:");
+        promptBuilder.AppendLine(planSummaryBuilder.ToString());
+        promptBuilder.AppendLine("Consolidated findings so far:");
+        promptBuilder.AppendLine(findingBuilder.ToString());
+        promptBuilder.AppendLine("Should the research continue? If important gaps remain, propose up to three highly specific follow-up questions.");
+        promptBuilder.AppendLine("Respond with JSON: {\"continue\": boolean, \"followUpQuestions\": [string...]}. Explain nothing else.");
+
+        var request = new OpenAiChatRequest(
+            SystemPrompt: "You are a research director who decides when an investigation should continue and proposes precise follow-up questions when needed.",
+            Messages: new[]
+            {
+                new OpenAiChatMessage("user", promptBuilder.ToString())
+            },
+            DeploymentName: _chatDeploymentName,
+            MaxOutputTokens: 350);
+
+        string response = await _openAiService.GenerateTextAsync(request, cancellationToken).ConfigureAwait(false);
+        if (!TryParseContinuationDecision(response, out var decision))
+        {
+            bool defaultContinue = plan.Branches.Any(static branch => branch.Status == ResearchBranchStatus.Pending)
+                && aggregation.Findings.Count < plan.Branches.Count;
+
+            return new ResearchContinuationDecision(defaultContinue, Array.Empty<string>());
+        }
+
+        return decision;
+    }
+
     private async Task<ResearchPlan> GeneratePlanAsync(AgentTask task, CancellationToken cancellationToken)
     {
         var request = new OpenAiChatRequest(
@@ -275,7 +438,7 @@ public sealed class OrchestratorAgent : IAgent
         var results = new ConcurrentBag<ResearchBranchResult>();
         var branchTasks = new List<Task>();
 
-        foreach (var branch in plan.Branches)
+        foreach (var branch in plan.Branches.Where(static b => b.Status == ResearchBranchStatus.Pending).ToList())
         {
             branchTasks.Add(Task.Run(async () =>
             {
@@ -401,13 +564,187 @@ public sealed class OrchestratorAgent : IAgent
         return await _openAiService.GenerateTextAsync(request, cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task<string> GenerateReportAsync(
+    private async Task<ReportOutline> GenerateOutlineAsync(
         AgentTask rootTask,
         ResearchAggregationResult aggregationResult,
         string synthesis,
         CancellationToken cancellationToken)
     {
-        string markdown = _reportBuilder.Build(rootTask.Objective, synthesis, aggregationResult.Findings);
+        var findings = aggregationResult.Findings ?? Array.Empty<ResearchFinding>();
+        var promptBuilder = new StringBuilder();
+        promptBuilder.AppendLine($"Objective: {rootTask.Objective}");
+        promptBuilder.AppendLine("Synthesis overview:");
+        promptBuilder.AppendLine(string.IsNullOrWhiteSpace(synthesis) ? "(No synthesis provided.)" : synthesis.Trim());
+        promptBuilder.AppendLine();
+        promptBuilder.AppendLine("Findings (use IDs when referencing support):");
+
+        foreach (var finding in findings.Take(10))
+        {
+            string content = finding.Content.Length > MaxSectionEvidenceCharacters
+                ? finding.Content[..MaxSectionEvidenceCharacters]
+                : finding.Content;
+            promptBuilder.AppendLine($"- Id: {finding.Id}");
+            promptBuilder.AppendLine($"  Title: {finding.Title}");
+            promptBuilder.AppendLine($"  Confidence: {finding.Confidence:F2}");
+            promptBuilder.AppendLine($"  Summary: {content}");
+            promptBuilder.AppendLine();
+        }
+
+        if (findings.Count == 0)
+        {
+            promptBuilder.AppendLine("(No findings available. Create a generic outline.)");
+        }
+
+        promptBuilder.AppendLine("Design a structured outline for the final report. Identify core sections that directly answer the objective, and optional general sections for context (introduction, methodology, risks, open questions). Return JSON with fields: 'notes' (string), 'coreSections' (array), 'generalSections' (array). Each section must include 'title', 'summary', and 'supportingFindingIds' referencing the provided IDs. Use empty arrays when not needed. No extra commentary.");
+
+        var request = new OpenAiChatRequest(
+            SystemPrompt: "You are a veteran research editor who designs structured report outlines grounded in provided evidence.",
+            Messages: new[]
+            {
+                new OpenAiChatMessage("user", promptBuilder.ToString())
+            },
+            DeploymentName: _chatDeploymentName,
+            MaxOutputTokens: 500);
+
+        string response = await _openAiService.GenerateTextAsync(request, cancellationToken).ConfigureAwait(false);
+        if (!TryParseOutline(response, rootTask.Objective ?? string.Empty, findings, out var outline))
+        {
+            outline = BuildFallbackOutline(rootTask.Objective ?? string.Empty, findings);
+        }
+
+        return outline;
+    }
+
+    private async Task<List<ReportSectionDraft>> DraftReportSectionsAsync(
+        AgentTask rootTask,
+        ReportOutline outline,
+        ResearchAggregationResult aggregationResult,
+        string synthesis,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(outline);
+        var drafts = new List<ReportSectionDraft>();
+        var findingMap = aggregationResult.Findings.ToDictionary(f => f.Id, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var section in outline.CoreSections)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var draft = await DraftSectionAsync(rootTask, section, findingMap, aggregationResult, synthesis, isGeneral: false, cancellationToken).ConfigureAwait(false);
+            drafts.Add(draft);
+        }
+
+        foreach (var section in outline.GeneralSections)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var draft = await DraftSectionAsync(rootTask, section, findingMap, aggregationResult, synthesis, isGeneral: true, cancellationToken).ConfigureAwait(false);
+            drafts.Add(draft);
+        }
+
+        return drafts;
+    }
+
+    private async Task<ReportSectionDraft> DraftSectionAsync(
+        AgentTask rootTask,
+        ReportSectionPlan sectionPlan,
+        IReadOnlyDictionary<string, ResearchFinding> findingMap,
+        ResearchAggregationResult aggregationResult,
+        string synthesis,
+        bool isGeneral,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(sectionPlan);
+
+        var relevantFindings = new List<ResearchFinding>();
+        foreach (string findingId in sectionPlan.SupportingFindingIds)
+        {
+            if (findingMap.TryGetValue(findingId, out var finding))
+            {
+                relevantFindings.Add(finding);
+            }
+        }
+
+        if (relevantFindings.Count == 0)
+        {
+            relevantFindings = aggregationResult.Findings.Take(3).ToList();
+        }
+
+        var promptBuilder = new StringBuilder();
+        promptBuilder.AppendLine($"Objective: {rootTask.Objective}");
+        promptBuilder.AppendLine($"Section: {sectionPlan.Title}");
+        if (!string.IsNullOrWhiteSpace(sectionPlan.Summary))
+        {
+            promptBuilder.AppendLine($"Section goals: {sectionPlan.Summary}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(synthesis))
+        {
+            promptBuilder.AppendLine("Overall synthesis context:");
+            promptBuilder.AppendLine(synthesis.Trim());
+        }
+
+        promptBuilder.AppendLine("Evidence:");
+        foreach (var finding in relevantFindings)
+        {
+            string evidence = finding.Content.Length > MaxSectionEvidenceCharacters
+                ? finding.Content[..MaxSectionEvidenceCharacters]
+                : finding.Content;
+            promptBuilder.AppendLine($"- {finding.Title} (confidence {finding.Confidence:F2}): {evidence}");
+        }
+
+        if (relevantFindings.Count == 0)
+        {
+            promptBuilder.AppendLine("(No direct evidence; provide contextual overview.)");
+        }
+
+        promptBuilder.AppendLine();
+        promptBuilder.AppendLine("Write a polished Markdown narrative (2-4 paragraphs) that explains this section. Stay factual and only use the supplied evidence. Do not include headings or citation brackets. Return only the body text.");
+
+        var request = new OpenAiChatRequest(
+            SystemPrompt: "You craft concise, evidence-grounded research report sections.",
+            Messages: new[]
+            {
+                new OpenAiChatMessage("user", promptBuilder.ToString())
+            },
+            DeploymentName: _chatDeploymentName,
+            MaxOutputTokens: 600);
+
+        string content = await _openAiService.GenerateTextAsync(request, cancellationToken).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(content))
+        {
+            content = string.Join(
+                Environment.NewLine + Environment.NewLine,
+                relevantFindings.Select(f => f.Content));
+        }
+
+        var citations = relevantFindings
+            .SelectMany(f => f.Citations)
+            .GroupBy(c => c.SourceId, StringComparer.Ordinal)
+            .Select(group => group.First())
+            .Take(12)
+            .ToList();
+
+        return new ReportSectionDraft
+        {
+            SectionId = sectionPlan.SectionId,
+            Title = sectionPlan.Title,
+            Content = content.Trim(),
+            IsGeneral = isGeneral,
+            Citations = citations
+        };
+    }
+
+    private async Task<string> GenerateReportAsync(
+        AgentTask rootTask,
+        ResearchAggregationResult aggregationResult,
+        string synthesis,
+        ReportOutline outline,
+        IReadOnlyList<ReportSectionDraft> sectionDrafts,
+        CancellationToken cancellationToken)
+    {
+        string rootQuestion = string.IsNullOrWhiteSpace(rootTask.Objective)
+            ? "Autonomous Research Report"
+            : rootTask.Objective!;
+        string markdown = _reportBuilder.Build(rootQuestion, synthesis, outline, sectionDrafts, aggregationResult.Findings);
         string fileName = $"report_{DateTimeOffset.UtcNow:yyyyMMdd_HHmmss}_{Guid.NewGuid():N}.md";
         string reportPath = Path.Combine(_reportsDirectory, fileName);
         await File.WriteAllTextAsync(reportPath, markdown, cancellationToken).ConfigureAwait(false);
@@ -538,6 +875,194 @@ public sealed class OrchestratorAgent : IAgent
         return modified;
     }
 
+    private bool TryParseOutline(
+        string response,
+        string objective,
+        IReadOnlyList<ResearchFinding> findings,
+        out ReportOutline outline)
+    {
+        outline = new ReportOutline
+        {
+            Objective = objective
+        };
+        var result = outline;
+
+        if (string.IsNullOrWhiteSpace(response))
+        {
+            return false;
+        }
+
+        int start = response.IndexOf('{');
+        int end = response.LastIndexOf('}');
+        if (start < 0 || end < start)
+        {
+            return false;
+        }
+
+        string json = response[start..(end + 1)];
+        try
+        {
+            var payload = JsonSerializer.Deserialize<OutlinePayload>(json, _revisionOptions);
+            if (payload is null)
+            {
+                return false;
+            }
+
+            if (!string.IsNullOrWhiteSpace(payload.Notes))
+            {
+                result.Notes = payload.Notes!.Trim();
+            }
+
+            var validIds = new HashSet<string>(findings.Select(f => f.Id), StringComparer.OrdinalIgnoreCase);
+
+            void AddSections(IEnumerable<OutlineSectionPayload>? sections, bool isGeneral)
+            {
+                if (sections is null)
+                {
+                    return;
+                }
+
+                foreach (var section in sections)
+                {
+                    if (section is null || string.IsNullOrWhiteSpace(section.Title))
+                    {
+                        continue;
+                    }
+
+                    var plan = new ReportSectionPlan
+                    {
+                        Title = section.Title.Trim(),
+                        Summary = string.IsNullOrWhiteSpace(section.Summary) ? null : section.Summary!.Trim()
+                    };
+
+                    if (section.SupportingFindingIds is not null)
+                    {
+                        foreach (string id in section.SupportingFindingIds)
+                        {
+                            if (!string.IsNullOrWhiteSpace(id) && validIds.Contains(id))
+                            {
+                                plan.SupportingFindingIds.Add(id);
+                            }
+                        }
+                    }
+
+                    if (isGeneral)
+                    {
+                        result.GeneralSections.Add(plan);
+                    }
+                    else
+                    {
+                        result.CoreSections.Add(plan);
+                    }
+                }
+            }
+
+            AddSections(payload.CoreSections, isGeneral: false);
+            AddSections(payload.GeneralSections, isGeneral: true);
+
+            return result.CoreSections.Count > 0 || result.GeneralSections.Count > 0 || !string.IsNullOrWhiteSpace(result.Notes);
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogDebug(ex, "Failed to parse outline response. Raw response: {Response}", response);
+            return false;
+        }
+    }
+
+    private static ReportOutline BuildFallbackOutline(string objective, IReadOnlyList<ResearchFinding> findings)
+    {
+        var outline = new ReportOutline
+        {
+            Objective = objective,
+            Notes = "Fallback outline generated due to parsing issues."
+        };
+
+        if (findings.Count == 0)
+        {
+            outline.CoreSections.Add(new ReportSectionPlan
+            {
+                Title = "Key Insights",
+                Summary = "Summarize the research objective, key hypotheses, and next steps."
+            });
+            outline.GeneralSections.Add(new ReportSectionPlan
+            {
+                Title = "Recommended Next Actions",
+                Summary = "Outline pragmatic follow-up research tasks to fill evidence gaps."
+            });
+
+            return outline;
+        }
+
+        foreach (var finding in findings.Take(4))
+        {
+            var plan = new ReportSectionPlan
+            {
+                Title = finding.Title,
+                Summary = finding.Content.Length > 200 ? finding.Content[..200] + "…" : finding.Content
+            };
+            plan.SupportingFindingIds.Add(finding.Id);
+            outline.CoreSections.Add(plan);
+        }
+
+        if (findings.Count > 4)
+        {
+            var plan = new ReportSectionPlan
+            {
+                Title = "Broader Context",
+                Summary = "Highlight secondary findings, risks, or adjacent themes uncovered during research."
+            };
+            foreach (var id in findings.Skip(4).Select(f => f.Id).Take(5))
+            {
+                plan.SupportingFindingIds.Add(id);
+            }
+
+            outline.GeneralSections.Add(plan);
+        }
+
+        return outline;
+    }
+
+    private bool TryParseContinuationDecision(string response, out ResearchContinuationDecision decision)
+    {
+        decision = new ResearchContinuationDecision(false, Array.Empty<string>());
+        if (string.IsNullOrWhiteSpace(response))
+        {
+            return false;
+        }
+
+        int start = response.IndexOf('{');
+        int end = response.LastIndexOf('}');
+        if (start < 0 || end < start)
+        {
+            return false;
+        }
+
+        string json = response[start..(end + 1)];
+        try
+        {
+            var parsed = JsonSerializer.Deserialize<ContinuationDecisionPayload>(json, _revisionOptions);
+            if (parsed is null)
+            {
+                return false;
+            }
+
+            var questions = parsed.FollowUpQuestions?
+                .Where(static question => !string.IsNullOrWhiteSpace(question))
+                .Select(static question => question.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Take(MaxFollowupQuestions)
+                .ToList() ?? new List<string>();
+
+            decision = new ResearchContinuationDecision(parsed.Continue, questions);
+            return true;
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogDebug(ex, "Failed to parse continuation decision. Raw response: {Response}", response);
+            return false;
+        }
+    }
+
     private static List<string> ParseQuestions(string response)
     {
         var questions = new List<string>();
@@ -564,6 +1089,41 @@ public sealed class OrchestratorAgent : IAgent
 
         return questions;
     }
+
+    private sealed class OutlinePayload
+    {
+        [JsonPropertyName("notes")]
+        public string? Notes { get; set; }
+
+        [JsonPropertyName("coreSections")]
+        public List<OutlineSectionPayload>? CoreSections { get; set; }
+
+        [JsonPropertyName("generalSections")]
+        public List<OutlineSectionPayload>? GeneralSections { get; set; }
+    }
+
+    private sealed class OutlineSectionPayload
+    {
+        [JsonPropertyName("title")]
+        public string? Title { get; set; }
+
+        [JsonPropertyName("summary")]
+        public string? Summary { get; set; }
+
+        [JsonPropertyName("supportingFindingIds")]
+        public List<string>? SupportingFindingIds { get; set; }
+    }
+
+    private sealed class ContinuationDecisionPayload
+    {
+        [JsonPropertyName("continue")]
+        public bool Continue { get; set; }
+
+        [JsonPropertyName("followUpQuestions")]
+        public List<string>? FollowUpQuestions { get; set; }
+    }
+
+    private sealed record ResearchContinuationDecision(bool ShouldContinue, IReadOnlyList<string> NewQuestions);
 
     private sealed class ReportEditInstruction
     {

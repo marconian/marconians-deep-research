@@ -70,7 +70,10 @@ public sealed class OrchestratorAgentTests
         {
             "1. Investigate topic",
             "Answer summary with high confidence",
-            "Synthesis summary"
+            "{\"continue\": false, \"followUpQuestions\": []}",
+            "Synthesis summary",
+            "{\"notes\": \"\", \"coreSections\": [{\"title\": \"Key Findings\", \"summary\": \"Summarize the key insight\", \"supportingFindingIds\": []}], \"generalSections\": []}",
+            "Detailed section content grounded in evidence."
         });
 
         var openAiMock = new Mock<IAzureOpenAiService>();

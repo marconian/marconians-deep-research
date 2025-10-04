@@ -99,10 +99,23 @@
 - [x] Document flagged resource workflow and update best-practices summary
 
 ## M16 - Computer-use Flagged Resource Processing Refinement
-- [ ] Audit flagged resource classification gaps for PDFs and other binaries surfaced by computer-use.
-- [ ] Update follow-up orchestration to funnel flagged web pages into the scraper and flagged PDFs into the Document Intelligence pipeline automatically.
+## M16 - Computer-use Flagged Resource Processing Refinement
+- [x] Audit flagged resource classification gaps for PDFs and other binaries surfaced by computer-use.
+- [x] Update follow-up orchestration to funnel flagged web pages into the scraper and flagged PDFs into the Document Intelligence pipeline automatically.
 - [ ] Guard the scraper against binary responses and ensure file registry entries trigger downstream file reading.
 - [ ] Extend automated coverage to validate the new branching logic for pages versus PDFs.
+
+## M17 - Report Generation Flow Compliance
+- [x] Enforce hybrid search/exploration flow loops in `ResearcherAgent` across all providers.
+- [x] Restructure `OrchestratorAgent` stages to follow analysis -> outline -> section writing -> general sections.
+- [x] Capture iterative outline artifacts in memory and flow tracker for auditability.
+- [x] Update synthesis/report builder logic to honour section ordering and outline decisions.
+
+## M18 - CAPTCHA Mitigation & Stealth Browser Posture
+- [ ] Integrate Playwright stealth configuration (navigator.webdriver patches, realistic UA/timezone/viewport) in computer-use services.
+- [ ] Introduce human-like cursor/typing behavior simulation for CUA-issued actions with configurable parameters.
+- [ ] Detect CAPTCHA interruptions and surface dedicated recovery events with retry guidance.
+- [ ] Document mitigation strategy and add tests validating fallback behavior when CAPTCHA is encountered.
 ## Documentation & Patterns
 - [x] Update `docs/specs.md` if architecture adjustments arise (with justification)
 - [x] Capture architectural patterns in `docs/architectural_patterns.md` when stabilized

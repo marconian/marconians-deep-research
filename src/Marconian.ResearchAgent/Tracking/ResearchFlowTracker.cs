@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
+using Marconian.ResearchAgent.Models.Reporting;
 using Marconian.ResearchAgent.Models.Research;
 using Marconian.ResearchAgent.Models.Tools;
 using Microsoft.Extensions.Logging;
@@ -22,9 +23,11 @@ public sealed class ResearchFlowTracker
     private FlowNode? _planNode;
     private FlowNode? _synthesisNode;
     private FlowNode? _reportNode;
+    private FlowNode? _outlineNode;
     private string? _diagramPath;
     private string? _sessionId;
     private int _nodeSequence;
+    private readonly Dictionary<string, FlowNode> _outlineSections = new(StringComparer.OrdinalIgnoreCase);
 
     public ResearchFlowTracker(ILogger<ResearchFlowTracker>? logger = null)
     {
@@ -207,6 +210,81 @@ public sealed class ResearchFlowTracker
         }
     }
 
+    public void RecordOutline(ReportOutline outline)
+    {
+        ArgumentNullException.ThrowIfNull(outline);
+
+        lock (_sync)
+        {
+            if (_synthesisNode is null && _planNode is null)
+            {
+                return;
+            }
+
+            _outlineSections.Clear();
+            string label = $"Outline ready\nCore: {outline.CoreSections.Count}\nGeneral: {outline.GeneralSections.Count}";
+            if (!string.IsNullOrWhiteSpace(outline.Notes))
+            {
+                label += $"\n{outline.Notes!.Trim().Truncate(80)}";
+            }
+
+            _outlineNode = CreateNodeUnsafe(label, NodeShape.Diamond);
+            string? sourceId = _synthesisNode?.Id ?? _planNode?.Id ?? _sessionNode?.Id;
+            AddEdgeUnsafe(sourceId, _outlineNode.Id, "outline");
+
+            foreach (var section in outline.CoreSections)
+            {
+                AddOutlineSectionUnsafe(section, isGeneral: false);
+            }
+
+            foreach (var section in outline.GeneralSections)
+            {
+                AddOutlineSectionUnsafe(section, isGeneral: true);
+            }
+
+            FlushUnsafe();
+        }
+    }
+
+    public void RecordSectionDraft(ReportSectionDraft draft)
+    {
+        ArgumentNullException.ThrowIfNull(draft);
+
+        lock (_sync)
+        {
+            if (_outlineNode is null && _reportNode is null)
+            {
+                return;
+            }
+
+            string label = (draft.IsGeneral ? "General draft" : "Core draft") + $"\n{draft.Title}";
+            string? trimmed = draft.Content?.Trim();
+            if (!string.IsNullOrWhiteSpace(trimmed))
+            {
+                label += $"\n{trimmed!.Truncate(160)}";
+            }
+
+            var node = CreateNodeUnsafe(label, NodeShape.Parallelogram);
+            string? parentId = null;
+            if (_outlineSections.TryGetValue(draft.SectionId, out var parentNode))
+            {
+                parentId = parentNode.Id;
+            }
+            else if (_outlineNode is not null)
+            {
+                parentId = _outlineNode.Id;
+            }
+            else if (_synthesisNode is not null)
+            {
+                parentId = _synthesisNode.Id;
+            }
+
+            AddEdgeUnsafe(parentId, node.Id, "draft");
+            _outlineSections[draft.SectionId] = node;
+            FlushUnsafe();
+        }
+    }
+
     public void RecordReportDraft(string reportPath)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(reportPath);
@@ -214,7 +292,11 @@ public sealed class ResearchFlowTracker
         lock (_sync)
         {
             _reportNode ??= CreateNodeUnsafe("Report draft", NodeShape.Rectangle);
-            if (_synthesisNode is not null)
+            if (_outlineNode is not null)
+            {
+                AddEdgeUnsafe(_outlineNode.Id, _reportNode.Id, "compile");
+            }
+            else if (_synthesisNode is not null)
             {
                 AddEdgeUnsafe(_synthesisNode.Id, _reportNode.Id, "draft");
             }
@@ -360,9 +442,25 @@ public sealed class ResearchFlowTracker
         _planNode = null;
         _synthesisNode = null;
         _reportNode = null;
+        _outlineNode = null;
         _diagramPath = null;
         _sessionId = null;
         _nodeSequence = 0;
+        _outlineSections.Clear();
+    }
+
+    private void AddOutlineSectionUnsafe(ReportSectionPlan section, bool isGeneral)
+    {
+        string label = (isGeneral ? "General section" : "Core section") + $"\n{section.Title}";
+        if (!string.IsNullOrWhiteSpace(section.Summary))
+        {
+            label += $"\n{section.Summary!.Trim().Truncate(120)}";
+        }
+
+        var node = CreateNodeUnsafe(label, NodeShape.Rectangle);
+        string? sourceId = _outlineNode?.Id ?? _planNode?.Id ?? _sessionNode?.Id;
+        AddEdgeUnsafe(sourceId, node.Id, isGeneral ? "general" : "core");
+        _outlineSections[section.SectionId] = node;
     }
 
     private static string Sanitize(string value)
