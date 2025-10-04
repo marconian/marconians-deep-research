@@ -454,6 +454,11 @@ public sealed class ResearchFlowTracker
             label += $"\n{section.Summary!.Trim().Truncate(120)}";
         }
 
+        if (section.StructuralOnly)
+        {
+            label += "\n(structural)";
+        }
+
         var node = CreateNodeUnsafe(label, NodeShape.Rectangle);
         string? sourceId = _outlineNode?.Id ?? _planNode?.Id ?? _sessionNode?.Id;
         AddEdgeUnsafe(sourceId, node.Id, isGeneral ? "general" : "core");

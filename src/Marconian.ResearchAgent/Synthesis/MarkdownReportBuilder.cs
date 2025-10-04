@@ -2,12 +2,15 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 using Marconian.ResearchAgent.Models.Reporting;
 
 namespace Marconian.ResearchAgent.Synthesis;
 
 public sealed class MarkdownReportBuilder
 {
+    private static readonly Regex CitationTagRegex = new("<<ref:(?<tag>[A-Za-z0-9_-]+)>>", RegexOptions.Compiled);
+
     public string Build(
         string rootQuestion,
         string executiveSummary,
@@ -69,7 +72,6 @@ public sealed class MarkdownReportBuilder
         {
             builder.AppendLine("## Sources");
             builder.AppendLine();
-            RegisterCitations(findings.SelectMany(f => f.Citations), citationOrder, citationIndexMap);
             AppendCitations(builder, citationOrder, citationIndexMap);
         }
 
@@ -102,14 +104,17 @@ public sealed class MarkdownReportBuilder
         if (!string.IsNullOrWhiteSpace(node.SectionId) &&
             draftMap.TryGetValue(node.SectionId, out var draft))
         {
-            string trimmed = draft.Content.Trim();
-            if (trimmed.Length > 0)
+            string processed = ReplaceCitationTags(draft.Content, draft, citationOrder, citationIndexMap, out bool tagsApplied);
+            if (processed.Length > 0)
             {
-                builder.AppendLine(trimmed);
+                builder.AppendLine(processed);
                 builder.AppendLine();
             }
 
-            RegisterCitations(draft.Citations, citationOrder, citationIndexMap);
+            if (!tagsApplied)
+            {
+                RegisterCitations(draft.Citations, citationOrder, citationIndexMap);
+            }
         }
         else if (!string.IsNullOrWhiteSpace(node.SectionId) &&
                  planMap.TryGetValue(node.SectionId, out var plan) &&
@@ -128,9 +133,11 @@ public sealed class MarkdownReportBuilder
         else if (string.IsNullOrWhiteSpace(node.SectionId) &&
                  string.Equals(node.Title, "Sources", StringComparison.OrdinalIgnoreCase))
         {
-            RegisterCitations(findings.SelectMany(f => f.Citations), citationOrder, citationIndexMap);
-            AppendCitations(builder, citationOrder, citationIndexMap);
-            builder.AppendLine();
+            if (citationOrder.Count > 0)
+            {
+                AppendCitations(builder, citationOrder, citationIndexMap);
+                builder.AppendLine();
+            }
             sourcesRendered = true;
         }
 
@@ -175,13 +182,7 @@ public sealed class MarkdownReportBuilder
                 continue;
             }
 
-            if (citationIndexMap.ContainsKey(citation.SourceId))
-            {
-                continue;
-            }
-
-            citationOrder.Add(citation);
-            citationIndexMap[citation.SourceId] = citationOrder.Count;
+            EnsureCitationRegistered(citation, citationOrder, citationIndexMap);
         }
     }
 
@@ -212,8 +213,61 @@ public sealed class MarkdownReportBuilder
                 parts.Add(snippet);
             }
 
-            builder.AppendLine($"[{index}] {string.Join(" – ", parts)}");
+            builder.AppendLine($"[^{index}]: {string.Join(" – ", parts)}");
         }
+    }
+
+    private static string ReplaceCitationTags(
+        string content,
+        ReportSectionDraft draft,
+        List<SourceCitation> citationOrder,
+        Dictionary<string, int> citationIndexMap,
+        out bool replacementsMade)
+    {
+        if (string.IsNullOrWhiteSpace(content))
+        {
+            replacementsMade = false;
+            return string.Empty;
+        }
+
+        if (draft.CitationTags.Count == 0)
+        {
+            replacementsMade = false;
+            return content.Trim();
+        }
+
+        bool anyReplacement = false;
+        string replaced = CitationTagRegex.Replace(content, match =>
+        {
+            string tag = match.Groups["tag"].Value;
+            if (!draft.CitationTags.TryGetValue(tag, out var citation))
+            {
+                return string.Empty;
+            }
+
+            int index = EnsureCitationRegistered(citation, citationOrder, citationIndexMap);
+            anyReplacement = true;
+            return $"[^{index}]";
+        });
+
+        replacementsMade = anyReplacement;
+        return replaced.Trim();
+    }
+
+    private static int EnsureCitationRegistered(
+        SourceCitation citation,
+        List<SourceCitation> citationOrder,
+        Dictionary<string, int> citationIndexMap)
+    {
+        if (citationIndexMap.TryGetValue(citation.SourceId, out int existing))
+        {
+            return existing;
+        }
+
+        citationOrder.Add(citation);
+        int index = citationOrder.Count;
+        citationIndexMap[citation.SourceId] = index;
+        return index;
     }
 
     private static void RenderFallbackReport(
@@ -242,13 +296,16 @@ public sealed class MarkdownReportBuilder
         foreach (var draft in drafts)
         {
             builder.AppendLine($"## {draft.Title}");
-            builder.AppendLine(draft.Content.Trim());
+            string processed = ReplaceCitationTags(draft.Content, draft, citationOrder, citationIndexMap, out bool tagsApplied);
+            builder.AppendLine(processed);
             builder.AppendLine();
 
-            RegisterCitations(draft.Citations, citationOrder, citationIndexMap);
+            if (!tagsApplied)
+            {
+                RegisterCitations(draft.Citations, citationOrder, citationIndexMap);
+            }
         }
 
-        RegisterCitations(findings.SelectMany(f => f.Citations), citationOrder, citationIndexMap);
         builder.AppendLine("## Sources");
         builder.AppendLine();
         AppendCitations(builder, citationOrder, citationIndexMap);

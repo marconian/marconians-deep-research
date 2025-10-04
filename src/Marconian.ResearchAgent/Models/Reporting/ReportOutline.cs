@@ -24,6 +24,8 @@ public sealed class ReportSectionPlan
 
     public string? Summary { get; set; }
 
+    public bool StructuralOnly { get; set; }
+
     public List<string> SupportingFindingIds { get; init; } = new();
 }
 

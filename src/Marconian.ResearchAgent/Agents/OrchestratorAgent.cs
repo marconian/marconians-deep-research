@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using Marconian.ResearchAgent.Configuration;
 using Marconian.ResearchAgent.Memory;
@@ -46,6 +47,7 @@ public sealed class OrchestratorAgent : IAgent
     {
         PropertyNameCaseInsensitive = true
     };
+    private static readonly OpenAiChatJsonSchemaFormat OutlineSchemaFormat = BuildOutlineSchemaFormat();
     public OrchestratorState CurrentState { get; private set; } = OrchestratorState.Planning;
 
     public OrchestratorAgent(
@@ -762,7 +764,8 @@ public sealed class OrchestratorAgent : IAgent
                 new OpenAiChatMessage("user", promptBuilder.ToString())
             },
             DeploymentName: _chatDeploymentName,
-            MaxOutputTokens: 500);
+            MaxOutputTokens: 500,
+            JsonSchemaFormat: OutlineSchemaFormat);
 
         string response = await _openAiService.GenerateTextAsync(request, cancellationToken).ConfigureAwait(false);
         if (!TryParseOutline(response, rootTask.Objective ?? string.Empty, findings, out var outline))
@@ -812,6 +815,12 @@ public sealed class OrchestratorAgent : IAgent
                 continue;
             }
 
+            if (sectionPlan.StructuralOnly)
+            {
+                draftedSectionIds.Add(sectionPlan.SectionId);
+                continue;
+            }
+
             sectionContexts.TryGetValue(sectionPlan.SectionId, out var context);
             var draft = await DraftSectionAsync(
                     rootTask,
@@ -833,6 +842,11 @@ public sealed class OrchestratorAgent : IAgent
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (!draftedSectionIds.Add(section.SectionId))
+            {
+                continue;
+            }
+
+            if (section.StructuralOnly)
             {
                 continue;
             }
@@ -947,6 +961,19 @@ public sealed class OrchestratorAgent : IAgent
             relevantFindings = aggregationResult.Findings.Take(3).ToList();
         }
 
+        var citations = relevantFindings
+            .SelectMany(f => f.Citations)
+            .GroupBy(c => c.SourceId, StringComparer.Ordinal)
+            .Select(group => group.First())
+            .Take(12)
+            .ToList();
+
+        var citationTagPairs = new List<(string Tag, SourceCitation Citation)>(citations.Count);
+        for (int index = 0; index < citations.Count; index++)
+        {
+            citationTagPairs.Add(($"S{index + 1}", citations[index]));
+        }
+
         var promptBuilder = new StringBuilder();
         promptBuilder.AppendLine(string.Format(
             CultureInfo.InvariantCulture,
@@ -1050,6 +1077,41 @@ public sealed class OrchestratorAgent : IAgent
             promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.OutlineNoEvidence);
         }
 
+        if (citationTagPairs.Count > 0)
+        {
+            promptBuilder.AppendLine();
+            promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.SectionSourcesHeader);
+            foreach (var pair in citationTagPairs)
+            {
+                string displayTitle = !string.IsNullOrWhiteSpace(pair.Citation.Title)
+                    ? pair.Citation.Title!.Trim()
+                    : pair.Citation.SourceId;
+                promptBuilder.AppendLine(string.Format(
+                    CultureInfo.InvariantCulture,
+                    SystemPrompts.Templates.Orchestrator.SectionSourceLine,
+                    pair.Tag,
+                    displayTitle));
+
+                if (!string.IsNullOrWhiteSpace(pair.Citation.Url))
+                {
+                    promptBuilder.AppendLine(string.Format(
+                        CultureInfo.InvariantCulture,
+                        SystemPrompts.Templates.Orchestrator.SectionSourceDetails,
+                        pair.Citation.Url!.Trim()));
+                }
+
+                if (!string.IsNullOrWhiteSpace(pair.Citation.Snippet))
+                {
+                    promptBuilder.AppendLine(string.Format(
+                        CultureInfo.InvariantCulture,
+                        SystemPrompts.Templates.Orchestrator.SectionSourceSnippet,
+                        pair.Citation.Snippet!.Trim()));
+                }
+            }
+
+            promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.SectionSourcesInstruction);
+        }
+
         promptBuilder.AppendLine();
         promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.SectionWritingInstruction);
 
@@ -1087,19 +1149,17 @@ public sealed class OrchestratorAgent : IAgent
             content = string.Join(Environment.NewLine + Environment.NewLine, fallbackSegments);
         }
 
-        var citations = relevantFindings
-            .SelectMany(f => f.Citations)
-            .GroupBy(c => c.SourceId, StringComparer.Ordinal)
-            .Select(group => group.First())
-            .Take(12)
-            .ToList();
+        var citationTagMap = citationTagPairs.Count == 0
+            ? new Dictionary<string, SourceCitation>(StringComparer.OrdinalIgnoreCase)
+            : citationTagPairs.ToDictionary(pair => pair.Tag, pair => pair.Citation, StringComparer.OrdinalIgnoreCase);
 
         return new ReportSectionDraft
         {
             SectionId = sectionPlan.SectionId,
             Title = sectionPlan.Title,
             Content = content.Trim(),
-            Citations = citations
+            Citations = citations,
+            CitationTags = citationTagMap
         };
     }
 
@@ -1167,16 +1227,6 @@ public sealed class OrchestratorAgent : IAgent
         }
 
         return true;
-    }
-
-    private static string BuildSyntheticSectionSummary(string title, string? parentTitle)
-    {
-        if (!string.IsNullOrWhiteSpace(parentTitle))
-        {
-            return $"Explain the \"{title}\" considerations within the broader \"{parentTitle}\" section, connecting transitions to adjacent topics.";
-        }
-
-        return $"Detail the \"{title}\" dimension of the research objective, highlighting why it matters and how it links to the other sections.";
     }
 
     private async Task<string> GenerateReportAsync(
@@ -1388,7 +1438,8 @@ public sealed class OrchestratorAgent : IAgent
                     {
                         SectionId = sectionId,
                         Title = section.Title!.Trim(),
-                        Summary = string.IsNullOrWhiteSpace(section.Summary) ? null : section.Summary!.Trim()
+                        Summary = string.IsNullOrWhiteSpace(section.Summary) ? null : section.Summary!.Trim(),
+                        StructuralOnly = section.StructuralOnly ?? false
                     };
 
                     if (section.SupportingFindingIds is not null)
@@ -1454,8 +1505,7 @@ public sealed class OrchestratorAgent : IAgent
                     {
                         var syntheticPlan = new ReportSectionPlan
                         {
-                            Title = node.Title!.Trim(),
-                            Summary = BuildSyntheticSectionSummary(node.Title!.Trim(), parentTitle)
+                            Title = node.Title!.Trim()
                         };
 
                         workingOutline.Sections.Add(syntheticPlan);
@@ -1509,8 +1559,7 @@ public sealed class OrchestratorAgent : IAgent
 
         var summaryPlan = new ReportSectionPlan
         {
-            Title = "Executive Summary",
-            Summary = "Summarize the overall findings, implications, and recommended next steps."
+            Title = "Executive Summary"
         };
         outline.Sections.Add(summaryPlan);
 
@@ -1532,8 +1581,7 @@ public sealed class OrchestratorAgent : IAgent
         {
             var overviewPlan = new ReportSectionPlan
             {
-                Title = "Key Insights",
-                Summary = "Summarize the research objective, key hypotheses, and next steps."
+                Title = "Key Insights"
             };
             outline.Sections.Add(overviewPlan);
 
@@ -1556,8 +1604,7 @@ public sealed class OrchestratorAgent : IAgent
             {
                 var plan = new ReportSectionPlan
                 {
-                    Title = finding.Title,
-                    Summary = finding.Content.Length > 200 ? finding.Content[..200] + "…" : finding.Content
+                    Title = finding.Title
                 };
                 plan.SupportingFindingIds.Add(finding.Id);
                 outline.Sections.Add(plan);
@@ -1574,8 +1621,7 @@ public sealed class OrchestratorAgent : IAgent
             {
                 var contextPlan = new ReportSectionPlan
                 {
-                    Title = "Broader Context",
-                    Summary = "Highlight secondary findings, risks, or adjacent themes uncovered during research."
+                    Title = "Broader Context"
                 };
 
                 foreach (var id in findings.Skip(4).Select(f => f.Id).Take(5))
@@ -1603,6 +1649,139 @@ public sealed class OrchestratorAgent : IAgent
 
         outline.Layout.Add(rootNode);
         return outline;
+    }
+
+    private static OpenAiChatJsonSchemaFormat BuildOutlineSchemaFormat()
+    {
+        var schema = new Dictionary<string, object>
+        {
+            ["type"] = "object",
+            ["additionalProperties"] = false,
+            ["properties"] = new Dictionary<string, object>
+            {
+                ["notes"] = new Dictionary<string, object>
+                {
+                    ["type"] = "string",
+                    ["description"] = "Optional editorial notes for the outline. Use an empty string when no notes are required."
+                },
+                ["sections"] = new Dictionary<string, object>
+                {
+                    ["type"] = "array",
+                    ["description"] = "Detailed section plans that will be used for drafting.",
+                    ["items"] = new Dictionary<string, object>
+                    {
+                        ["$ref"] = "#/$defs/sectionPlan"
+                    },
+                    ["minItems"] = 1
+                },
+                ["layout"] = new Dictionary<string, object>
+                {
+                    ["type"] = "array",
+                    ["description"] = "Hierarchical heading layout describing report structure.",
+                    ["items"] = new Dictionary<string, object>
+                    {
+                        ["$ref"] = "#/$defs/layoutNode"
+                    },
+                    ["minItems"] = 1
+                }
+            },
+            ["required"] = new[] { "notes", "sections", "layout" },
+            ["$defs"] = new Dictionary<string, object>
+            {
+                ["sectionPlan"] = new Dictionary<string, object>
+                {
+                    ["type"] = "object",
+                    ["additionalProperties"] = false,
+                    ["properties"] = new Dictionary<string, object>
+                    {
+                        ["sectionId"] = new Dictionary<string, object>
+                        {
+                            ["type"] = "string",
+                            ["description"] = "Unique identifier for the section."
+                        },
+                        ["title"] = new Dictionary<string, object>
+                        {
+                            ["type"] = "string",
+                            ["description"] = "Heading text for the section."
+                        },
+                        ["summary"] = new Dictionary<string, object>
+                        {
+                            ["type"] = "string",
+                            ["description"] = "Brief summary describing the focus of the section.",
+                            ["default"] = string.Empty
+                        },
+                        ["supportingFindingIds"] = new Dictionary<string, object>
+                        {
+                            ["type"] = "array",
+                            ["description"] = "List of finding IDs that directly support this section.",
+                            ["items"] = new Dictionary<string, object>
+                            {
+                                ["type"] = "string"
+                            },
+                            ["minItems"] = 0
+                        },
+                        ["structuralOnly"] = new Dictionary<string, object>
+                        {
+                            ["type"] = "boolean",
+                            ["description"] = "When true, the section represents a structural element that must not include drafted narrative paragraphs.",
+                            ["default"] = false
+                        }
+                    },
+                    ["required"] = new[] { "sectionId", "title", "summary", "supportingFindingIds", "structuralOnly" }
+                },
+                ["layoutNode"] = new Dictionary<string, object>
+                {
+                    ["type"] = "object",
+                    ["additionalProperties"] = false,
+                    ["properties"] = new Dictionary<string, object>
+                    {
+                        ["nodeId"] = new Dictionary<string, object>
+                        {
+                            ["type"] = "string",
+                            ["description"] = "Unique identifier for the layout node."
+                        },
+                        ["headingType"] = new Dictionary<string, object>
+                        {
+                            ["type"] = "string",
+                            ["description"] = "Markdown heading level (h1-h4).",
+                            ["pattern"] = "^h[1-4]$"
+                        },
+                        ["title"] = new Dictionary<string, object>
+                        {
+                            ["type"] = "string",
+                            ["description"] = "Heading title rendered for this node."
+                        },
+                        ["sectionId"] = new Dictionary<string, object>
+                        {
+                            ["type"] = "string",
+                            ["description"] = "Optional sectionId this layout node maps to."
+                        },
+                        ["children"] = new Dictionary<string, object>
+                        {
+                            ["type"] = "array",
+                            ["items"] = new Dictionary<string, object>
+                            {
+                                ["$ref"] = "#/$defs/layoutNode"
+                            },
+                            ["default"] = Array.Empty<object>(),
+                            ["description"] = "Child nodes nested under this heading."
+                        }
+                    },
+                    ["required"] = new[] { "nodeId", "headingType", "title", "sectionId", "children" }
+                }
+            }
+        };
+
+        JsonNode? schemaNode = JsonSerializer.SerializeToNode(schema);
+        if (schemaNode is null)
+        {
+            throw new InvalidOperationException("Failed to materialize outline schema JSON node.");
+        }
+
+        return new OpenAiChatJsonSchemaFormat(
+            "report_outline",
+            schemaNode,
+            Strict: true);
     }
 
     private bool TryParseContinuationDecision(string response, out ResearchContinuationDecision decision)
@@ -1711,6 +1890,9 @@ public sealed class OrchestratorAgent : IAgent
 
         [JsonPropertyName("supportingFindingIds")]
         public List<string>? SupportingFindingIds { get; set; }
+
+        [JsonPropertyName("structuralOnly")]
+        public bool? StructuralOnly { get; set; }
     }
 
     private sealed class OutlineLayoutNodePayload

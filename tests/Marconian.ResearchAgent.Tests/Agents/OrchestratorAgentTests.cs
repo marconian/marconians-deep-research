@@ -1,3 +1,4 @@
+using System.Linq;
 using Marconian.ResearchAgent.Agents;
 using Marconian.ResearchAgent.Configuration;
 using Marconian.ResearchAgent.Memory;
@@ -135,6 +136,14 @@ public sealed class OrchestratorAgentTests
             Assert.That(reportPath, Is.Not.Null.And.Not.Empty);
             Assert.That(File.Exists(reportPath!), Is.True);
             Assert.That(storedRecords, Has.Count.GreaterThanOrEqualTo(2));
+
+            var outlineRequest = openAiMock.Invocations
+                .Where(invocation => invocation.Method.Name == nameof(IAzureOpenAiService.GenerateTextAsync))
+                .Select(invocation => invocation.Arguments.FirstOrDefault() as OpenAiChatRequest)
+                .FirstOrDefault(request => request is not null && request.SystemPrompt == SystemPrompts.Orchestrator.OutlineEditor);
+
+            Assert.That(outlineRequest, Is.Not.Null, "Outline request should have been issued.");
+            Assert.That(outlineRequest!.JsonSchemaFormat, Is.Not.Null, "Outline request must enforce the structured JSON schema.");
         }
         finally
         {

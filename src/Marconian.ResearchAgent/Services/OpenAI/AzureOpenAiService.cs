@@ -1,30 +1,60 @@
 using System.Linq;
+using System.Text;
 using Azure;
 using Azure.AI.OpenAI;
+using OpenAI.Chat;
+using OpenAI.Embeddings;
 using Marconian.ResearchAgent.Configuration;
 using Marconian.ResearchAgent.Services.OpenAI.Models;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using System.ClientModel;
 
 namespace Marconian.ResearchAgent.Services.OpenAI;
 
 public sealed class AzureOpenAiService : IAzureOpenAiService
 {
-    private readonly OpenAIClient _client;
+    private readonly ChatClient _chatClient;
+    private readonly EmbeddingClient _embeddingsClient;
+    private readonly string _chatDeploymentName;
+    private readonly string _embeddingDeploymentName;
     private readonly ILogger<AzureOpenAiService> _logger;
 
     public AzureOpenAiService(Settings.AppSettings settings, ILogger<AzureOpenAiService>? logger = null)
     {
         ArgumentNullException.ThrowIfNull(settings);
         _logger = logger ?? NullLogger<AzureOpenAiService>.Instance;
-        _client = new OpenAIClient(new Uri(settings.AzureOpenAiEndpoint), new AzureKeyCredential(settings.AzureOpenAiApiKey));
+        var credential = new ApiKeyCredential(settings.AzureOpenAiApiKey);
+        var client = new AzureOpenAIClient(new Uri(settings.AzureOpenAiEndpoint), credential);
+        _chatDeploymentName = settings.AzureOpenAiChatDeployment;
+        _embeddingDeploymentName = settings.AzureOpenAiEmbeddingDeployment;
+        _chatClient = client.GetChatClient(_chatDeploymentName);
+        _embeddingsClient = client.GetEmbeddingClient(_embeddingDeploymentName);
     }
 
     public async Task<string> GenerateTextAsync(OpenAiChatRequest request, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        var options = new ChatCompletionsOptions();
+        var messages = new List<ChatMessage>
+        {
+            new SystemChatMessage(request.SystemPrompt)
+        };
+
+        foreach (var message in request.Messages)
+        {
+            messages.Add(ToChatMessage(message));
+        }
+
+        var options = new ChatCompletionOptions();
+
+        // Azure's latest models reject the legacy max_tokens parameter. Until the SDK exposes the
+        // replacement field, skip sending an explicit cap but keep a debug trace for visibility.
+        if (request.MaxOutputTokens > 0)
+        {
+            _logger.LogDebug("MaxOutputTokens requested ({MaxTokens}), but current Azure OpenAI deployment does not support explicit max token parameters. Skipping explicit limit.", request.MaxOutputTokens);
+        }
+
         if (request.Temperature is float temperature)
         {
             options.Temperature = temperature;
@@ -32,27 +62,29 @@ public sealed class AzureOpenAiService : IAzureOpenAiService
 
         if (request.TopP is float topP)
         {
-            options.NucleusSamplingFactor = topP;
+            options.TopP = topP;
         }
 
-        options.Messages.Add(new ChatMessage(ChatRole.System, request.SystemPrompt));
-        foreach (var message in request.Messages)
+        if (request.JsonSchemaFormat is not null)
         {
-            options.Messages.Add(new ChatMessage(message.Role, message.Content));
+            options.ResponseFormat = ChatResponseFormat.CreateJsonSchemaFormat(
+                request.JsonSchemaFormat.SchemaName,
+                BinaryData.FromString(request.JsonSchemaFormat.Schema.ToJsonString()),
+                jsonSchemaIsStrict: request.JsonSchemaFormat.Strict);
         }
 
         try
         {
-            _logger.LogDebug("Requesting chat completion with {MessageCount} messages and system prompt length {SystemPromptLength}.", options.Messages.Count, request.SystemPrompt.Length);
-            Response<ChatCompletions> response = await _client.GetChatCompletionsAsync(request.DeploymentName, options, cancellationToken).ConfigureAwait(false);
-            var bestChoice = response.Value.Choices.FirstOrDefault();
-            string content = bestChoice?.Message.Content?.Trim() ?? string.Empty;
+            _logger.LogDebug("Requesting chat completion with {MessageCount} messages and system prompt length {SystemPromptLength}.", messages.Count, request.SystemPrompt.Length);
+            ChatCompletion completion = await _chatClient.CompleteChatAsync(messages, options, cancellationToken).ConfigureAwait(false);
+
+            string content = ExtractCompletionText(completion);
             _logger.LogDebug("Received chat completion with length {Length} characters.", content.Length);
             return content;
         }
-        catch (RequestFailedException ex)
+        catch (Exception ex) when (ex is RequestFailedException or InvalidOperationException)
         {
-            _logger.LogError(ex, "Azure OpenAI chat completion failed with status {Status}.", ex.Status);
+            _logger.LogError(ex, "Azure OpenAI chat completion failed for deployment {Deployment}.", _chatDeploymentName);
             throw new InvalidOperationException($"Azure OpenAI chat completion failed: {ex.Message}", ex);
         }
     }
@@ -63,31 +95,59 @@ public sealed class AzureOpenAiService : IAzureOpenAiService
 
         if (string.IsNullOrWhiteSpace(request.InputText))
         {
-            _logger.LogWarning("Embedding request received with empty input for deployment {Deployment}. Returning placeholder vector.", request.DeploymentName);
+            _logger.LogWarning("Embedding request received with empty input for deployment {Deployment}. Returning placeholder vector.", _embeddingDeploymentName);
             return Array.Empty<float>();
         }
-
-        var options = new EmbeddingsOptions(request.InputText);
 
         try
         {
             _logger.LogDebug("Requesting embedding for input length {Length} characters.", request.InputText.Length);
-            Response<Embeddings> response = await _client.GetEmbeddingsAsync(request.DeploymentName, options, cancellationToken).ConfigureAwait(false);
-            if (response?.Value?.Data is null || response.Value.Data.Count == 0)
+            ClientResult<OpenAIEmbeddingCollection> embeddings = await _embeddingsClient.GenerateEmbeddingsAsync([request.InputText], cancellationToken: cancellationToken).ConfigureAwait(false);
+            if (embeddings.Value.FirstOrDefault() is not { } embedding)
             {
-                _logger.LogWarning("Embedding response contained no vectors for deployment {Deployment}.", request.DeploymentName);
+                _logger.LogWarning("Embedding response contained no vectors for deployment {Deployment}.", _embeddingDeploymentName);
                 return Array.Empty<float>();
             }
 
-            var embedding = response.Value.Data.FirstOrDefault();
-            IReadOnlyList<float> vector = embedding?.Embedding?.ToArray() ?? Array.Empty<float>();
+            IReadOnlyList<float> vector = embedding.ToFloats().ToArray() ?? Array.Empty<float>();
             _logger.LogDebug("Received embedding with {DimensionCount} dimensions.", vector.Count);
             return vector;
         }
-        catch (RequestFailedException ex)
+        catch (Exception ex) when (ex is RequestFailedException or InvalidOperationException)
         {
-            _logger.LogError(ex, "Azure OpenAI embedding generation failed with status {Status}.", ex.Status);
+            _logger.LogError(ex, "Azure OpenAI embedding generation failed for deployment {Deployment}.", _embeddingDeploymentName);
             throw new InvalidOperationException($"Azure OpenAI embedding generation failed: {ex.Message}", ex);
         }
+    }
+
+    private static ChatMessage ToChatMessage(OpenAiChatMessage message)
+    {
+        string role = message.Role?.Trim().ToLowerInvariant() ?? string.Empty;
+        return role switch
+        {
+            "system" => new SystemChatMessage(message.Content),
+            "assistant" => new AssistantChatMessage(message.Content),
+            "tool" => new ToolChatMessage("tool", message.Content),
+            _ => new UserChatMessage(message.Content)
+        };
+    }
+
+    private static string ExtractCompletionText(ChatCompletion completion)
+    {
+        if (completion is null)
+        {
+            return string.Empty;
+        }
+
+        var builder = new StringBuilder();
+        foreach (var part in completion.Content)
+        {
+            if (part.Text is not null)
+            {
+                builder.Append(part.Text);
+            }
+        }
+
+        return builder.ToString().Trim();
     }
 }

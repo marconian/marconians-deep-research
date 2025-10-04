@@ -45,7 +45,7 @@ public static class SystemPrompts
             public const string SynthesisFindingsHeader = "Findings (use IDs when referencing support):";
             public const string SynthesisNoFindings = "(No findings available. Create a generic outline.)";
             public const string SynthesisNoSynthesis = "(No synthesis provided.)";
-            public const string OutlineInstruction = "Design a structured outline for the final report. Return JSON with fields: 'notes' (string), 'sections' (array), and 'layout' (array). Each section entry must include 'sectionId', 'title', 'summary', and 'supportingFindingIds' referencing the provided IDs. The layout array should describe the Markdown heading hierarchy: every node must include 'nodeId', 'headingType' (h1-h4), 'title', optional 'sectionId' matching a section entry, and 'children' (array). Include an executive summary node, thematic body nodes, and a final sources node (without sectionId) so citations can be appended. No extra commentary.";
+            public const string OutlineInstruction = "Design a structured outline for the final report. Return JSON with fields: 'notes' (string), 'sections' (array), and 'layout' (array). Each section entry must include 'sectionId', 'title', 'summary', and 'supportingFindingIds' referencing the provided IDs, plus an optional boolean 'structuralOnly' that defaults to false. When 'structuralOnly' is true the section is purely structural (heading, list, or container) and no narrative paragraphs should be drafted for it. The layout array should describe the Markdown heading hierarchy: every node must include 'nodeId', 'headingType' (h1-h4), 'title', optional 'sectionId' matching a section entry, and 'children' (array). Include an executive summary node, thematic body nodes, and a final sources node (without sectionId) so citations can be appended. No extra commentary.";
             public const string OutlineNotesHeader = "Outline notes:";
             public const string OutlineSectionLocationHeader = "Section location within outline:";
             public const string OutlineSiblingHeader = "Sibling sections:";
@@ -55,7 +55,12 @@ public static class SystemPrompts
             public const string OutlineSynthesisContextHeader = "Overall synthesis context:";
             public const string OutlineEvidenceHeader = "Evidence:";
             public const string OutlineNoEvidence = "(No direct evidence; provide contextual overview.)";
-            public const string SectionWritingInstruction = "Write a polished Markdown narrative (2-4 paragraphs) for this section that stays consistent with the overall outline and surrounding sections. Incorporate transitions to the parent and child topics when appropriate, stay factual, and only use the supplied evidence. Do not include headings or citation brackets. Return only the body text.";
+            public const string SectionSourcesHeader = "Sources for this section (use the tags below in your narrative):";
+            public const string SectionSourceLine = "- {0}: {1}";
+            public const string SectionSourceDetails = "    URL: {0}";
+            public const string SectionSourceSnippet = "    Notes: {0}";
+            public const string SectionSourcesInstruction = "When citing a source in the narrative, append the matching tag in the format <<ref:TAG>> immediately after the supporting sentence.";
+            public const string SectionWritingInstruction = "Write a polished Markdown narrative (2-4 paragraphs) for this section that stays consistent with the overall outline and surrounding sections. Incorporate transitions to the parent and child topics when appropriate, stay factual, and only use the supplied evidence. Use the provided citation tags (<<ref:TAG>>) exactly where evidence is applied. Do not include headings. Return only the body text.";
             public const string ReportLinesHeader = "Existing report lines:";
             public const string ReportRevisionInstruction = "Suggest up to three targeted edits to improve clarity, add missing citations, or fix structural issues. Return a JSON array of objects with properties 'action' ('replace' | 'insert_before' | 'insert_after'), 'line' (1-based) and 'content'. If no changes are needed, return an empty JSON array.";
         }
