@@ -438,6 +438,11 @@ You control a Chromium browser. Investigate the query, open promising results, a
             return previous;
         }
 
+        if (string.IsNullOrWhiteSpace(previous.Call.CallId))
+        {
+            throw new InvalidOperationException("Computer-use response did not include a call identifier.");
+        }
+
         string screenshot = await CaptureScreenshotAsync(cancellationToken).ConfigureAwait(false);
         var output = new JsonObject
         {
@@ -487,6 +492,21 @@ You control a Chromium browser. Investigate the query, open promising results, a
             payload["instructions"] = instructions;
         }
         payload["model"] = _deployment;
+
+        if (_logger.IsEnabled(LogLevel.Debug))
+        {
+            string? urlForLog = null;
+            if (output.TryGetPropertyValue("current_url", out JsonNode? urlNode) && urlNode is JsonValue urlValue)
+            {
+                urlForLog = urlValue.GetValue<string>();
+            }
+
+            _logger.LogDebug(
+                "Submitting computer_call_output (callId={CallId}, responseId={ResponseId}, url={Url})",
+                previous.Call.CallId,
+                previous.ResponseId,
+                urlForLog);
+        }
 
         using JsonDocument response = await SendRequestAsync(payload, cancellationToken).ConfigureAwait(false);
         return ParseResponse(response, transcript);
@@ -705,6 +725,7 @@ You control a Chromium browser. Investigate the query, open promising results, a
         ExplorationPayload? summaryPayload = null;
         string? summaryRawJson = null;
         string? summaryCallId = null;
+        string? summaryResponseId = null;
         List<string>? capturedSegments = null;
 
         void ProcessSummaryCandidate(JsonElement candidate)
@@ -716,6 +737,7 @@ You control a Chromium browser. Investigate the query, open promising results, a
                 if (!string.IsNullOrWhiteSpace(callId))
                 {
                     summaryCallId = callId;
+                    summaryResponseId = responseId;
                 }
             }
         }
@@ -894,7 +916,8 @@ You control a Chromium browser. Investigate the query, open promising results, a
         return new ComputerUseResponseState(responseId, call, completed, summaryCallId)
         {
             SummaryPayload = summaryPayload,
-            SummaryRawJson = summaryRawJson
+            SummaryRawJson = summaryRawJson,
+            SummaryResponseId = summaryResponseId
         };
     }
 
@@ -1994,6 +2017,8 @@ You control a Chromium browser. Investigate the query, open promising results, a
         public ExplorationPayload? SummaryPayload { get; init; }
 
         public string? SummaryRawJson { get; init; }
+
+        public string? SummaryResponseId { get; init; }
     }
 
     private sealed record ComputerCall(string CallId, ComputerUseAction Action, IReadOnlyList<ComputerUseSafetyCheck> PendingSafetyChecks);
@@ -2055,6 +2080,7 @@ You control a Chromium browser. Investigate the query, open promising results, a
             ExplorationPayload? summaryPayload = response.SummaryPayload;
             string? summaryRawJson = response.SummaryRawJson;
             string? summaryCallId = response.SummaryFunctionCallId;
+            string? summaryResponseId = response.SummaryResponseId;
             string? acknowledgedSummaryCallId = null;
 
             void UpdateSummary(ComputerUseResponseState state)
@@ -2068,6 +2094,15 @@ You control a Chromium browser. Investigate the query, open promising results, a
                 if (!string.IsNullOrWhiteSpace(state.SummaryFunctionCallId))
                 {
                     summaryCallId = state.SummaryFunctionCallId;
+                }
+
+                if (!string.IsNullOrWhiteSpace(state.SummaryResponseId))
+                {
+                    summaryResponseId = state.SummaryResponseId;
+                }
+                else if (string.IsNullOrWhiteSpace(state.SummaryFunctionCallId))
+                {
+                    summaryResponseId = null;
                 }
             }
 
@@ -2085,12 +2120,16 @@ You control a Chromium browser. Investigate the query, open promising results, a
                 }
 
                 ComputerUseResponseState ackSource = response;
-                if (string.IsNullOrWhiteSpace(ackSource.ResponseId) && !string.IsNullOrWhiteSpace(lastResponseId))
+                string? ackResponseId = !string.IsNullOrWhiteSpace(ackSource.ResponseId)
+                    ? ackSource.ResponseId
+                    : summaryResponseId;
+
+                if (string.IsNullOrWhiteSpace(ackResponseId) && !string.IsNullOrWhiteSpace(lastResponseId))
                 {
-                    ackSource = ackSource with { ResponseId = lastResponseId };
+                    ackResponseId = lastResponseId;
                 }
 
-                if (string.IsNullOrWhiteSpace(ackSource.ResponseId))
+                if (string.IsNullOrWhiteSpace(ackResponseId))
                 {
                     return;
                 }
@@ -2098,10 +2137,13 @@ You control a Chromium browser. Investigate the query, open promising results, a
                 string callId = summaryCallId!;
                 string? rawJson = summaryRawJson;
 
+                ackSource = ackSource with { ResponseId = ackResponseId };
+
                 ackSource = await SendSummaryFunctionOutputAsync(ackSource, transcript, callId, rawJson, cancellationToken).ConfigureAwait(false);
                 response = ackSource;
 
                 acknowledgedSummaryCallId = callId;
+                summaryResponseId = null;
                 UpdateSummary(response);
 
                 if (!string.IsNullOrWhiteSpace(response.ResponseId))
@@ -2217,7 +2259,7 @@ You control a Chromium browser. Investigate the query, open promising results, a
                 _logger.LogWarning("Computer-use exploration for url '{Url}' reached iteration limit before completion.", url);
             }
 
-            if (!summaryRequested && !string.IsNullOrWhiteSpace(lastResponseId))
+            if (!summaryRequested && response.Call is null && !string.IsNullOrWhiteSpace(lastResponseId))
             {
                 try
                 {

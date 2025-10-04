@@ -115,8 +115,10 @@
 - [x] Allow outline sections to be marked structural-only so drafting skips headings that don't need narrative (2025-10-04)
 
 ## M18 - CAPTCHA Mitigation & Stealth Browser Posture
-- [ ] Integrate Playwright stealth configuration (navigator.webdriver patches, realistic UA/timezone/viewport) in computer-use services.
+- [ ] Integrate Playwright stealth configuration (navigator.webdriver patches, realistic UA/timezone/viewport, persistent contexts, manual launch flags) in computer-use services per stealth blueprint.
+- [ ] Evaluate stealth tooling options (soenneker.playwrights.extensions.stealth, Undetected.Playwright, rebrowser patches) and record decisions + trade-offs.
 - [ ] Introduce human-like cursor/typing behavior simulation for CUA-issued actions with configurable parameters.
+- [ ] Implement rotating residential proxy and TLS/JA3 alignment strategy to reduce bot fingerprint discrepancies.
 - [ ] Detect CAPTCHA interruptions and surface dedicated recovery events with retry guidance.
 - [ ] Document mitigation strategy and add tests validating fallback behavior when CAPTCHA is encountered.
 
