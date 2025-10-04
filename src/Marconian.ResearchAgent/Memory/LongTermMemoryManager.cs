@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Linq;
+using System.Text;
 using Marconian.ResearchAgent.Models.Memory;
 using Marconian.ResearchAgent.Models.Reporting;
 using Marconian.ResearchAgent.Services.Cosmos;
@@ -117,7 +118,17 @@ public sealed class LongTermMemoryManager
 
         if (filtered.Count == 0)
         {
-            return Array.Empty<ResearchFinding>();
+            var reconstructed = ReconstructFindingsFromStoredArtifacts(records);
+            if (reconstructed.Count == 0)
+            {
+                return Array.Empty<ResearchFinding>();
+            }
+
+            _logger.LogInformation(
+                "Reconstructed {FindingCount} finding(s) for session {SessionId} using stored tool outputs.",
+                reconstructed.Count,
+                researchSessionId);
+            return reconstructed;
         }
 
         var grouped = new Dictionary<string, List<MemoryRecord>>(StringComparer.OrdinalIgnoreCase);
@@ -194,6 +205,133 @@ public sealed class LongTermMemoryManager
             .ToList();
     }
 
+    private IReadOnlyList<ResearchFinding> ReconstructFindingsFromStoredArtifacts(IReadOnlyList<MemoryRecord> records)
+    {
+        var toolOutputs = records
+            .Where(record => record.Type.StartsWith("tool_output::", StringComparison.OrdinalIgnoreCase)
+                              && !string.IsNullOrWhiteSpace(record.Content))
+            .ToList();
+
+        if (toolOutputs.Count == 0)
+        {
+            return Array.Empty<ResearchFinding>();
+        }
+
+        var grouped = toolOutputs
+            .GroupBy(static record =>
+            {
+                if (record.Metadata.TryGetValue("agentTaskId", out var agentTaskId) && !string.IsNullOrWhiteSpace(agentTaskId))
+                {
+                    return agentTaskId;
+                }
+
+                if (record.Metadata.TryGetValue("instruction", out var instruction) && !string.IsNullOrWhiteSpace(instruction))
+                {
+                    return instruction;
+                }
+
+                return record.Type;
+            }, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var findings = new List<ResearchFinding>(grouped.Count);
+
+        foreach (var group in grouped)
+        {
+            var ordered = group
+                .OrderBy(record => record.CreatedAtUtc)
+                .ToList();
+
+            var primary = ordered[^1];
+            string title = ResolveFallbackTitle(primary);
+
+            var contentBuilder = new StringBuilder();
+            foreach (var record in ordered)
+            {
+                string chunk = record.Content.Trim();
+                if (chunk.Length == 0)
+                {
+                    continue;
+                }
+
+                contentBuilder.AppendLine(chunk);
+                contentBuilder.AppendLine();
+            }
+
+            string combinedContent = contentBuilder.ToString().Trim();
+            if (combinedContent.Length == 0)
+            {
+                continue;
+            }
+
+            var citations = ordered
+                .SelectMany(record => record.Sources.Select(source => (source, recordId: record.Id)))
+                .Where(tuple => tuple.source is not null)
+                .GroupBy(tuple =>
+                    string.IsNullOrWhiteSpace(tuple.source.SourceId)
+                        ? tuple.source.Url ?? tuple.source.Title ?? $"memory:{tuple.recordId}"
+                        : tuple.source.SourceId,
+                    StringComparer.OrdinalIgnoreCase)
+                .Select(group =>
+                {
+                    var source = group.First().source;
+                    string sourceId = string.IsNullOrWhiteSpace(source.SourceId) ? group.Key : source.SourceId;
+                    return new SourceCitation(sourceId, source.Title, source.Url, source.Snippet);
+                })
+                .ToList();
+
+            var finding = new ResearchFinding
+            {
+                Id = primary.Metadata.TryGetValue("agentTaskId", out var agentTaskId) && !string.IsNullOrWhiteSpace(agentTaskId)
+                    ? agentTaskId
+                    : primary.Id,
+                Title = title,
+                Content = combinedContent,
+                Citations = citations,
+                Confidence = ResolveFallbackConfidence(primary)
+            };
+
+            findings.Add(finding);
+        }
+
+        return findings
+            .OrderByDescending(finding => finding.Confidence)
+            .ThenByDescending(finding => finding.Content.Length)
+            .ToList();
+    }
+
+    private static string ResolveFallbackTitle(MemoryRecord record)
+    {
+        if (record.Metadata.TryGetValue("instruction", out var instruction) && !string.IsNullOrWhiteSpace(instruction))
+        {
+            return instruction.Trim();
+        }
+
+        if (record.Metadata.TryGetValue("title", out var title) && !string.IsNullOrWhiteSpace(title))
+        {
+            return title.Trim();
+        }
+
+        if (record.Metadata.TryGetValue("tool", out var toolName) && !string.IsNullOrWhiteSpace(toolName))
+        {
+            return $"Output from {toolName.Trim()}";
+        }
+
+        return "Restored Finding";
+    }
+
+    private static double ResolveFallbackConfidence(MemoryRecord record)
+    {
+        if (record.Metadata.TryGetValue("confidence", out var confidenceValue)
+            && double.TryParse(confidenceValue, NumberStyles.Float, CultureInfo.InvariantCulture, out double parsed)
+            && parsed is >= 0 and <= 1)
+        {
+            return parsed;
+        }
+
+        return 0.35d;
+    }
+
     public Task<IReadOnlyList<MemoryRecord>> GetRecentMemoriesAsync(string researchSessionId, int limit, CancellationToken cancellationToken = default)
         => _cosmosMemoryService.QueryBySessionAsync(researchSessionId, limit, cancellationToken);
 
@@ -216,13 +354,14 @@ public sealed class LongTermMemoryManager
         IReadOnlyCollection<string>? relatedToolIds = null,
         CancellationToken cancellationToken = default)
     {
+        var placeholder = CreatePlaceholderEmbedding();
         var record = new MemoryRecord
         {
             Id = $"{researchSessionId}_branch_{branchId}",
             ResearchSessionId = researchSessionId,
             Type = "branch_state",
             Content = summary ?? question,
-            Embedding = CreatePlaceholderEmbedding(),
+            Embedding = placeholder.Length > 0 ? placeholder : null,
             Metadata = new Dictionary<string, string>
             {
                 ["branchId"] = branchId,
@@ -250,13 +389,14 @@ public sealed class LongTermMemoryManager
         string? note = null,
         CancellationToken cancellationToken = default)
     {
+        var placeholder = CreatePlaceholderEmbedding();
         var record = new MemoryRecord
         {
             Id = $"{researchSessionId}_session_state",
             ResearchSessionId = researchSessionId,
             Type = "session_state",
             Content = note ?? state,
-            Embedding = CreatePlaceholderEmbedding(),
+            Embedding = placeholder.Length > 0 ? placeholder : null,
             Metadata = new Dictionary<string, string>
             {
                 ["state"] = state,
@@ -289,13 +429,45 @@ public sealed class LongTermMemoryManager
 
     private async Task<float[]> GenerateEmbeddingAsync(string content, CancellationToken cancellationToken)
     {
-        var vector = await _openAiService.GenerateEmbeddingAsync(
-            new OpenAiEmbeddingRequest(_embeddingDeploymentName, content),
-            cancellationToken).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(content))
+        {
+            return Array.Empty<float>();
+        }
 
-        return vector.Count == 0
-            ? CreatePlaceholderEmbedding()
-            : vector.ToArray();
+        try
+        {
+            var vector = await _openAiService.GenerateEmbeddingAsync(
+                new OpenAiEmbeddingRequest(_embeddingDeploymentName, content),
+                cancellationToken).ConfigureAwait(false);
+
+            if (vector is null || vector.Count == 0)
+            {
+                _logger.LogWarning(
+                    "Embedding service returned no vector for content length {Length}. Using empty embedding.",
+                    content.Length);
+                return Array.Empty<float>();
+            }
+
+            int expectedDimensions = _cosmosMemoryService.VectorDimensions;
+            if (expectedDimensions > 0 && vector.Count != expectedDimensions)
+            {
+                _logger.LogWarning(
+                    "Embedding dimension mismatch for content length {Length}. Expected {Expected} but received {Actual}.",
+                    content.Length,
+                    expectedDimensions,
+                    vector.Count);
+                return Array.Empty<float>();
+            }
+
+            return vector.ToArray();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Embedding generation failed for content length {Length}. Falling back to empty embedding.",
+                content.Length);
+            return Array.Empty<float>();
+        }
     }
 
     private async Task<List<MemoryRecord>> StoreChunkedRecordsAsync(
@@ -333,13 +505,15 @@ public sealed class LongTermMemoryManager
                 chunkMetadata["chunkTokenSpan"] = TokenUtilities.CountTokens(chunk).ToString(CultureInfo.InvariantCulture);
             }
 
+            var embedding = await GenerateEmbeddingAsync(chunk, cancellationToken).ConfigureAwait(false);
+
             var record = new MemoryRecord
             {
                 Id = chunkCount == 1 ? baseId : $"{baseId}_chunk_{index:D4}",
                 ResearchSessionId = researchSessionId,
                 Type = memoryType,
                 Content = chunk,
-                Embedding = await GenerateEmbeddingAsync(chunk, cancellationToken).ConfigureAwait(false),
+                Embedding = embedding.Length > 0 ? embedding : null,
                 Metadata = chunkMetadata,
                 Sources = new List<MemorySourceReference>(sources)
             };
@@ -385,7 +559,12 @@ public sealed class LongTermMemoryManager
 
     private float[] CreatePlaceholderEmbedding()
     {
-        int dimensions = Math.Max(1, _cosmosMemoryService.VectorDimensions);
-        return Enumerable.Repeat(0f, dimensions).ToArray();
+        int dimensions = _cosmosMemoryService.VectorDimensions;
+        if (dimensions <= 0)
+        {
+            return Array.Empty<float>();
+        }
+
+        return new float[dimensions];
     }
 }

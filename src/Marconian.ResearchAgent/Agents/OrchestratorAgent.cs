@@ -81,8 +81,8 @@ public sealed class OrchestratorAgent : IAgent
 
     public async Task<AgentExecutionResult> ExecuteTaskAsync(AgentTask task, CancellationToken cancellationToken = default)
     {
-    ArgumentNullException.ThrowIfNull(task);
-    bool reportOnlyMode = task.Parameters.TryGetValue("reportOnly", out var reportOnlyValue) && IsAffirmative(reportOnlyValue);
+        ArgumentNullException.ThrowIfNull(task);
+        bool reportOnlyMode = task.Parameters.TryGetValue("reportOnly", out var reportOnlyValue) && IsAffirmative(reportOnlyValue);
         string diagramPath = Path.Combine(_reportsDirectory, $"flow_{task.ResearchSessionId}_{DateTimeOffset.UtcNow:yyyyMMdd_HHmmss}.md");
         _flowTracker?.ConfigureSession(task.ResearchSessionId, task.Objective ?? string.Empty, diagramPath);
 
@@ -680,7 +680,7 @@ public sealed class OrchestratorAgent : IAgent
             promptBuilder.AppendLine("(No findings available. Create a generic outline.)");
         }
 
-    promptBuilder.AppendLine("Design a structured outline for the final report. Return JSON with fields: 'notes' (string), 'sections' (array), and 'layout' (array). Each section entry must include 'sectionId', 'title', 'summary', and 'supportingFindingIds' referencing the provided IDs. The layout array should describe the Markdown heading hierarchy: every node must include 'nodeId', 'headingType' (h1-h4), 'title', optional 'sectionId' matching a section entry, and 'children' (array). Include an executive summary node, thematic body nodes, and a final sources node (without sectionId) so citations can be appended. No extra commentary.");
+        promptBuilder.AppendLine("Design a structured outline for the final report. Return JSON with fields: 'notes' (string), 'sections' (array), and 'layout' (array). Each section entry must include 'sectionId', 'title', 'summary', and 'supportingFindingIds' referencing the provided IDs. The layout array should describe the Markdown heading hierarchy: every node must include 'nodeId', 'headingType' (h1-h4), 'title', optional 'sectionId' matching a section entry, and 'children' (array). Include an executive summary node, thematic body nodes, and a final sources node (without sectionId) so citations can be appended. No extra commentary.");
 
         var request = new OpenAiChatRequest(
             SystemPrompt: "You are a veteran research editor who designs structured report outlines grounded in provided evidence.",
@@ -712,6 +712,8 @@ public sealed class OrchestratorAgent : IAgent
         var findingMap = aggregationResult.Findings.ToDictionary(f => f.Id, StringComparer.OrdinalIgnoreCase);
         var sectionLookup = outline.Sections.ToDictionary(section => section.SectionId, StringComparer.OrdinalIgnoreCase);
         var draftedSectionIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var sectionContexts = BuildSectionContexts(outline.Layout, sectionLookup);
+        var priorDrafts = new List<ReportSectionDraft>();
 
         IEnumerable<string> EnumerateLayoutSections(IEnumerable<ReportLayoutNode> nodes)
         {
@@ -737,9 +739,21 @@ public sealed class OrchestratorAgent : IAgent
                 continue;
             }
 
-            var draft = await DraftSectionAsync(rootTask, sectionPlan, findingMap, aggregationResult, synthesis, cancellationToken).ConfigureAwait(false);
+            sectionContexts.TryGetValue(sectionPlan.SectionId, out var context);
+            var draft = await DraftSectionAsync(
+                    rootTask,
+                    sectionPlan,
+                    findingMap,
+                    aggregationResult,
+                    synthesis,
+                    outline,
+                    context,
+                    priorDrafts,
+                    cancellationToken)
+                .ConfigureAwait(false);
             drafts.Add(draft);
             draftedSectionIds.Add(sectionPlan.SectionId);
+            priorDrafts.Add(draft);
         }
 
         foreach (var section in outline.Sections)
@@ -750,11 +764,87 @@ public sealed class OrchestratorAgent : IAgent
                 continue;
             }
 
-            var draft = await DraftSectionAsync(rootTask, section, findingMap, aggregationResult, synthesis, cancellationToken).ConfigureAwait(false);
+            sectionContexts.TryGetValue(section.SectionId, out var context);
+            var draft = await DraftSectionAsync(
+                    rootTask,
+                    section,
+                    findingMap,
+                    aggregationResult,
+                    synthesis,
+                    outline,
+                    context,
+                    priorDrafts,
+                    cancellationToken)
+                .ConfigureAwait(false);
             drafts.Add(draft);
+            priorDrafts.Add(draft);
         }
 
         return drafts;
+    }
+
+    private static Dictionary<string, SectionDraftContext> BuildSectionContexts(
+        IReadOnlyList<ReportLayoutNode> layout,
+        IReadOnlyDictionary<string, ReportSectionPlan> sectionLookup)
+    {
+        var contexts = new Dictionary<string, SectionDraftContext>(StringComparer.OrdinalIgnoreCase);
+
+        void Traverse(
+            ReportLayoutNode node,
+            List<string> path,
+            ReportLayoutNode? parent,
+            IReadOnlyList<ReportLayoutNode> siblings)
+        {
+            var nextPath = new List<string>(path)
+            {
+                node.Title
+            };
+
+            string? parentSectionId = parent?.SectionId;
+            string? parentTitle = parent?.Title;
+            string? parentSummary = null;
+            if (!string.IsNullOrWhiteSpace(parentSectionId) && sectionLookup.TryGetValue(parentSectionId, out var parentPlan))
+            {
+                parentSummary = parentPlan.Summary;
+            }
+
+            var siblingTitles = siblings
+                .Where(static s => !string.IsNullOrWhiteSpace(s.Title))
+                .Where(s => !ReferenceEquals(s, node))
+                .Select(static s => s.Title.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            var childTitles = node.Children
+                .Where(static c => !string.IsNullOrWhiteSpace(c.Title))
+                .Select(static c => c.Title.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (!string.IsNullOrWhiteSpace(node.SectionId))
+            {
+                contexts[node.SectionId] = new SectionDraftContext(
+                    node.SectionId,
+                    nextPath,
+                    parentTitle,
+                    parentSectionId,
+                    parentSummary,
+                    siblingTitles,
+                    childTitles);
+            }
+
+            foreach (var child in node.Children)
+            {
+                Traverse(child, nextPath, node, node.Children);
+            }
+        }
+
+        foreach (var root in layout)
+        {
+            Traverse(root, new List<string>(), null, layout);
+        }
+
+        return contexts;
     }
 
     private async Task<ReportSectionDraft> DraftSectionAsync(
@@ -763,7 +853,10 @@ public sealed class OrchestratorAgent : IAgent
         IReadOnlyDictionary<string, ResearchFinding> findingMap,
         ResearchAggregationResult aggregationResult,
     string synthesis,
-    CancellationToken cancellationToken)
+        ReportOutline outline,
+        SectionDraftContext? context,
+        IReadOnlyList<ReportSectionDraft> priorDrafts,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(sectionPlan);
 
@@ -789,6 +882,61 @@ public sealed class OrchestratorAgent : IAgent
             promptBuilder.AppendLine($"Section goals: {sectionPlan.Summary}");
         }
 
+        if (!string.IsNullOrWhiteSpace(outline.Notes))
+        {
+            promptBuilder.AppendLine("Outline notes:");
+            promptBuilder.AppendLine(outline.Notes!.Trim());
+        }
+
+        if (context is not null)
+        {
+            promptBuilder.AppendLine("Section location within outline:");
+            promptBuilder.AppendLine(string.Join(" > ", context.HeadingPath));
+
+            if (!string.IsNullOrWhiteSpace(context.ParentTitle))
+            {
+                promptBuilder.AppendLine($"Parent section: {context.ParentTitle}");
+            }
+
+            if (!string.IsNullOrWhiteSpace(context.ParentSummary))
+            {
+                promptBuilder.AppendLine($"Parent focus: {context.ParentSummary}");
+            }
+
+            if (context.SiblingTitles.Count > 0)
+            {
+                promptBuilder.AppendLine("Sibling sections:");
+                foreach (string sibling in context.SiblingTitles)
+                {
+                    promptBuilder.AppendLine($"- {sibling}");
+                }
+            }
+
+            if (context.ChildTitles.Count > 0)
+            {
+                promptBuilder.AppendLine("Subtopics to set up:");
+                foreach (string child in context.ChildTitles)
+                {
+                    promptBuilder.AppendLine($"- {child}");
+                }
+            }
+        }
+
+        if (outline.Layout.Count > 0)
+        {
+            promptBuilder.AppendLine("Full outline structure:");
+            promptBuilder.AppendLine(RenderLayoutSummary(outline.Layout));
+        }
+
+        if (priorDrafts.Count > 0)
+        {
+            promptBuilder.AppendLine("Previously drafted sections (for coherence):");
+            foreach (var prior in priorDrafts.TakeLast(3))
+            {
+                promptBuilder.AppendLine($"- {prior.Title}: {SummarizeForPrompt(prior.Content, 320)}");
+            }
+        }
+
         if (!string.IsNullOrWhiteSpace(synthesis))
         {
             promptBuilder.AppendLine("Overall synthesis context:");
@@ -810,7 +958,7 @@ public sealed class OrchestratorAgent : IAgent
         }
 
         promptBuilder.AppendLine();
-        promptBuilder.AppendLine("Write a polished Markdown narrative (2-4 paragraphs) that explains this section. Stay factual and only use the supplied evidence. Do not include headings or citation brackets. Return only the body text.");
+        promptBuilder.AppendLine("Write a polished Markdown narrative (2-4 paragraphs) for this section that stays consistent with the overall outline and surrounding sections. Incorporate transitions to the parent and child topics when appropriate, stay factual, and only use the supplied evidence. Do not include headings or citation brackets. Return only the body text.");
 
         var request = new OpenAiChatRequest(
             SystemPrompt: "You craft concise, evidence-grounded research report sections.",
@@ -824,9 +972,26 @@ public sealed class OrchestratorAgent : IAgent
         string content = await _openAiService.GenerateTextAsync(request, cancellationToken).ConfigureAwait(false);
         if (string.IsNullOrWhiteSpace(content))
         {
-            content = string.Join(
-                Environment.NewLine + Environment.NewLine,
-                relevantFindings.Select(f => f.Content));
+            var fallbackSegments = new List<string>();
+            if (!string.IsNullOrWhiteSpace(sectionPlan.Summary))
+            {
+                fallbackSegments.Add(sectionPlan.Summary!.Trim());
+            }
+
+            if (relevantFindings.Count > 0)
+            {
+                fallbackSegments.AddRange(relevantFindings
+                    .Select(f => f.Content)
+                    .Where(static text => !string.IsNullOrWhiteSpace(text))
+                    .Select(static text => text.Trim()));
+            }
+
+            if (fallbackSegments.Count == 0)
+            {
+                fallbackSegments.Add($"Provide narrative detail for the section '{sectionPlan.Title}' connecting it to the research objective.");
+            }
+
+            content = string.Join(Environment.NewLine + Environment.NewLine, fallbackSegments);
         }
 
         var citations = relevantFindings
@@ -843,6 +1008,82 @@ public sealed class OrchestratorAgent : IAgent
             Content = content.Trim(),
             Citations = citations
         };
+    }
+
+    private static string RenderLayoutSummary(IReadOnlyList<ReportLayoutNode> layout)
+    {
+        if (layout.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        var builder = new StringBuilder();
+
+        void RenderNode(ReportLayoutNode node, int depth)
+        {
+            if (string.IsNullOrWhiteSpace(node.Title))
+            {
+                return;
+            }
+
+            builder.Append(' ', depth * 2);
+            builder.Append("- ");
+            builder.AppendLine(node.Title.Trim());
+
+            foreach (var child in node.Children)
+            {
+                RenderNode(child, depth + 1);
+            }
+        }
+
+        foreach (var node in layout)
+        {
+            RenderNode(node, 0);
+        }
+
+        return builder.ToString().TrimEnd();
+    }
+
+    private static string SummarizeForPrompt(string content, int maxLength)
+    {
+        if (string.IsNullOrWhiteSpace(content))
+        {
+            return string.Empty;
+        }
+
+        string normalized = content.Replace("\r\n", " ").Replace('\n', ' ').Trim();
+        if (normalized.Length <= maxLength)
+        {
+            return normalized;
+        }
+
+        return normalized[..maxLength] + "…";
+    }
+
+    private static bool ShouldCreateSectionForNode(string title, string? parentTitle)
+    {
+        if (string.IsNullOrWhiteSpace(title))
+        {
+            return false;
+        }
+
+        if (string.Equals(title, "Executive Summary", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(title, "Sources", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    private static string BuildSyntheticSectionSummary(string title, string? parentTitle)
+    {
+        if (!string.IsNullOrWhiteSpace(parentTitle))
+        {
+            return $"Explain the \"{title}\" considerations within the broader \"{parentTitle}\" section, connecting transitions to adjacent topics.";
+        }
+
+        return $"Detail the \"{title}\" dimension of the research objective, highlighting why it matters and how it links to the other sections.";
     }
 
     private async Task<string> GenerateReportAsync(
@@ -997,6 +1238,7 @@ public sealed class OrchestratorAgent : IAgent
         {
             Objective = objective
         };
+        var workingOutline = outline;
 
         if (string.IsNullOrWhiteSpace(response))
         {
@@ -1084,7 +1326,7 @@ public sealed class OrchestratorAgent : IAgent
                 };
             }
 
-            List<ReportLayoutNode> ConvertNodes(List<OutlineLayoutNodePayload>? nodes)
+            List<ReportLayoutNode> ConvertNodes(List<OutlineLayoutNodePayload>? nodes, string? parentTitle)
             {
                 var list = new List<ReportLayoutNode>();
                 if (nodes is null)
@@ -1112,6 +1354,19 @@ public sealed class OrchestratorAgent : IAgent
                         sectionId = null;
                     }
 
+                    if (sectionId is null && ShouldCreateSectionForNode(node.Title!, parentTitle))
+                    {
+                        var syntheticPlan = new ReportSectionPlan
+                        {
+                            Title = node.Title!.Trim(),
+                            Summary = BuildSyntheticSectionSummary(node.Title!.Trim(), parentTitle)
+                        };
+
+                        workingOutline.Sections.Add(syntheticPlan);
+                        declaredSectionIds.Add(syntheticPlan.SectionId);
+                        sectionId = syntheticPlan.SectionId;
+                    }
+
                     var layoutNode = new ReportLayoutNode
                     {
                         NodeId = nodeId,
@@ -1120,7 +1375,7 @@ public sealed class OrchestratorAgent : IAgent
                         SectionId = sectionId
                     };
 
-                    var children = ConvertNodes(node.Children);
+                    var children = ConvertNodes(node.Children, layoutNode.Title);
                     if (children.Count > 0)
                     {
                         layoutNode.Children.AddRange(children);
@@ -1134,7 +1389,7 @@ public sealed class OrchestratorAgent : IAgent
 
             if (payload.Layout is not null)
             {
-                outline.Layout.AddRange(ConvertNodes(payload.Layout));
+                outline.Layout.AddRange(ConvertNodes(payload.Layout, null));
             }
 
             return outline.Layout.Count > 0;
@@ -1402,6 +1657,15 @@ public sealed class OrchestratorAgent : IAgent
         [JsonPropertyName("content")]
         public string Content { get; set; } = string.Empty;
     }
+
+    private sealed record SectionDraftContext(
+        string SectionId,
+        IReadOnlyList<string> HeadingPath,
+        string? ParentTitle,
+        string? ParentSectionId,
+        string? ParentSummary,
+        IReadOnlyList<string> SiblingTitles,
+        IReadOnlyList<string> ChildTitles);
 }
 
 

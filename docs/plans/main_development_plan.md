@@ -126,8 +126,8 @@
 - [x] Attempt report-only regeneration for latest session and capture runtime diagnostics.
 - [x] Review session logs to identify failure modes preventing stored findings.
 - [x] Assess most recent generated report for structure, consistency, and citation quality.
-- [ ] Patch Cosmos persistence and embedding generation so findings persist reliably for regeneration.
-- [ ] Iterate on report layout/prompting to eliminate redundancy and tighten citation sourcing.
+- [x] Patch Cosmos persistence and embedding generation so findings persist reliably for regeneration.
+- [x] Iterate on report layout/prompting to eliminate redundancy and tighten citation sourcing.
 - [x] Update `docs/specs.md` if architecture adjustments arise (with justification)
 - [x] Capture architectural patterns in `docs/architectural_patterns.md` when stabilized
 
