@@ -9,6 +9,8 @@ public sealed class ReportOutline
 
     public required string Objective { get; init; }
 
+    public string? Title { get; set; }
+
     public string? Notes { get; set; }
 
     public List<ReportSectionPlan> Sections { get; init; } = new();

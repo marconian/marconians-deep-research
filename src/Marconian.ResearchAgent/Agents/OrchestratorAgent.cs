@@ -1407,6 +1407,11 @@ public sealed class OrchestratorAgent : IAgent
                 return false;
             }
 
+            if (!string.IsNullOrWhiteSpace(payload.Title))
+            {
+                outline.Title = payload.Title!.Trim();
+            }
+
             if (!string.IsNullOrWhiteSpace(payload.Notes))
             {
                 outline.Notes = payload.Notes!.Trim();
@@ -1538,6 +1543,13 @@ public sealed class OrchestratorAgent : IAgent
                 outline.Layout.AddRange(ConvertNodes(payload.Layout, null));
             }
 
+            if (string.IsNullOrWhiteSpace(outline.Title))
+            {
+                outline.Title = string.IsNullOrWhiteSpace(objective)
+                    ? "Autonomous Research Report"
+                    : objective.Trim();
+            }
+
             return outline.Layout.Count > 0;
         }
         catch (JsonException ex)
@@ -1549,13 +1561,14 @@ public sealed class OrchestratorAgent : IAgent
 
     private static ReportOutline BuildFallbackOutline(string objective, IReadOnlyList<ResearchFinding> findings)
     {
+        string rootTitle = string.IsNullOrWhiteSpace(objective) ? "Autonomous Research Report" : objective.Trim();
+
         var outline = new ReportOutline
         {
             Objective = objective,
+            Title = rootTitle,
             Notes = "Fallback outline generated due to parsing issues."
         };
-
-        string rootTitle = string.IsNullOrWhiteSpace(objective) ? "Autonomous Research Report" : objective.Trim();
 
         var summaryPlan = new ReportSectionPlan
         {
@@ -1563,19 +1576,12 @@ public sealed class OrchestratorAgent : IAgent
         };
         outline.Sections.Add(summaryPlan);
 
-        var rootNode = new ReportLayoutNode
-        {
-            HeadingType = "h1",
-            Title = rootTitle
-        };
-
-        var summaryNode = new ReportLayoutNode
+        outline.Layout.Add(new ReportLayoutNode
         {
             HeadingType = "h2",
             Title = "Executive Summary",
             SectionId = summaryPlan.SectionId
-        };
-        rootNode.Children.Add(summaryNode);
+        });
 
         if (findings.Count == 0)
         {
@@ -1585,7 +1591,7 @@ public sealed class OrchestratorAgent : IAgent
             };
             outline.Sections.Add(overviewPlan);
 
-            rootNode.Children.Add(new ReportLayoutNode
+            outline.Layout.Add(new ReportLayoutNode
             {
                 HeadingType = "h2",
                 Title = "Key Insights",
@@ -1638,16 +1644,14 @@ public sealed class OrchestratorAgent : IAgent
                 });
             }
 
-            rootNode.Children.Add(bodyNode);
+            outline.Layout.Add(bodyNode);
         }
 
-        rootNode.Children.Add(new ReportLayoutNode
+        outline.Layout.Add(new ReportLayoutNode
         {
             HeadingType = "h2",
             Title = "Sources"
         });
-
-        outline.Layout.Add(rootNode);
         return outline;
     }
 
@@ -1659,6 +1663,11 @@ public sealed class OrchestratorAgent : IAgent
             ["additionalProperties"] = false,
             ["properties"] = new Dictionary<string, object>
             {
+                ["title"] = new Dictionary<string, object>
+                {
+                    ["type"] = "string",
+                    ["description"] = "Concise Markdown-ready report title."
+                },
                 ["notes"] = new Dictionary<string, object>
                 {
                     ["type"] = "string",
@@ -1685,7 +1694,7 @@ public sealed class OrchestratorAgent : IAgent
                     ["minItems"] = 1
                 }
             },
-            ["required"] = new[] { "notes", "sections", "layout" },
+            ["required"] = new[] { "title", "notes", "sections", "layout" },
             ["$defs"] = new Dictionary<string, object>
             {
                 ["sectionPlan"] = new Dictionary<string, object>
@@ -1867,6 +1876,9 @@ public sealed class OrchestratorAgent : IAgent
 
     private sealed class OutlinePayload
     {
+        [JsonPropertyName("title")]
+        public string? Title { get; set; }
+
         [JsonPropertyName("notes")]
         public string? Notes { get; set; }
 

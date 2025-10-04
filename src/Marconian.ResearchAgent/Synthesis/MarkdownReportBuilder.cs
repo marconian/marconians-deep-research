@@ -33,6 +33,10 @@ public sealed class MarkdownReportBuilder
 
         var builder = new StringBuilder();
 
+        string reportTitle = ResolveReportTitle(outline, rootQuestion);
+        builder.AppendLine($"# {reportTitle}");
+        builder.AppendLine();
+
         if (!string.IsNullOrWhiteSpace(outline.Notes))
         {
             builder.AppendLine($"> {outline.Notes.Trim()}");
@@ -41,18 +45,15 @@ public sealed class MarkdownReportBuilder
 
         if (outline.Layout.Count == 0)
         {
-            RenderFallbackReport(builder, rootQuestion, executiveSummary, draftMap.Values, findings, citationOrder, citationIndexMap);
-            sourcesRendered = true;
+            sourcesRendered = RenderFallbackReport(
+                builder,
+                executiveSummary,
+                draftMap.Values,
+                citationOrder,
+                citationIndexMap);
         }
         else
         {
-            bool hasHeadingLevelOne = outline.Layout.Any(node => string.Equals(node.HeadingType, "h1", StringComparison.OrdinalIgnoreCase));
-            if (!hasHeadingLevelOne)
-            {
-                builder.AppendLine($"# {rootQuestion}");
-                builder.AppendLine();
-            }
-
             foreach (var node in outline.Layout)
             {
                 RenderLayoutNode(
@@ -160,10 +161,9 @@ public sealed class MarkdownReportBuilder
     {
         string marker = headingType?.Trim().ToLowerInvariant() switch
         {
-            "h1" or "#" => "#",
-            "h2" or "##" => "##",
             "h3" or "###" => "###",
             "h4" or "####" => "####",
+            "h2" or "##" => "##",
             _ => "##"
         };
 
@@ -270,28 +270,19 @@ public sealed class MarkdownReportBuilder
         return index;
     }
 
-    private static void RenderFallbackReport(
+    private static bool RenderFallbackReport(
         StringBuilder builder,
-        string rootQuestion,
         string executiveSummary,
         IEnumerable<ReportSectionDraft> drafts,
-        IReadOnlyList<ResearchFinding> findings,
         List<SourceCitation> citationOrder,
         Dictionary<string, int> citationIndexMap)
     {
-        builder.AppendLine($"# {rootQuestion}");
-        builder.AppendLine();
-
-        builder.AppendLine("## Executive Summary");
-        if (string.IsNullOrWhiteSpace(executiveSummary))
+        if (!string.IsNullOrWhiteSpace(executiveSummary))
         {
-            builder.AppendLine("(No summary provided.)");
-        }
-        else
-        {
+            builder.AppendLine("## Executive Summary");
             builder.AppendLine(executiveSummary.Trim());
+            builder.AppendLine();
         }
-        builder.AppendLine();
 
         foreach (var draft in drafts)
         {
@@ -306,9 +297,30 @@ public sealed class MarkdownReportBuilder
             }
         }
 
+        if (citationOrder.Count == 0)
+        {
+            return false;
+        }
+
         builder.AppendLine("## Sources");
         builder.AppendLine();
         AppendCitations(builder, citationOrder, citationIndexMap);
+        return true;
+    }
+
+    private static string ResolveReportTitle(ReportOutline outline, string rootQuestion)
+    {
+        if (!string.IsNullOrWhiteSpace(outline.Title))
+        {
+            return outline.Title!.Trim();
+        }
+
+        if (!string.IsNullOrWhiteSpace(rootQuestion))
+        {
+            return rootQuestion.Trim();
+        }
+
+        return "Autonomous Research Report";
     }
 }
 
