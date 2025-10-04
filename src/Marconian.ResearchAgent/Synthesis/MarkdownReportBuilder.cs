@@ -21,118 +21,237 @@ public sealed class MarkdownReportBuilder
         sections ??= Array.Empty<ReportSectionDraft>();
         findings ??= Array.Empty<ResearchFinding>();
 
-        var sectionMap = sections.ToDictionary(section => section.SectionId, StringComparer.OrdinalIgnoreCase);
+        var draftMap = sections.ToDictionary(section => section.SectionId, StringComparer.OrdinalIgnoreCase);
+        var planMap = outline.Sections.ToDictionary(section => section.SectionId, StringComparer.OrdinalIgnoreCase);
+
+        var citationOrder = new List<SourceCitation>();
+        var citationIndexMap = new Dictionary<string, int>(StringComparer.Ordinal);
+        bool sourcesRendered = false;
 
         var builder = new StringBuilder();
-        builder.AppendLine($"# Research Report: {rootQuestion}");
-        builder.AppendLine();
-        builder.AppendLine("## Executive Summary");
-        builder.AppendLine(executiveSummary.Trim().Length == 0 ? "(No summary produced.)" : executiveSummary.Trim());
-        builder.AppendLine();
 
-        if (!string.IsNullOrWhiteSpace(outline.Notes) || outline.CoreSections.Count > 0 || outline.GeneralSections.Count > 0)
+        if (!string.IsNullOrWhiteSpace(outline.Notes))
         {
-            builder.AppendLine("## Outline Snapshot");
-            if (!string.IsNullOrWhiteSpace(outline.Notes))
-            {
-                builder.AppendLine(outline.Notes!.Trim());
-            }
-
-            foreach (var section in outline.CoreSections)
-            {
-                builder.AppendLine($"- Core: {section.Title} {(string.IsNullOrWhiteSpace(section.Summary) ? string.Empty : $"- {section.Summary!.Trim()}")}");
-            }
-
-            foreach (var section in outline.GeneralSections)
-            {
-                builder.AppendLine($"- General: {section.Title} {(string.IsNullOrWhiteSpace(section.Summary) ? string.Empty : $"- {section.Summary!.Trim()}")}");
-            }
-
+            builder.AppendLine($"> {outline.Notes.Trim()}");
             builder.AppendLine();
         }
 
-        builder.AppendLine("## Detailed Sections");
-
-        int citationIndex = 1;
-        var citationMap = new Dictionary<string, int>(StringComparer.Ordinal);
-
-        foreach (var plan in outline.CoreSections)
+        if (outline.Layout.Count == 0)
         {
-            if (!sectionMap.TryGetValue(plan.SectionId, out var draft))
-            {
-                continue;
-            }
-
-            AppendSection(builder, draft, citationMap, ref citationIndex);
+            RenderFallbackReport(builder, rootQuestion, executiveSummary, draftMap.Values, findings, citationOrder, citationIndexMap);
+            sourcesRendered = true;
         }
-
-        if (outline.GeneralSections.Count > 0)
+        else
         {
-            builder.AppendLine("## General Sections");
-            builder.AppendLine();
-
-            foreach (var plan in outline.GeneralSections)
+            bool hasHeadingLevelOne = outline.Layout.Any(node => string.Equals(node.HeadingType, "h1", StringComparison.OrdinalIgnoreCase));
+            if (!hasHeadingLevelOne)
             {
-                if (!sectionMap.TryGetValue(plan.SectionId, out var draft))
-                {
-                    continue;
-                }
-
-                AppendSection(builder, draft, citationMap, ref citationIndex);
-            }
-        }
-
-        if (findings.Count > 0)
-        {
-            builder.AppendLine("## Appendix: Findings Reference");
-            foreach (var finding in findings)
-            {
-                builder.AppendLine($"### {finding.Title}");
-                builder.AppendLine(finding.Content);
+                builder.AppendLine($"# {rootQuestion}");
                 builder.AppendLine();
             }
+
+            foreach (var node in outline.Layout)
+            {
+                RenderLayoutNode(
+                    node,
+                    builder,
+                    draftMap,
+                    planMap,
+                    findings,
+                    executiveSummary,
+                    citationOrder,
+                    citationIndexMap,
+                    ref sourcesRendered);
+            }
         }
 
-        if (citationMap.Count > 0)
+        if (!sourcesRendered && citationOrder.Count > 0)
         {
-            builder.AppendLine("## Citation Index");
-            foreach (var kvp in citationMap.OrderBy(k => k.Value))
-            {
-                builder.AppendLine($"[{kvp.Value}] {kvp.Key}");
-            }
+            builder.AppendLine("## Sources");
+            builder.AppendLine();
+            RegisterCitations(findings.SelectMany(f => f.Citations), citationOrder, citationIndexMap);
+            AppendCitations(builder, citationOrder, citationIndexMap);
         }
 
         return builder.ToString();
     }
 
-    private static void AppendSection(
+    private static void RenderLayoutNode(
+        ReportLayoutNode node,
         StringBuilder builder,
-        ReportSectionDraft draft,
-        Dictionary<string, int> citationMap,
-        ref int citationIndex)
+        IReadOnlyDictionary<string, ReportSectionDraft> draftMap,
+        IReadOnlyDictionary<string, ReportSectionPlan> planMap,
+        IReadOnlyList<ResearchFinding> findings,
+        string executiveSummary,
+        List<SourceCitation> citationOrder,
+        Dictionary<string, int> citationIndexMap,
+        ref bool sourcesRendered)
     {
-        builder.AppendLine($"### {draft.Title}");
-        builder.AppendLine(draft.Content.Trim());
-        builder.AppendLine();
-
-        if (draft.Citations.Count == 0)
+        if (string.IsNullOrWhiteSpace(node.Title))
         {
             return;
         }
 
-        builder.AppendLine("**Citations:**");
-        foreach (var citation in draft.Citations)
+        string heading = BuildHeading(node.HeadingType, node.Title);
+        if (!string.IsNullOrEmpty(heading))
         {
-            if (!citationMap.TryGetValue(citation.SourceId, out var index))
-            {
-                index = citationIndex++;
-                citationMap[citation.SourceId] = index;
-            }
-
-            builder.AppendLine($"- [{index}] {citation.Title ?? citation.SourceId} - {citation.Url}");
+            builder.AppendLine(heading);
+            builder.AppendLine();
         }
 
+        if (!string.IsNullOrWhiteSpace(node.SectionId) &&
+            draftMap.TryGetValue(node.SectionId, out var draft))
+        {
+            string trimmed = draft.Content.Trim();
+            if (trimmed.Length > 0)
+            {
+                builder.AppendLine(trimmed);
+                builder.AppendLine();
+            }
+
+            RegisterCitations(draft.Citations, citationOrder, citationIndexMap);
+        }
+        else if (!string.IsNullOrWhiteSpace(node.SectionId) &&
+                 planMap.TryGetValue(node.SectionId, out var plan) &&
+                 !string.IsNullOrWhiteSpace(plan.Summary))
+        {
+            builder.AppendLine(plan.Summary.Trim());
+            builder.AppendLine();
+        }
+        else if (string.IsNullOrWhiteSpace(node.SectionId) &&
+                 string.Equals(node.Title, "Executive Summary", StringComparison.OrdinalIgnoreCase) &&
+                 !string.IsNullOrWhiteSpace(executiveSummary))
+        {
+            builder.AppendLine(executiveSummary.Trim());
+            builder.AppendLine();
+        }
+        else if (string.IsNullOrWhiteSpace(node.SectionId) &&
+                 string.Equals(node.Title, "Sources", StringComparison.OrdinalIgnoreCase))
+        {
+            RegisterCitations(findings.SelectMany(f => f.Citations), citationOrder, citationIndexMap);
+            AppendCitations(builder, citationOrder, citationIndexMap);
+            builder.AppendLine();
+            sourcesRendered = true;
+        }
+
+        foreach (var child in node.Children)
+        {
+            RenderLayoutNode(
+                child,
+                builder,
+                draftMap,
+                planMap,
+                findings,
+                executiveSummary,
+                citationOrder,
+                citationIndexMap,
+                ref sourcesRendered);
+        }
+    }
+
+    private static string BuildHeading(string? headingType, string title)
+    {
+        string marker = headingType?.Trim().ToLowerInvariant() switch
+        {
+            "h1" or "#" => "#",
+            "h2" or "##" => "##",
+            "h3" or "###" => "###",
+            "h4" or "####" => "####",
+            _ => "##"
+        };
+
+        return $"{marker} {title.Trim()}";
+    }
+
+    private static void RegisterCitations(
+        IEnumerable<SourceCitation> citations,
+        List<SourceCitation> citationOrder,
+        Dictionary<string, int> citationIndexMap)
+    {
+        foreach (var citation in citations)
+        {
+            if (citation is null)
+            {
+                continue;
+            }
+
+            if (citationIndexMap.ContainsKey(citation.SourceId))
+            {
+                continue;
+            }
+
+            citationOrder.Add(citation);
+            citationIndexMap[citation.SourceId] = citationOrder.Count;
+        }
+    }
+
+    private static void AppendCitations(
+        StringBuilder builder,
+        List<SourceCitation> citationOrder,
+        Dictionary<string, int> citationIndexMap)
+    {
+        foreach (var citation in citationOrder)
+        {
+            if (!citationIndexMap.TryGetValue(citation.SourceId, out int index))
+            {
+                continue;
+            }
+
+            string displayTitle = string.IsNullOrWhiteSpace(citation.Title) ? citation.SourceId : citation.Title!.Trim();
+            string displayUrl = string.IsNullOrWhiteSpace(citation.Url) ? string.Empty : citation.Url.Trim();
+            string snippet = string.IsNullOrWhiteSpace(citation.Snippet) ? string.Empty : citation.Snippet.Trim();
+
+            var parts = new List<string> { displayTitle };
+            if (!string.IsNullOrEmpty(displayUrl))
+            {
+                parts.Add(displayUrl);
+            }
+
+            if (!string.IsNullOrEmpty(snippet))
+            {
+                parts.Add(snippet);
+            }
+
+            builder.AppendLine($"[{index}] {string.Join(" – ", parts)}");
+        }
+    }
+
+    private static void RenderFallbackReport(
+        StringBuilder builder,
+        string rootQuestion,
+        string executiveSummary,
+        IEnumerable<ReportSectionDraft> drafts,
+        IReadOnlyList<ResearchFinding> findings,
+        List<SourceCitation> citationOrder,
+        Dictionary<string, int> citationIndexMap)
+    {
+        builder.AppendLine($"# {rootQuestion}");
         builder.AppendLine();
+
+        builder.AppendLine("## Executive Summary");
+        if (string.IsNullOrWhiteSpace(executiveSummary))
+        {
+            builder.AppendLine("(No summary provided.)");
+        }
+        else
+        {
+            builder.AppendLine(executiveSummary.Trim());
+        }
+        builder.AppendLine();
+
+        foreach (var draft in drafts)
+        {
+            builder.AppendLine($"## {draft.Title}");
+            builder.AppendLine(draft.Content.Trim());
+            builder.AppendLine();
+
+            RegisterCitations(draft.Citations, citationOrder, citationIndexMap);
+        }
+
+        RegisterCitations(findings.SelectMany(f => f.Citations), citationOrder, citationIndexMap);
+        builder.AppendLine("## Sources");
+        builder.AppendLine();
+        AppendCitations(builder, citationOrder, citationIndexMap);
     }
 }
 

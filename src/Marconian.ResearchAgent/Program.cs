@@ -234,7 +234,28 @@ internal static class Program
                 out string? dumpDirectory,
                 out string? dumpType,
                 out int dumpLimit,
-                out string? diagnoseComputerUseArgument);
+                out string? diagnoseComputerUseArgument,
+                out string? reportOnlySessionId);
+
+            bool reportOnlyMode = !string.IsNullOrWhiteSpace(reportOnlySessionId);
+            if (reportOnlyMode)
+            {
+                if (!string.IsNullOrWhiteSpace(dumpSessionId) || !string.IsNullOrWhiteSpace(diagnoseComputerUseArgument))
+                {
+                    logger.LogError("--report-session cannot be combined with dump or diagnostic operations.");
+                    Console.Error.WriteLine("--report-session cannot be combined with dump or diagnostic operations.");
+                    return 1;
+                }
+
+                if (!string.IsNullOrWhiteSpace(resumeSessionId) &&
+                    !string.Equals(resumeSessionId, reportOnlySessionId, StringComparison.OrdinalIgnoreCase))
+                {
+                    logger.LogWarning("Ignoring --resume value {ResumeId} in favor of --report-session {ReportId}.", resumeSessionId, reportOnlySessionId);
+                }
+
+                resumeSessionId = reportOnlySessionId;
+                providedQuery = null;
+            }
 
             if (!string.IsNullOrWhiteSpace(dumpSessionId))
             {
@@ -467,11 +488,32 @@ internal static class Program
                 ContextHints = new List<string>()
             };
 
-            Console.WriteLine(sessionToResume is null
-                ? $"Starting new research session '{sessionId}' for objective: {researchObjective}"
-                : $"Resuming session '{sessionId}' (last status: {sessionToResume.Status}) for objective: {researchObjective}");
+            if (reportOnlyMode)
+            {
+                task.Parameters["reportOnly"] = "true";
+            }
 
-            logger.LogInformation("Executing research objective '{Objective}' for session {SessionId}.", researchObjective, sessionId);
+            string sessionMessage = sessionToResume is null
+                ? $"Starting new research session '{sessionId}' for objective: {researchObjective}"
+                : $"Resuming session '{sessionId}' (last status: {sessionToResume.Status}) for objective: {researchObjective}";
+
+            if (reportOnlyMode)
+            {
+                string status = sessionToResume?.Status ?? "unknown";
+                sessionMessage = $"Regenerating report for session '{sessionId}' (previous status: {status}) using stored findings.";
+                logger.LogInformation("Regenerating report for session {SessionId} using stored findings.", sessionId);
+            }
+
+            Console.WriteLine(sessionMessage);
+
+            if (reportOnlyMode)
+            {
+                logger.LogInformation("Regenerating report for session {SessionId} without new exploration.", sessionId);
+            }
+            else
+            {
+                logger.LogInformation("Executing research objective '{Objective}' for session {SessionId}.", researchObjective, sessionId);
+            }
 
             AgentExecutionResult executionResult = await orchestrator.ExecuteTaskAsync(task, cts.Token).ConfigureAwait(false);
 
@@ -691,7 +733,8 @@ internal static class Program
         out string? dumpDirectory,
         out string? dumpType,
         out int dumpLimit,
-        out string? diagnoseComputerUse)
+        out string? diagnoseComputerUse,
+        out string? reportSessionId)
     {
         resumeSessionId = null;
         query = null;
@@ -701,6 +744,7 @@ internal static class Program
         dumpType = null;
         dumpLimit = 200;
         diagnoseComputerUse = null;
+        reportSessionId = null;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -756,9 +800,15 @@ internal static class Program
                         diagnoseComputerUse = args[++i];
                     }
                     break;
+                case "--report-session":
+                    if (i + 1 < args.Length)
+                    {
+                        reportSessionId = args[++i];
+                    }
+                    break;
                 case "--help":
                 case "-h":
-                    Console.WriteLine("Usage: dotnet run [--query \"question\"] [--resume sessionId] [--reports path] [--dump-session sessionId [--dump-type type] [--dump-dir path] [--dump-limit N]] [--diagnose-computer-use \"url|objective\"]");
+                    Console.WriteLine("Usage: dotnet run [--query \"question\"] [--resume sessionId] [--reports path] [--dump-session sessionId [--dump-type type] [--dump-dir path] [--dump-limit N]] [--diagnose-computer-use \"url|objective\"] [--report-session sessionId]");
                     Environment.Exit(0);
                     break;
             }

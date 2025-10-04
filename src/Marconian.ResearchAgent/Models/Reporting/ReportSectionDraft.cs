@@ -10,7 +10,5 @@ public sealed class ReportSectionDraft
 
     public required string Content { get; set; }
 
-    public bool IsGeneral { get; init; }
-
     public List<SourceCitation> Citations { get; init; } = new();
 }

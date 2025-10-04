@@ -81,7 +81,8 @@ public sealed class OrchestratorAgent : IAgent
 
     public async Task<AgentExecutionResult> ExecuteTaskAsync(AgentTask task, CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(task);
+    ArgumentNullException.ThrowIfNull(task);
+    bool reportOnlyMode = task.Parameters.TryGetValue("reportOnly", out var reportOnlyValue) && IsAffirmative(reportOnlyValue);
         string diagramPath = Path.Combine(_reportsDirectory, $"flow_{task.ResearchSessionId}_{DateTimeOffset.UtcNow:yyyyMMdd_HHmmss}.md");
         _flowTracker?.ConfigureSession(task.ResearchSessionId, task.Objective ?? string.Empty, diagramPath);
 
@@ -100,31 +101,115 @@ public sealed class OrchestratorAgent : IAgent
             await _longTermMemoryManager.UpsertSessionStateAsync(task.ResearchSessionId, "planning", task.Objective, cancellationToken).ConfigureAwait(false);
 
             CurrentState = OrchestratorState.Planning;
-            plan = await GeneratePlanAsync(task, cancellationToken).ConfigureAwait(false);
-            if (plan is null)
+            if (reportOnlyMode)
             {
-                throw new InvalidOperationException("Failed to generate a research plan.");
+                var restoredFindings = await _longTermMemoryManager.RestoreFindingsAsync(
+                        task.ResearchSessionId,
+                        cancellationToken: cancellationToken)
+                    .ConfigureAwait(false);
+
+                if (restoredFindings.Count == 0)
+                {
+                    throw new InvalidOperationException("No stored findings are available for this session. Run a full research cycle before regenerating the report.");
+                }
+
+                plan = new ResearchPlan
+                {
+                    ResearchSessionId = task.ResearchSessionId,
+                    RootQuestion = task.Objective ?? string.Empty
+                };
+
+                var restoredPairs = new List<(ResearchBranchPlan Branch, ResearchFinding Finding)>(restoredFindings.Count);
+                foreach (var finding in restoredFindings)
+                {
+                    string question = string.IsNullOrWhiteSpace(finding.Title)
+                        ? "Restored finding"
+                        : finding.Title;
+
+                    var branchPlan = new ResearchBranchPlan
+                    {
+                        Question = question,
+                        Status = ResearchBranchStatus.Completed
+                    };
+
+                    plan.Branches.Add(branchPlan);
+                    restoredPairs.Add((branchPlan, finding));
+                }
+
+                _flowTracker?.RecordPlan(plan);
+
+                foreach (var (branch, finding) in restoredPairs)
+                {
+                    branchResults.Add(new ResearchBranchResult
+                    {
+                        BranchId = branch.BranchId,
+                        Finding = finding,
+                        ToolOutputs = new List<ToolExecutionResult>(),
+                        Notes = new List<string>
+                        {
+                            "Restored from stored findings for report regeneration."
+                        }
+                    });
+
+                    _flowTracker?.RecordBranchCompleted(branch.BranchId, true, "Restored from stored findings.");
+                    await _longTermMemoryManager.UpsertBranchStateAsync(
+                        task.ResearchSessionId,
+                        branch.BranchId,
+                        branch.Question,
+                        "restored",
+                        summary: finding.Title,
+                        cancellationToken: cancellationToken).ConfigureAwait(false);
+                }
+
+                _logger.LogInformation("Restored {FindingCount} stored finding(s) for session {SessionId}.", branchResults.Count, task.ResearchSessionId);
+                await _longTermMemoryManager.UpsertSessionStateAsync(
+                    task.ResearchSessionId,
+                    "report_regeneration_loaded",
+                    $"Restored findings: {branchResults.Count}",
+                    cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                plan = await GeneratePlanAsync(task, cancellationToken).ConfigureAwait(false);
+                if (plan is null)
+                {
+                    throw new InvalidOperationException("Failed to generate a research plan.");
+                }
+
+                _flowTracker?.RecordPlan(plan);
+                _logger.LogInformation("Generated research plan with {BranchCount} branches.", plan.Branches.Count);
+                await _longTermMemoryManager.UpsertSessionStateAsync(
+                    task.ResearchSessionId,
+                    "plan_ready",
+                    $"Branches: {plan.Branches.Count}",
+                    cancellationToken).ConfigureAwait(false);
             }
 
-            _flowTracker?.RecordPlan(plan);
-            _logger.LogInformation("Generated research plan with {BranchCount} branches.", plan.Branches.Count);
-            await _longTermMemoryManager.UpsertSessionStateAsync(
-                task.ResearchSessionId,
-                "plan_ready",
-                $"Branches: {plan.Branches.Count}",
-                cancellationToken).ConfigureAwait(false);
-
             CurrentState = OrchestratorState.ExecutingResearchBranches;
-            aggregationResult = await RunResearchWorkflowAsync(task, plan, branchResults, cancellationToken).ConfigureAwait(false);
+            if (!reportOnlyMode)
+            {
+                aggregationResult = await RunResearchWorkflowAsync(task, plan!, branchResults, cancellationToken).ConfigureAwait(false);
 
-            _logger.LogInformation("Completed research workflow with {FindingCount} aggregated findings across {BranchCount} branches.",
-                aggregationResult.Findings.Count,
-                branchResults.Count);
-            await _longTermMemoryManager.UpsertSessionStateAsync(
-                task.ResearchSessionId,
-                "branches_completed",
-                $"Branches: {branchResults.Count}",
-                cancellationToken).ConfigureAwait(false);
+                _logger.LogInformation("Completed research workflow with {FindingCount} aggregated findings across {BranchCount} branches.",
+                    aggregationResult.Findings.Count,
+                    branchResults.Count);
+                await _longTermMemoryManager.UpsertSessionStateAsync(
+                    task.ResearchSessionId,
+                    "branches_completed",
+                    $"Branches: {branchResults.Count}",
+                    cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                aggregationResult = _aggregator.Aggregate(branchResults);
+                _flowTracker?.RecordAggregation(aggregationResult.Findings.Count);
+                _logger.LogInformation("Aggregated {FindingCount} stored finding(s) for report regeneration.", aggregationResult.Findings.Count);
+                await _longTermMemoryManager.UpsertSessionStateAsync(
+                    task.ResearchSessionId,
+                    "report_regeneration_aggregated",
+                    $"Findings: {aggregationResult.Findings.Count}",
+                    cancellationToken).ConfigureAwait(false);
+            }
 
             CurrentState = OrchestratorState.SynthesizingResults;
             synthesis = await SynthesizeAsync(task, plan, aggregationResult, cancellationToken).ConfigureAwait(false);
@@ -595,7 +680,7 @@ public sealed class OrchestratorAgent : IAgent
             promptBuilder.AppendLine("(No findings available. Create a generic outline.)");
         }
 
-        promptBuilder.AppendLine("Design a structured outline for the final report. Identify core sections that directly answer the objective, and optional general sections for context (introduction, methodology, risks, open questions). Return JSON with fields: 'notes' (string), 'coreSections' (array), 'generalSections' (array). Each section must include 'title', 'summary', and 'supportingFindingIds' referencing the provided IDs. Use empty arrays when not needed. No extra commentary.");
+    promptBuilder.AppendLine("Design a structured outline for the final report. Return JSON with fields: 'notes' (string), 'sections' (array), and 'layout' (array). Each section entry must include 'sectionId', 'title', 'summary', and 'supportingFindingIds' referencing the provided IDs. The layout array should describe the Markdown heading hierarchy: every node must include 'nodeId', 'headingType' (h1-h4), 'title', optional 'sectionId' matching a section entry, and 'children' (array). Include an executive summary node, thematic body nodes, and a final sources node (without sectionId) so citations can be appended. No extra commentary.");
 
         var request = new OpenAiChatRequest(
             SystemPrompt: "You are a veteran research editor who designs structured report outlines grounded in provided evidence.",
@@ -625,18 +710,47 @@ public sealed class OrchestratorAgent : IAgent
         ArgumentNullException.ThrowIfNull(outline);
         var drafts = new List<ReportSectionDraft>();
         var findingMap = aggregationResult.Findings.ToDictionary(f => f.Id, StringComparer.OrdinalIgnoreCase);
+        var sectionLookup = outline.Sections.ToDictionary(section => section.SectionId, StringComparer.OrdinalIgnoreCase);
+        var draftedSectionIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var section in outline.CoreSections)
+        IEnumerable<string> EnumerateLayoutSections(IEnumerable<ReportLayoutNode> nodes)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var draft = await DraftSectionAsync(rootTask, section, findingMap, aggregationResult, synthesis, isGeneral: false, cancellationToken).ConfigureAwait(false);
-            drafts.Add(draft);
+            foreach (var node in nodes)
+            {
+                if (!string.IsNullOrWhiteSpace(node.SectionId))
+                {
+                    yield return node.SectionId!;
+                }
+
+                foreach (var childId in EnumerateLayoutSections(node.Children))
+                {
+                    yield return childId;
+                }
+            }
         }
 
-        foreach (var section in outline.GeneralSections)
+        foreach (string sectionId in EnumerateLayoutSections(outline.Layout))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var draft = await DraftSectionAsync(rootTask, section, findingMap, aggregationResult, synthesis, isGeneral: true, cancellationToken).ConfigureAwait(false);
+            if (!sectionLookup.TryGetValue(sectionId, out var sectionPlan))
+            {
+                continue;
+            }
+
+            var draft = await DraftSectionAsync(rootTask, sectionPlan, findingMap, aggregationResult, synthesis, cancellationToken).ConfigureAwait(false);
+            drafts.Add(draft);
+            draftedSectionIds.Add(sectionPlan.SectionId);
+        }
+
+        foreach (var section in outline.Sections)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!draftedSectionIds.Add(section.SectionId))
+            {
+                continue;
+            }
+
+            var draft = await DraftSectionAsync(rootTask, section, findingMap, aggregationResult, synthesis, cancellationToken).ConfigureAwait(false);
             drafts.Add(draft);
         }
 
@@ -648,9 +762,8 @@ public sealed class OrchestratorAgent : IAgent
         ReportSectionPlan sectionPlan,
         IReadOnlyDictionary<string, ResearchFinding> findingMap,
         ResearchAggregationResult aggregationResult,
-        string synthesis,
-        bool isGeneral,
-        CancellationToken cancellationToken)
+    string synthesis,
+    CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(sectionPlan);
 
@@ -728,7 +841,6 @@ public sealed class OrchestratorAgent : IAgent
             SectionId = sectionPlan.SectionId,
             Title = sectionPlan.Title,
             Content = content.Trim(),
-            IsGeneral = isGeneral,
             Citations = citations
         };
     }
@@ -885,7 +997,6 @@ public sealed class OrchestratorAgent : IAgent
         {
             Objective = objective
         };
-        var result = outline;
 
         if (string.IsNullOrWhiteSpace(response))
         {
@@ -910,28 +1021,35 @@ public sealed class OrchestratorAgent : IAgent
 
             if (!string.IsNullOrWhiteSpace(payload.Notes))
             {
-                result.Notes = payload.Notes!.Trim();
+                outline.Notes = payload.Notes!.Trim();
             }
 
-            var validIds = new HashSet<string>(findings.Select(f => f.Id), StringComparer.OrdinalIgnoreCase);
+            var validFindingIds = new HashSet<string>(findings.Select(f => f.Id), StringComparer.OrdinalIgnoreCase);
+            var declaredSectionIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            void AddSections(IEnumerable<OutlineSectionPayload>? sections, bool isGeneral)
+            if (payload.Sections is not null)
             {
-                if (sections is null)
-                {
-                    return;
-                }
-
-                foreach (var section in sections)
+                foreach (var section in payload.Sections)
                 {
                     if (section is null || string.IsNullOrWhiteSpace(section.Title))
                     {
                         continue;
                     }
 
+                    string sectionId = string.IsNullOrWhiteSpace(section.SectionId)
+                        ? Guid.NewGuid().ToString("N")
+                        : section.SectionId!.Trim();
+
+                    if (!declaredSectionIds.Add(sectionId))
+                    {
+                        sectionId = Guid.NewGuid().ToString("N");
+                        declaredSectionIds.Add(sectionId);
+                    }
+
                     var plan = new ReportSectionPlan
                     {
-                        Title = section.Title.Trim(),
+                        SectionId = sectionId,
+                        Title = section.Title!.Trim(),
                         Summary = string.IsNullOrWhiteSpace(section.Summary) ? null : section.Summary!.Trim()
                     };
 
@@ -939,28 +1057,87 @@ public sealed class OrchestratorAgent : IAgent
                     {
                         foreach (string id in section.SupportingFindingIds)
                         {
-                            if (!string.IsNullOrWhiteSpace(id) && validIds.Contains(id))
+                            if (!string.IsNullOrWhiteSpace(id) && validFindingIds.Contains(id))
                             {
                                 plan.SupportingFindingIds.Add(id);
                             }
                         }
                     }
 
-                    if (isGeneral)
-                    {
-                        result.GeneralSections.Add(plan);
-                    }
-                    else
-                    {
-                        result.CoreSections.Add(plan);
-                    }
+                    outline.Sections.Add(plan);
                 }
             }
 
-            AddSections(payload.CoreSections, isGeneral: false);
-            AddSections(payload.GeneralSections, isGeneral: true);
+            static string NormalizeHeading(string? heading)
+            {
+                if (string.IsNullOrWhiteSpace(heading))
+                {
+                    return "h2";
+                }
 
-            return result.CoreSections.Count > 0 || result.GeneralSections.Count > 0 || !string.IsNullOrWhiteSpace(result.Notes);
+                return heading.Trim().ToLowerInvariant() switch
+                {
+                    "h1" or "#" => "h1",
+                    "h3" or "###" => "h3",
+                    "h4" or "####" => "h4",
+                    _ => "h2"
+                };
+            }
+
+            List<ReportLayoutNode> ConvertNodes(List<OutlineLayoutNodePayload>? nodes)
+            {
+                var list = new List<ReportLayoutNode>();
+                if (nodes is null)
+                {
+                    return list;
+                }
+
+                foreach (var node in nodes)
+                {
+                    if (node is null || string.IsNullOrWhiteSpace(node.Title))
+                    {
+                        continue;
+                    }
+
+                    string nodeId = string.IsNullOrWhiteSpace(node.NodeId)
+                        ? Guid.NewGuid().ToString("N")
+                        : node.NodeId!.Trim();
+
+                    string? sectionId = string.IsNullOrWhiteSpace(node.SectionId)
+                        ? null
+                        : node.SectionId!.Trim();
+
+                    if (sectionId is not null && !declaredSectionIds.Contains(sectionId))
+                    {
+                        sectionId = null;
+                    }
+
+                    var layoutNode = new ReportLayoutNode
+                    {
+                        NodeId = nodeId,
+                        HeadingType = NormalizeHeading(node.HeadingType),
+                        Title = node.Title!.Trim(),
+                        SectionId = sectionId
+                    };
+
+                    var children = ConvertNodes(node.Children);
+                    if (children.Count > 0)
+                    {
+                        layoutNode.Children.AddRange(children);
+                    }
+
+                    list.Add(layoutNode);
+                }
+
+                return list;
+            }
+
+            if (payload.Layout is not null)
+            {
+                outline.Layout.AddRange(ConvertNodes(payload.Layout));
+            }
+
+            return outline.Layout.Count > 0;
         }
         catch (JsonException ex)
         {
@@ -977,48 +1154,103 @@ public sealed class OrchestratorAgent : IAgent
             Notes = "Fallback outline generated due to parsing issues."
         };
 
+        string rootTitle = string.IsNullOrWhiteSpace(objective) ? "Autonomous Research Report" : objective.Trim();
+
+        var summaryPlan = new ReportSectionPlan
+        {
+            Title = "Executive Summary",
+            Summary = "Summarize the overall findings, implications, and recommended next steps."
+        };
+        outline.Sections.Add(summaryPlan);
+
+        var rootNode = new ReportLayoutNode
+        {
+            HeadingType = "h1",
+            Title = rootTitle
+        };
+
+        var summaryNode = new ReportLayoutNode
+        {
+            HeadingType = "h2",
+            Title = "Executive Summary",
+            SectionId = summaryPlan.SectionId
+        };
+        rootNode.Children.Add(summaryNode);
+
         if (findings.Count == 0)
         {
-            outline.CoreSections.Add(new ReportSectionPlan
+            var overviewPlan = new ReportSectionPlan
             {
                 Title = "Key Insights",
                 Summary = "Summarize the research objective, key hypotheses, and next steps."
-            });
-            outline.GeneralSections.Add(new ReportSectionPlan
-            {
-                Title = "Recommended Next Actions",
-                Summary = "Outline pragmatic follow-up research tasks to fill evidence gaps."
-            });
-
-            return outline;
-        }
-
-        foreach (var finding in findings.Take(4))
-        {
-            var plan = new ReportSectionPlan
-            {
-                Title = finding.Title,
-                Summary = finding.Content.Length > 200 ? finding.Content[..200] + "…" : finding.Content
             };
-            plan.SupportingFindingIds.Add(finding.Id);
-            outline.CoreSections.Add(plan);
-        }
+            outline.Sections.Add(overviewPlan);
 
-        if (findings.Count > 4)
+            rootNode.Children.Add(new ReportLayoutNode
+            {
+                HeadingType = "h2",
+                Title = "Key Insights",
+                SectionId = overviewPlan.SectionId
+            });
+        }
+        else
         {
-            var plan = new ReportSectionPlan
+            var bodyNode = new ReportLayoutNode
             {
-                Title = "Broader Context",
-                Summary = "Highlight secondary findings, risks, or adjacent themes uncovered during research."
+                HeadingType = "h2",
+                Title = "Key Findings"
             };
-            foreach (var id in findings.Skip(4).Select(f => f.Id).Take(5))
+
+            foreach (var finding in findings.Take(4))
             {
-                plan.SupportingFindingIds.Add(id);
+                var plan = new ReportSectionPlan
+                {
+                    Title = finding.Title,
+                    Summary = finding.Content.Length > 200 ? finding.Content[..200] + "…" : finding.Content
+                };
+                plan.SupportingFindingIds.Add(finding.Id);
+                outline.Sections.Add(plan);
+
+                bodyNode.Children.Add(new ReportLayoutNode
+                {
+                    HeadingType = "h3",
+                    Title = finding.Title,
+                    SectionId = plan.SectionId
+                });
             }
 
-            outline.GeneralSections.Add(plan);
+            if (findings.Count > 4)
+            {
+                var contextPlan = new ReportSectionPlan
+                {
+                    Title = "Broader Context",
+                    Summary = "Highlight secondary findings, risks, or adjacent themes uncovered during research."
+                };
+
+                foreach (var id in findings.Skip(4).Select(f => f.Id).Take(5))
+                {
+                    contextPlan.SupportingFindingIds.Add(id);
+                }
+
+                outline.Sections.Add(contextPlan);
+                bodyNode.Children.Add(new ReportLayoutNode
+                {
+                    HeadingType = "h3",
+                    Title = contextPlan.Title,
+                    SectionId = contextPlan.SectionId
+                });
+            }
+
+            rootNode.Children.Add(bodyNode);
         }
 
+        rootNode.Children.Add(new ReportLayoutNode
+        {
+            HeadingType = "h2",
+            Title = "Sources"
+        });
+
+        outline.Layout.Add(rootNode);
         return outline;
     }
 
@@ -1063,6 +1295,19 @@ public sealed class OrchestratorAgent : IAgent
         }
     }
 
+    private static bool IsAffirmative(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        return value.Equals("true", StringComparison.OrdinalIgnoreCase) ||
+               value.Equals("1", StringComparison.OrdinalIgnoreCase) ||
+               value.Equals("yes", StringComparison.OrdinalIgnoreCase) ||
+               value.Equals("y", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static List<string> ParseQuestions(string response)
     {
         var questions = new List<string>();
@@ -1095,15 +1340,18 @@ public sealed class OrchestratorAgent : IAgent
         [JsonPropertyName("notes")]
         public string? Notes { get; set; }
 
-        [JsonPropertyName("coreSections")]
-        public List<OutlineSectionPayload>? CoreSections { get; set; }
+        [JsonPropertyName("sections")]
+        public List<OutlineSectionPayload>? Sections { get; set; }
 
-        [JsonPropertyName("generalSections")]
-        public List<OutlineSectionPayload>? GeneralSections { get; set; }
+        [JsonPropertyName("layout")]
+        public List<OutlineLayoutNodePayload>? Layout { get; set; }
     }
 
     private sealed class OutlineSectionPayload
     {
+        [JsonPropertyName("sectionId")]
+        public string? SectionId { get; set; }
+
         [JsonPropertyName("title")]
         public string? Title { get; set; }
 
@@ -1112,6 +1360,24 @@ public sealed class OrchestratorAgent : IAgent
 
         [JsonPropertyName("supportingFindingIds")]
         public List<string>? SupportingFindingIds { get; set; }
+    }
+
+    private sealed class OutlineLayoutNodePayload
+    {
+        [JsonPropertyName("nodeId")]
+        public string? NodeId { get; set; }
+
+        [JsonPropertyName("headingType")]
+        public string? HeadingType { get; set; }
+
+        [JsonPropertyName("title")]
+        public string? Title { get; set; }
+
+        [JsonPropertyName("sectionId")]
+        public string? SectionId { get; set; }
+
+        [JsonPropertyName("children")]
+        public List<OutlineLayoutNodePayload>? Children { get; set; }
     }
 
     private sealed class ContinuationDecisionPayload

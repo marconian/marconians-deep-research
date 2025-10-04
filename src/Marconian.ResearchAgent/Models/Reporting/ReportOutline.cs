@@ -11,9 +11,9 @@ public sealed class ReportOutline
 
     public string? Notes { get; set; }
 
-    public List<ReportSectionPlan> CoreSections { get; init; } = new();
+    public List<ReportSectionPlan> Sections { get; init; } = new();
 
-    public List<ReportSectionPlan> GeneralSections { get; init; } = new();
+    public List<ReportLayoutNode> Layout { get; init; } = new();
 }
 
 public sealed class ReportSectionPlan
@@ -25,4 +25,17 @@ public sealed class ReportSectionPlan
     public string? Summary { get; set; }
 
     public List<string> SupportingFindingIds { get; init; } = new();
+}
+
+public sealed class ReportLayoutNode
+{
+    public string NodeId { get; init; } = Guid.NewGuid().ToString("N");
+
+    public string HeadingType { get; init; } = "h2";
+
+    public required string Title { get; init; }
+
+    public string? SectionId { get; init; }
+
+    public List<ReportLayoutNode> Children { get; init; } = new();
 }

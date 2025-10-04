@@ -97,6 +97,103 @@ public sealed class LongTermMemoryManager
         return records.First();
     }
 
+    public async Task<IReadOnlyList<ResearchFinding>> RestoreFindingsAsync(
+        string researchSessionId,
+        string memoryType = "research_finding",
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(researchSessionId))
+        {
+            return Array.Empty<ResearchFinding>();
+        }
+
+        IReadOnlyList<MemoryRecord> records = await _cosmosMemoryService
+            .QueryBySessionAsync(researchSessionId, 2000, cancellationToken)
+            .ConfigureAwait(false);
+
+        var filtered = records
+            .Where(record => string.Equals(record.Type, memoryType, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        if (filtered.Count == 0)
+        {
+            return Array.Empty<ResearchFinding>();
+        }
+
+        var grouped = new Dictionary<string, List<MemoryRecord>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var record in filtered)
+        {
+            string key = record.Metadata.TryGetValue("chunkParentId", out var parentId) && !string.IsNullOrWhiteSpace(parentId)
+                ? parentId
+                : record.Id;
+
+            if (!grouped.TryGetValue(key, out var bucket))
+            {
+                bucket = new List<MemoryRecord>();
+                grouped[key] = bucket;
+            }
+
+            bucket.Add(record);
+        }
+
+        var results = new List<(ResearchFinding Finding, DateTimeOffset Timestamp)>(grouped.Count);
+
+        foreach (var entry in grouped)
+        {
+            static int ResolveChunkIndex(MemoryRecord record)
+            {
+                if (record.Metadata.TryGetValue("chunkIndex", out var chunkValue) &&
+                    int.TryParse(chunkValue, NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsed))
+                {
+                    return parsed;
+                }
+
+                return 0;
+            }
+
+            var ordered = entry.Value
+                .OrderBy(record => ResolveChunkIndex(record))
+                .ThenBy(record => record.CreatedAtUtc)
+                .ToList();
+
+            var primary = ordered[0];
+            string combinedContent = string.Join(
+                Environment.NewLine + Environment.NewLine,
+                ordered.Select(record => record.Content).Where(static chunk => !string.IsNullOrWhiteSpace(chunk)));
+
+            string title = primary.Metadata.TryGetValue("title", out var storedTitle) && !string.IsNullOrWhiteSpace(storedTitle)
+                ? storedTitle!
+                : entry.Key;
+
+            double confidence = primary.Metadata.TryGetValue("confidence", out var storedConfidence) &&
+                double.TryParse(storedConfidence, NumberStyles.Float, CultureInfo.InvariantCulture, out double parsedConfidence)
+                    ? parsedConfidence
+                    : 0.5d;
+
+            var citations = primary.Sources
+                .Select(source => new SourceCitation(source.SourceId, source.Title, source.Url, source.Snippet))
+                .GroupBy(citation => citation.SourceId, StringComparer.OrdinalIgnoreCase)
+                .Select(group => group.First())
+                .ToList();
+
+            var finding = new ResearchFinding
+            {
+                Id = entry.Key,
+                Title = title,
+                Content = combinedContent,
+                Citations = citations,
+                Confidence = confidence
+            };
+
+            results.Add((finding, primary.CreatedAtUtc));
+        }
+
+        return results
+            .OrderByDescending(tuple => tuple.Timestamp)
+            .Select(tuple => tuple.Finding)
+            .ToList();
+    }
+
     public Task<IReadOnlyList<MemoryRecord>> GetRecentMemoriesAsync(string researchSessionId, int limit, CancellationToken cancellationToken = default)
         => _cosmosMemoryService.QueryBySessionAsync(researchSessionId, limit, cancellationToken);
 

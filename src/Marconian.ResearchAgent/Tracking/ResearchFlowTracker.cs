@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
+using System.Linq;
 using Marconian.ResearchAgent.Models.Reporting;
 using Marconian.ResearchAgent.Models.Research;
 using Marconian.ResearchAgent.Models.Tools;
@@ -222,7 +223,7 @@ public sealed class ResearchFlowTracker
             }
 
             _outlineSections.Clear();
-            string label = $"Outline ready\nCore: {outline.CoreSections.Count}\nGeneral: {outline.GeneralSections.Count}";
+            string label = $"Outline ready\nSections: {outline.Sections.Count}";
             if (!string.IsNullOrWhiteSpace(outline.Notes))
             {
                 label += $"\n{outline.Notes!.Trim().Truncate(80)}";
@@ -232,14 +233,10 @@ public sealed class ResearchFlowTracker
             string? sourceId = _synthesisNode?.Id ?? _planNode?.Id ?? _sessionNode?.Id;
             AddEdgeUnsafe(sourceId, _outlineNode.Id, "outline");
 
-            foreach (var section in outline.CoreSections)
+            var planMap = outline.Sections.ToDictionary(section => section.SectionId, StringComparer.OrdinalIgnoreCase);
+            foreach (var node in outline.Layout)
             {
-                AddOutlineSectionUnsafe(section, isGeneral: false);
-            }
-
-            foreach (var section in outline.GeneralSections)
-            {
-                AddOutlineSectionUnsafe(section, isGeneral: true);
+                RegisterOutlineLayoutNodeUnsafe(node, _outlineNode.Id, planMap);
             }
 
             FlushUnsafe();
@@ -257,7 +254,7 @@ public sealed class ResearchFlowTracker
                 return;
             }
 
-            string label = (draft.IsGeneral ? "General draft" : "Core draft") + $"\n{draft.Title}";
+            string label = $"Section draft\n{draft.Title}";
             string? trimmed = draft.Content?.Trim();
             if (!string.IsNullOrWhiteSpace(trimmed))
             {
@@ -461,6 +458,58 @@ public sealed class ResearchFlowTracker
         string? sourceId = _outlineNode?.Id ?? _planNode?.Id ?? _sessionNode?.Id;
         AddEdgeUnsafe(sourceId, node.Id, isGeneral ? "general" : "core");
         _outlineSections[section.SectionId] = node;
+    }
+
+    private void RegisterOutlineLayoutNodeUnsafe(ReportLayoutNode layoutNode, string parentNodeId, IReadOnlyDictionary<string, ReportSectionPlan> planMap)
+    {
+        if (string.IsNullOrEmpty(parentNodeId))
+        {
+            return;
+        }
+
+        string headingTag = string.IsNullOrWhiteSpace(layoutNode.HeadingType)
+            ? "h2"
+            : layoutNode.HeadingType.Trim();
+        string headingLabel = headingTag.ToUpperInvariant();
+
+        ReportSectionPlan? sectionPlan = null;
+        if (!string.IsNullOrEmpty(layoutNode.SectionId))
+        {
+            planMap.TryGetValue(layoutNode.SectionId, out sectionPlan);
+        }
+
+        bool isSection = sectionPlan is not null;
+        string label = isSection
+            ? $"Section {headingLabel}\n{layoutNode.Title}"
+            : $"{headingLabel} group\n{layoutNode.Title}";
+
+        if (isSection && !string.IsNullOrWhiteSpace(sectionPlan!.Summary))
+        {
+            label += $"\n{sectionPlan.Summary!.Trim().Truncate(120)}";
+        }
+
+        if (isSection && sectionPlan!.SupportingFindingIds.Count > 0)
+        {
+            label += $"\nFindings: {sectionPlan.SupportingFindingIds.Count}";
+        }
+
+        var node = CreateNodeUnsafe(label, isSection ? NodeShape.Rectangle : NodeShape.Diamond);
+        AddEdgeUnsafe(parentNodeId, node.Id, isSection ? "section" : "group");
+
+        if (isSection && layoutNode.SectionId is { Length: > 0 })
+        {
+            _outlineSections[layoutNode.SectionId] = node;
+        }
+
+        if (layoutNode.Children is null || layoutNode.Children.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var child in layoutNode.Children)
+        {
+            RegisterOutlineLayoutNodeUnsafe(child, node.Id, planMap);
+        }
     }
 
     private static string Sanitize(string value)
