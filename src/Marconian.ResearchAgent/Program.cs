@@ -73,7 +73,9 @@ internal static class Program
         };
         Console.CancelKeyPress += cancelHandler;
 
-        ComputerUseSearchService? computerUseSearchService = null;
+    ComputerUseSearchService? computerUseSearchService = null;
+    PooledComputerUseExplorer? computerUseExplorerPool = null;
+    Func<ComputerUseSearchService>? computerUseServiceFactory = null;
         string? computerUseDisabledReason = null;
 
         ResearchFlowTracker? flowTracker = null;
@@ -137,12 +139,14 @@ internal static class Program
 
                 if (readiness.IsReady)
                 {
-                    computerUseSearchService = new ComputerUseSearchService(
+                    computerUseServiceFactory = () => new ComputerUseSearchService(
                         settings.AzureOpenAiEndpoint,
                         settings.AzureOpenAiApiKey,
                         settings.AzureOpenAiComputerUseDeployment!,
                         sharedHttpClient,
                         loggerFactory.CreateLogger<ComputerUseSearchService>());
+
+                    computerUseSearchService = computerUseServiceFactory();
                     logger.LogInformation(
                         "Computer-use automation is ready (Mode={Mode}, Provider={Provider}).",
                         settings.ComputerUseMode,
@@ -196,36 +200,6 @@ internal static class Program
                 googleCredentialsAvailable
                     ? WebSearchProvider.GoogleApi
                     : WebSearchProvider.ComputerUse;
-
-            Func<IEnumerable<ITool>> toolFactory = () =>
-            {
-                var tools = new List<ITool>
-                {
-                    new WebSearchTool(
-                        settings.GoogleApiKey,
-                        settings.GoogleSearchEngineId,
-                        cacheService,
-                        sharedHttpClient,
-                        loggerFactory.CreateLogger<WebSearchTool>(),
-                        settings.WebSearchProvider,
-                        computerUseSearchService,
-                        fallbackProvider: fallbackProvider,
-                        computerUseDisabledReason: computerUseDisabledReason,
-                        computerUseMode: settings.ComputerUseMode),
-                    new WebScraperTool(cacheService, sharedHttpClient, loggerFactory.CreateLogger<WebScraperTool>()),
-                    new FileReaderTool(fileRegistryService, documentService, sharedHttpClient, loggerFactory.CreateLogger<FileReaderTool>()),
-                    new ImageReaderTool(fileRegistryService, openAiService, settings.AzureOpenAiVisionDeployment, sharedHttpClient, loggerFactory.CreateLogger<ImageReaderTool>())
-                };
-
-                if (computerUseSearchService is not null)
-                {
-                    tools.Add(new ComputerUseNavigatorTool(
-                        computerUseSearchService,
-                        loggerFactory.CreateLogger<ComputerUseNavigatorTool>()));
-                }
-
-                return tools;
-            };
 
             ParseCommandLine(
                 args,
@@ -400,6 +374,46 @@ internal static class Program
             var orchestratorOptions = configuration.GetSection("Orchestrator").Get<OrchestratorOptions>() ?? new OrchestratorOptions();
             var researcherOptions = configuration.GetSection("Researcher").Get<ResearcherOptions>() ?? new ResearcherOptions();
             var shortTermOptions = configuration.GetSection("ShortTermMemory").Get<ShortTermMemoryOptions>() ?? new ShortTermMemoryOptions();
+
+            if (computerUseServiceFactory is not null)
+            {
+                int navigatorParallelism = Math.Max(1, researcherOptions.Parallelism?.NavigatorDegreeOfParallelism ?? 1);
+                computerUseExplorerPool = new PooledComputerUseExplorer(
+                    navigatorParallelism,
+                    () => computerUseServiceFactory(),
+                    loggerFactory.CreateLogger<PooledComputerUseExplorer>());
+            }
+
+            Func<IEnumerable<ITool>> toolFactory = () =>
+            {
+                var tools = new List<ITool>
+                {
+                    new WebSearchTool(
+                        settings.GoogleApiKey,
+                        settings.GoogleSearchEngineId,
+                        cacheService,
+                        sharedHttpClient,
+                        loggerFactory.CreateLogger<WebSearchTool>(),
+                        settings.WebSearchProvider,
+                        computerUseSearchService,
+                        fallbackProvider: fallbackProvider,
+                        computerUseDisabledReason: computerUseDisabledReason,
+                        computerUseMode: settings.ComputerUseMode),
+                    new WebScraperTool(cacheService, sharedHttpClient, loggerFactory.CreateLogger<WebScraperTool>()),
+                    new FileReaderTool(fileRegistryService, documentService, sharedHttpClient, loggerFactory.CreateLogger<FileReaderTool>()),
+                    new ImageReaderTool(fileRegistryService, openAiService, settings.AzureOpenAiVisionDeployment, sharedHttpClient, loggerFactory.CreateLogger<ImageReaderTool>())
+                };
+
+                IComputerUseExplorer? navigatorExplorer = computerUseExplorerPool ?? (IComputerUseExplorer?)computerUseSearchService;
+                if (navigatorExplorer is not null)
+                {
+                    tools.Add(new ComputerUseNavigatorTool(
+                        navigatorExplorer,
+                        loggerFactory.CreateLogger<ComputerUseNavigatorTool>()));
+                }
+
+                return tools;
+            };
 
             var orchestrator = new OrchestratorAgent(
                 openAiService,
@@ -577,6 +591,11 @@ internal static class Program
 
         finally
         {
+            if (computerUseExplorerPool is not null)
+            {
+                await computerUseExplorerPool.DisposeAsync().ConfigureAwait(false);
+            }
+
             if (computerUseSearchService is not null)
             {
                 await computerUseSearchService.DisposeAsync().ConfigureAwait(false);
