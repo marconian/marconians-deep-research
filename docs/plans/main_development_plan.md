@@ -116,9 +116,14 @@
 
 ## M18 - CAPTCHA Mitigation & Stealth Browser Posture
 - [ ] Integrate Playwright stealth configuration (navigator.webdriver patches, realistic UA/timezone/viewport, persistent contexts, manual launch flags) in computer-use services per stealth blueprint.
+	- [ ] Check in hardened Chromium launch profile hooked through `ComputerUseBrowserFactory` with locale/timezone alignment to proxy region.
 - [ ] Evaluate stealth tooling options (soenneker.playwrights.extensions.stealth, Undetected.Playwright, rebrowser patches) and record decisions + trade-offs.
+	- [ ] Run comparative diagnostics against `https://bot.sannysoft.com/` to quantify coverage per library and capture screenshots/logs.
+	- [ ] Document reapplication steps if `rebrowser-patches` are adopted post-Playwright upgrade.
 - [ ] Introduce human-like cursor/typing behavior simulation for CUA-issued actions with configurable parameters.
+	- [ ] Design injection point in `ComputerUseSearchService` to route CUA commands through motion and typing simulators before execution.
 - [ ] Implement rotating residential proxy and TLS/JA3 alignment strategy to reduce bot fingerprint discrepancies.
+	- [ ] Extend `Settings` + configuration templates with residential proxy provider credentials and failover rules.
 - [ ] Detect CAPTCHA interruptions and surface dedicated recovery events with retry guidance.
 - [ ] Document mitigation strategy and add tests validating fallback behavior when CAPTCHA is encountered.
 
