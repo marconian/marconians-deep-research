@@ -8,6 +8,7 @@ using Marconian.ResearchAgent.Configuration;
 using Marconian.ResearchAgent.Memory;
 using Marconian.ResearchAgent.Models.Agents;
 using Marconian.ResearchAgent.Models.Memory;
+using Marconian.ResearchAgent.Models.Tools;
 using Marconian.ResearchAgent.Services.Caching;
 using Marconian.ResearchAgent.Services.ComputerUse;
 using Marconian.ResearchAgent.Services.Cosmos;
@@ -232,7 +233,8 @@ internal static class Program
                 out string? dumpSessionId,
                 out string? dumpDirectory,
                 out string? dumpType,
-                out int dumpLimit);
+                out int dumpLimit,
+                out string? diagnoseComputerUseArgument);
 
             if (!string.IsNullOrWhiteSpace(dumpSessionId))
             {
@@ -261,6 +263,110 @@ internal static class Program
                 ? defaultReportDirectory
                 : Path.GetFullPath(reportDirectoryArgument);
             Directory.CreateDirectory(reportDirectory);
+
+            if (!string.IsNullOrWhiteSpace(diagnoseComputerUseArgument))
+            {
+                if (computerUseSearchService is null)
+                {
+                    string reason = computerUseDisabledReason ?? "Computer-use automation is not available in the current configuration.";
+                    logger.LogError("Cannot run computer-use diagnosis: {Reason}", reason);
+                    Console.Error.WriteLine($"Cannot run computer-use diagnosis: {reason}");
+                    return 1;
+                }
+
+                string trimmed = diagnoseComputerUseArgument.Trim();
+                string[] parts = trimmed.Split('|', 2, StringSplitOptions.TrimEntries);
+                string url = parts.Length > 0 ? parts[0] : string.Empty;
+                string? objective = parts.Length > 1 ? parts[1] : null;
+
+                if (string.IsNullOrWhiteSpace(url))
+                {
+                    logger.LogError("Invalid --diagnose-computer-use argument. Provide a URL followed by an optional objective separated by a pipe (|).");
+                    Console.Error.WriteLine("Invalid --diagnose-computer-use argument. Expected format: \"https://example.com|optional objective\"");
+                    return 1;
+                }
+
+                Console.WriteLine($"Running computer-use diagnosis for: {url}");
+                if (!string.IsNullOrWhiteSpace(objective))
+                {
+                    Console.WriteLine($"Objective: {objective}");
+                }
+
+                try
+                {
+                    ComputerUseExplorationResult exploration = await computerUseSearchService
+                        .ExploreAsync(url, objective, cts.Token)
+                        .ConfigureAwait(false);
+
+                    Console.WriteLine();
+                    Console.WriteLine("# Computer-use Exploration Summary");
+                    Console.WriteLine($"Requested URL : {exploration.RequestedUrl}");
+                    if (!string.IsNullOrWhiteSpace(exploration.FinalUrl))
+                    {
+                        Console.WriteLine($"Final URL      : {exploration.FinalUrl}");
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(exploration.PageTitle))
+                    {
+                        Console.WriteLine($"Page Title     : {exploration.PageTitle}");
+                    }
+
+                    Console.WriteLine();
+                    string summary = BuildExplorationSummary(exploration);
+                    Console.WriteLine(summary);
+
+                    if (exploration.FlaggedResources.Count > 0)
+                    {
+                        Console.WriteLine();
+                        Console.WriteLine("Flagged Resources:");
+                        foreach (FlaggedResource resource in exploration.FlaggedResources)
+                        {
+                            Console.WriteLine($" - [{resource.Type}] {resource.Title ?? resource.Url}");
+                            if (!string.IsNullOrWhiteSpace(resource.Url))
+                            {
+                                Console.WriteLine($"   URL: {resource.Url}");
+                            }
+                            if (!string.IsNullOrWhiteSpace(resource.Notes))
+                            {
+                                Console.WriteLine($"   Notes: {resource.Notes}");
+                            }
+                        }
+                    }
+
+                    if (exploration.Transcript.Count > 0)
+                    {
+                        Console.WriteLine();
+                        Console.WriteLine("Recent Transcript:");
+                        foreach (string segment in exploration.Transcript.TakeLast(5))
+                        {
+                            if (!string.IsNullOrWhiteSpace(segment))
+                            {
+                                Console.WriteLine($" - {segment.Trim()}");
+                            }
+                        }
+                    }
+
+                    Console.WriteLine();
+                    Console.WriteLine("Diagnosis complete. Detailed timeline saved under debug/computer-use.");
+                    return 0;
+                }
+                catch (ComputerUseSearchBlockedException blocked)
+                {
+                    logger.LogError(blocked, "Computer-use diagnosis blocked for {Url}", url);
+                    Console.Error.WriteLine($"Computer-use exploration blocked: {blocked.Message}");
+                    return 1;
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "Computer-use diagnosis failed for {Url}", url);
+                    Console.Error.WriteLine($"Computer-use exploration failed: {ex.Message}");
+                    return 1;
+                }
+            }
 
             var orchestrator = new OrchestratorAgent(
                 openAiService,
@@ -584,7 +690,8 @@ internal static class Program
         out string? dumpSessionId,
         out string? dumpDirectory,
         out string? dumpType,
-        out int dumpLimit)
+        out int dumpLimit,
+        out string? diagnoseComputerUse)
     {
         resumeSessionId = null;
         query = null;
@@ -593,6 +700,7 @@ internal static class Program
         dumpDirectory = null;
         dumpType = null;
         dumpLimit = 200;
+        diagnoseComputerUse = null;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -642,13 +750,52 @@ internal static class Program
                         dumpLimit = parsedLimit;
                     }
                     break;
+                case "--diagnose-computer-use":
+                    if (i + 1 < args.Length)
+                    {
+                        diagnoseComputerUse = args[++i];
+                    }
+                    break;
                 case "--help":
                 case "-h":
-                    Console.WriteLine("Usage: dotnet run [--query \"question\"] [--resume sessionId] [--reports path] [--dump-session sessionId [--dump-type type] [--dump-dir path] [--dump-limit N]]");
+                    Console.WriteLine("Usage: dotnet run [--query \"question\"] [--resume sessionId] [--reports path] [--dump-session sessionId [--dump-type type] [--dump-dir path] [--dump-limit N]] [--diagnose-computer-use \"url|objective\"]");
                     Environment.Exit(0);
                     break;
             }
         }
+    }
+
+    private static string BuildExplorationSummary(ComputerUseExplorationResult exploration)
+    {
+        if (!string.IsNullOrWhiteSpace(exploration.Summary))
+        {
+            return exploration.Summary!;
+        }
+
+        if (exploration.Transcript.Count == 0)
+        {
+            return "No summary was produced by the exploration session.";
+        }
+
+        var builder = new StringBuilder();
+        foreach (string segment in exploration.Transcript.TakeLast(3))
+        {
+            if (string.IsNullOrWhiteSpace(segment))
+            {
+                continue;
+            }
+
+            if (builder.Length > 0)
+            {
+                builder.AppendLine();
+            }
+
+            builder.Append(segment.Trim());
+        }
+
+        return builder.Length == 0
+            ? "No summary was produced by the exploration session."
+            : builder.ToString();
     }
     private static async Task RunCosmosDiagnosticsAsync(
         Settings.AppSettings settings,
