@@ -155,6 +155,421 @@ public sealed class OrchestratorAgent : IAgent
         return resolved;
     }
 
+    private static PlannerContext ExtractPlannerContext(IEnumerable<string> hints)
+    {
+        var summary = default(string);
+        var planSteps = new SortedDictionary<int, string>();
+        var unorderedPlanSteps = new List<string>();
+        var keyQuestions = new List<string>();
+        var notes = new List<string>();
+
+        if (hints is null)
+        {
+            return PlannerContext.Empty;
+        }
+
+        foreach (string raw in hints)
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                continue;
+            }
+
+            string hint = raw.Trim();
+            if (!hint.StartsWith("Planner", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            int colonIndex = hint.IndexOf(':');
+            if (colonIndex < 0 || colonIndex >= hint.Length - 1)
+            {
+                continue;
+            }
+
+            string key = hint[..colonIndex].Trim();
+            string value = hint[(colonIndex + 1)..].Trim();
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                continue;
+            }
+
+            if (key.Equals("PlannerSummary", StringComparison.OrdinalIgnoreCase))
+            {
+                summary ??= value;
+                continue;
+            }
+
+            if (key.StartsWith("PlannerPlanStep", StringComparison.OrdinalIgnoreCase))
+            {
+                string numberPart = key["PlannerPlanStep".Length..].Trim();
+                if (int.TryParse(numberPart, NumberStyles.Integer, CultureInfo.InvariantCulture, out int index) && index > 0)
+                {
+                    planSteps[index] = value;
+                }
+                else
+                {
+                    unorderedPlanSteps.Add(value);
+                }
+                continue;
+            }
+
+            if (key.Equals("PlannerQuestion", StringComparison.OrdinalIgnoreCase))
+            {
+                keyQuestions.Add(value);
+                continue;
+            }
+
+            if (key.Equals("PlannerNotes", StringComparison.OrdinalIgnoreCase))
+            {
+                notes.Add(value);
+            }
+        }
+
+        var orderedSteps = planSteps.Count > 0
+            ? planSteps.OrderBy(static pair => pair.Key).Select(static pair => pair.Value).ToList()
+            : new List<string>();
+
+        if (unorderedPlanSteps.Count > 0)
+        {
+            orderedSteps.AddRange(unorderedPlanSteps);
+        }
+
+        if (summary is null && orderedSteps.Count == 0 && keyQuestions.Count == 0 && notes.Count == 0)
+        {
+            return PlannerContext.Empty;
+        }
+
+        return new PlannerContext(summary, orderedSteps, keyQuestions, notes, true);
+    }
+
+    private static ResearchPlan ApplyPlannerContext(ResearchPlan generatedPlan, PlannerContext plannerContext)
+    {
+        if (generatedPlan is null)
+        {
+            throw new ArgumentNullException(nameof(generatedPlan));
+        }
+
+        if (!plannerContext.HasData)
+        {
+            return generatedPlan;
+        }
+
+        var summary = !string.IsNullOrWhiteSpace(plannerContext.Summary)
+            ? plannerContext.Summary
+            : generatedPlan.Summary;
+
+        var planSteps = plannerContext.PlanSteps.Count > 0
+            ? plannerContext.PlanSteps.Where(static step => !string.IsNullOrWhiteSpace(step)).Select(static step => step.Trim()).ToList()
+            : generatedPlan.PlanSteps.Where(static step => !string.IsNullOrWhiteSpace(step)).Select(static step => step.Trim()).ToList();
+
+        var keyQuestions = new List<string>();
+        foreach (string question in plannerContext.KeyQuestions.Where(static q => !string.IsNullOrWhiteSpace(q)))
+        {
+            string normalized = question.Trim();
+            if (!ContainsOrdinalIgnoreCase(keyQuestions, normalized))
+            {
+                keyQuestions.Add(normalized);
+            }
+        }
+
+        foreach (string question in generatedPlan.KeyQuestions.Where(static q => !string.IsNullOrWhiteSpace(q)))
+        {
+            string normalized = question.Trim();
+            if (!ContainsOrdinalIgnoreCase(keyQuestions, normalized))
+            {
+                keyQuestions.Add(normalized);
+            }
+        }
+
+        var assumptions = new List<string>();
+        foreach (string assumption in generatedPlan.Assumptions.Where(static a => !string.IsNullOrWhiteSpace(a)))
+        {
+            string normalized = assumption.Trim();
+            if (!ContainsOrdinalIgnoreCase(assumptions, normalized))
+            {
+                assumptions.Add(normalized);
+            }
+        }
+
+        foreach (string note in plannerContext.Notes.Where(static n => !string.IsNullOrWhiteSpace(n)))
+        {
+            string normalized = note.Trim();
+            if (!ContainsOrdinalIgnoreCase(assumptions, normalized))
+            {
+                assumptions.Add(normalized);
+            }
+        }
+
+        string? notes = plannerContext.Notes.Count > 0
+            ? string.Join(Environment.NewLine, plannerContext.Notes.Where(static n => !string.IsNullOrWhiteSpace(n)).Select(static n => n.Trim()))
+            : generatedPlan.Notes;
+
+        var branches = new List<ResearchBranchPlan>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (string step in planSteps)
+        {
+            string normalized = step.Trim();
+            if (normalized.Length == 0 || !seen.Add(normalized))
+            {
+                continue;
+            }
+
+            branches.Add(new ResearchBranchPlan
+            {
+                Question = normalized
+            });
+        }
+
+        foreach (var branch in generatedPlan.Branches)
+        {
+            if (branch is null || string.IsNullOrWhiteSpace(branch.Question))
+            {
+                continue;
+            }
+
+            string normalized = branch.Question.Trim();
+            if (normalized.Length == 0 || !seen.Add(normalized))
+            {
+                continue;
+            }
+
+            branches.Add(branch);
+        }
+
+        foreach (string question in keyQuestions)
+        {
+            string normalized = question.Trim();
+            if (normalized.Length == 0 || !seen.Add(normalized))
+            {
+                continue;
+            }
+
+            branches.Add(new ResearchBranchPlan
+            {
+                Question = normalized
+            });
+        }
+
+        return new ResearchPlan
+        {
+            ResearchSessionId = generatedPlan.ResearchSessionId,
+            RootQuestion = generatedPlan.RootQuestion,
+            Summary = summary,
+            Branches = branches,
+            PlanSteps = planSteps,
+            KeyQuestions = keyQuestions,
+            Assumptions = assumptions,
+            Notes = notes,
+            PlannerContextApplied = plannerContext.HasData
+        };
+    }
+
+    private static ResearchPlan BuildPlannerBackedPlan(AgentTask task, PlannerContext plannerContext)
+    {
+        ArgumentNullException.ThrowIfNull(task);
+
+        var branches = new List<ResearchBranchPlan>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (string step in plannerContext.PlanSteps.Where(static step => !string.IsNullOrWhiteSpace(step)))
+        {
+            string normalized = step.Trim();
+            if (normalized.Length == 0 || !seen.Add(normalized))
+            {
+                continue;
+            }
+
+            branches.Add(new ResearchBranchPlan
+            {
+                Question = normalized
+            });
+        }
+
+        foreach (string question in plannerContext.KeyQuestions.Where(static q => !string.IsNullOrWhiteSpace(q)))
+        {
+            string normalized = question.Trim();
+            if (normalized.Length == 0 || !seen.Add(normalized))
+            {
+                continue;
+            }
+
+            branches.Add(new ResearchBranchPlan
+            {
+                Question = normalized
+            });
+        }
+
+        var assumptions = plannerContext.Notes
+            .Where(static n => !string.IsNullOrWhiteSpace(n))
+            .Select(static n => n.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        string? notes = plannerContext.Notes.Count > 0
+            ? string.Join(Environment.NewLine, plannerContext.Notes.Where(static n => !string.IsNullOrWhiteSpace(n)).Select(static n => n.Trim()))
+            : null;
+
+        return new ResearchPlan
+        {
+            ResearchSessionId = task.ResearchSessionId,
+            RootQuestion = task.Objective ?? string.Empty,
+            Summary = plannerContext.Summary,
+            Branches = branches,
+            PlanSteps = plannerContext.PlanSteps.Where(static step => !string.IsNullOrWhiteSpace(step)).Select(static step => step.Trim()).ToList(),
+            KeyQuestions = plannerContext.KeyQuestions.Where(static q => !string.IsNullOrWhiteSpace(q)).Select(static q => q.Trim()).Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
+            Assumptions = assumptions,
+            Notes = notes,
+            PlannerContextApplied = true
+        };
+    }
+
+    private static bool ContainsOrdinalIgnoreCase(IEnumerable<string> source, string value)
+    {
+        return source.Any(item => string.Equals(item, value, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static PlannerDetails CollectPlannerDetails(ResearchPlan? plan)
+    {
+        if (plan is null)
+        {
+            return PlannerDetails.Empty;
+        }
+
+        string? summary = string.IsNullOrWhiteSpace(plan.Summary) ? null : plan.Summary.Trim();
+        var steps = plan.PlanSteps
+            .Where(static step => !string.IsNullOrWhiteSpace(step))
+            .Select(static step => step.Trim())
+            .ToList();
+
+        var questions = plan.KeyQuestions
+            .Where(static question => !string.IsNullOrWhiteSpace(question))
+            .Select(static question => question.Trim())
+            .Where(static question => question.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var notes = new List<string>();
+        if (!string.IsNullOrWhiteSpace(plan.Notes))
+        {
+            string[] noteLines = plan.Notes
+                .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (string noteLine in noteLines)
+            {
+                string trimmed = noteLine.Trim();
+                if (trimmed.Length > 0 && !ContainsOrdinalIgnoreCase(notes, trimmed))
+                {
+                    notes.Add(trimmed);
+                }
+            }
+        }
+
+        foreach (string assumption in plan.Assumptions.Where(static a => !string.IsNullOrWhiteSpace(a)))
+        {
+            string trimmed = assumption.Trim();
+            if (trimmed.Length > 0 && !ContainsOrdinalIgnoreCase(notes, trimmed))
+            {
+                notes.Add(trimmed);
+            }
+        }
+
+        if (summary is null && steps.Count == 0 && questions.Count == 0 && notes.Count == 0)
+        {
+            return PlannerDetails.Empty;
+        }
+
+    return new PlannerDetails(summary, steps, questions, notes, HasData: true);
+    }
+
+    private static string BuildPlannerContextForPrompt(PlannerDetails details)
+    {
+        if (!details.HasData)
+        {
+            return string.Empty;
+        }
+
+        var builder = new StringBuilder();
+
+        if (!string.IsNullOrWhiteSpace(details.Summary))
+        {
+            builder.AppendLine("Planner summary:");
+            builder.AppendLine(details.Summary.Trim());
+            builder.AppendLine();
+        }
+
+        if (details.Steps.Count > 0)
+        {
+            builder.AppendLine("Planned steps:");
+            for (int index = 0; index < details.Steps.Count; index++)
+            {
+                string step = details.Steps[index];
+                if (string.IsNullOrWhiteSpace(step))
+                {
+                    continue;
+                }
+
+                builder.AppendLine($"{index + 1}. {step.Trim()}");
+            }
+
+            builder.AppendLine();
+        }
+
+        if (details.KeyQuestions.Count > 0)
+        {
+            builder.AppendLine("Key questions to explore:");
+            foreach (string question in details.KeyQuestions)
+            {
+                if (string.IsNullOrWhiteSpace(question))
+                {
+                    continue;
+                }
+
+                builder.AppendLine($"- {question.Trim()}");
+            }
+
+            builder.AppendLine();
+        }
+
+        if (details.Notes.Count > 0)
+        {
+            builder.AppendLine("Planner notes and assumptions:");
+            foreach (string note in details.Notes)
+            {
+                if (string.IsNullOrWhiteSpace(note))
+                {
+                    continue;
+                }
+
+                builder.AppendLine($"- {note.Trim()}");
+            }
+
+            builder.AppendLine();
+        }
+
+        return builder.ToString().Trim();
+    }
+
+    private sealed record PlannerContext(
+        string? Summary,
+        List<string> PlanSteps,
+        List<string> KeyQuestions,
+        List<string> Notes,
+        bool HasData)
+    {
+        public static PlannerContext Empty { get; } = new(null, new List<string>(), new List<string>(), new List<string>(), false);
+    }
+
+    private sealed record PlannerDetails(
+        string? Summary,
+        List<string> Steps,
+        List<string> KeyQuestions,
+        List<string> Notes,
+        bool HasData)
+    {
+        public static PlannerDetails Empty { get; } = new(null, new List<string>(), new List<string>(), new List<string>(), false);
+    }
+
     public async Task<AgentExecutionResult> ExecuteTaskAsync(AgentTask task, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(task);
@@ -296,7 +711,7 @@ public sealed class OrchestratorAgent : IAgent
                 cancellationToken).ConfigureAwait(false);
 
             CurrentState = OrchestratorState.GeneratingReport;
-            outline = await GenerateOutlineAsync(task, aggregationResult, synthesis, cancellationToken).ConfigureAwait(false);
+            outline = await GenerateOutlineAsync(task, plan, aggregationResult, synthesis, cancellationToken).ConfigureAwait(false);
             _flowTracker?.RecordOutline(outline);
 
             sectionDrafts = await DraftReportSectionsAsync(task, outline, aggregationResult, synthesis, cancellationToken).ConfigureAwait(false);
@@ -305,7 +720,7 @@ public sealed class OrchestratorAgent : IAgent
                 _flowTracker?.RecordSectionDraft(draft);
             }
 
-            reportPath = await GenerateReportAsync(task, aggregationResult, synthesis, outline, sectionDrafts, cancellationToken).ConfigureAwait(false);
+            reportPath = await GenerateReportAsync(task, plan, aggregationResult, synthesis, outline, sectionDrafts, cancellationToken).ConfigureAwait(false);
             _flowTracker?.RecordReportDraft(reportPath);
             _logger.LogInformation("Initial report generated at {ReportPath}.", reportPath);
 
@@ -337,17 +752,36 @@ public sealed class OrchestratorAgent : IAgent
 
             string finalReportContent = await File.ReadAllTextAsync(reportPath, cancellationToken).ConfigureAwait(false);
 
+            var reportMetadata = new Dictionary<string, string>
+            {
+                ["reportPath"] = reportPath ?? string.Empty,
+                ["outlineId"] = outline?.OutlineId ?? string.Empty,
+                ["revisionsApplied"] = revisionsApplied.ToString(CultureInfo.InvariantCulture)
+            };
+
+            if (plan is not null && plan.PlannerContextApplied)
+            {
+                if (!string.IsNullOrWhiteSpace(plan.Summary))
+                {
+                    reportMetadata["plannerSummary"] = plan.Summary.Trim();
+                }
+
+                if (plan.PlanSteps.Count > 0)
+                {
+                    string serializedSteps = string.Join(" | ", plan.PlanSteps.Where(static step => !string.IsNullOrWhiteSpace(step)).Select(static step => step.Trim()));
+                    if (!string.IsNullOrWhiteSpace(serializedSteps))
+                    {
+                        reportMetadata["plannerSteps"] = serializedSteps;
+                    }
+                }
+            }
+
             await _longTermMemoryManager.StoreDocumentAsync(
                 task.ResearchSessionId,
                 finalReportContent,
                 "final_report",
                 finalFinding.Citations,
-                new Dictionary<string, string>
-                {
-                    ["reportPath"] = reportPath ?? string.Empty,
-                    ["outlineId"] = outline?.OutlineId ?? string.Empty,
-                    ["revisionsApplied"] = revisionsApplied.ToString(CultureInfo.InvariantCulture)
-                },
+                reportMetadata,
                 cancellationToken).ConfigureAwait(false);
 
             await _longTermMemoryManager.UpsertSessionStateAsync(
@@ -573,6 +1007,17 @@ public sealed class OrchestratorAgent : IAgent
 
     private async Task<ResearchPlan> GeneratePlanAsync(AgentTask task, CancellationToken cancellationToken)
     {
+        PlannerContext plannerContext = ExtractPlannerContext(task.ContextHints);
+        if (plannerContext.HasData && plannerContext.PlanSteps.Count > 0)
+        {
+            ResearchPlan plannerPlan = BuildPlannerBackedPlan(task, plannerContext);
+            if (plannerPlan.Branches.Count > 0)
+            {
+                _logger.LogInformation("Using planner-provided plan with {BranchCount} branches.", plannerPlan.Branches.Count);
+                return plannerPlan;
+            }
+        }
+
         var request = new OpenAiChatRequest(
             SystemPrompt: SystemPrompts.Orchestrator.PlanningStrategist,
             Messages: new[]
@@ -595,15 +1040,22 @@ public sealed class OrchestratorAgent : IAgent
             branchQuestions.Add(task.Objective ?? string.Empty);
         }
 
-        return new ResearchPlan
+        var generatedPlan = new ResearchPlan
         {
             ResearchSessionId = task.ResearchSessionId,
             RootQuestion = task.Objective ?? string.Empty,
+            Summary = null,
             Branches = branchQuestions.Select(question => new ResearchBranchPlan
             {
                 Question = question
-            }).ToList()
+            }).ToList(),
+            PlanSteps = new List<string>(branchQuestions),
+            KeyQuestions = new List<string>(),
+            Assumptions = new List<string>(),
+            PlannerContextApplied = false
         };
+
+        return ApplyPlannerContext(generatedPlan, plannerContext);
     }
 
     private async Task<List<ResearchBranchResult>> ExecuteBranchesAsync(AgentTask task, ResearchPlan plan, CancellationToken cancellationToken)
@@ -727,6 +1179,12 @@ public sealed class OrchestratorAgent : IAgent
             evidenceBuilder.AppendLine();
         }
 
+        var plannerDetails = CollectPlannerDetails(plan);
+        if (plannerDetails.HasData)
+        {
+            evidenceBuilder.Insert(0, BuildPlannerContextForPrompt(plannerDetails) + "\n\n");
+        }
+
         var request = new OpenAiChatRequest(
             SystemPrompt: SystemPrompts.Orchestrator.SynthesisAuthor,
             Messages: new[]
@@ -747,6 +1205,7 @@ public sealed class OrchestratorAgent : IAgent
 
     private async Task<ReportOutline> GenerateOutlineAsync(
         AgentTask rootTask,
+        ResearchPlan plan,
         ResearchAggregationResult aggregationResult,
         string synthesis,
         CancellationToken cancellationToken)
@@ -757,6 +1216,15 @@ public sealed class OrchestratorAgent : IAgent
             CultureInfo.InvariantCulture,
             SystemPrompts.Templates.Common.ObjectiveLine,
             rootTask.Objective ?? string.Empty));
+
+        var plannerDetails = CollectPlannerDetails(plan);
+        string plannerContextBlock = BuildPlannerContextForPrompt(plannerDetails);
+        if (!string.IsNullOrWhiteSpace(plannerContextBlock))
+        {
+            promptBuilder.AppendLine(plannerContextBlock);
+            promptBuilder.AppendLine();
+        }
+
         promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.SynthesisOverviewHeader);
         promptBuilder.AppendLine(string.IsNullOrWhiteSpace(synthesis)
             ? SystemPrompts.Templates.Orchestrator.SynthesisNoSynthesis
@@ -1257,6 +1725,7 @@ public sealed class OrchestratorAgent : IAgent
 
     private async Task<string> GenerateReportAsync(
         AgentTask rootTask,
+        ResearchPlan plan,
         ResearchAggregationResult aggregationResult,
         string synthesis,
         ReportOutline outline,
@@ -1266,7 +1735,7 @@ public sealed class OrchestratorAgent : IAgent
         string rootQuestion = string.IsNullOrWhiteSpace(rootTask.Objective)
             ? "Autonomous Research Report"
             : rootTask.Objective!;
-        string markdown = _reportBuilder.Build(rootQuestion, synthesis, outline, sectionDrafts, aggregationResult.Findings);
+    string markdown = _reportBuilder.Build(rootQuestion, synthesis, outline, sectionDrafts, aggregationResult.Findings, plan);
         string fileName = $"report_{DateTimeOffset.UtcNow:yyyyMMdd_HHmmss}_{Guid.NewGuid():N}.md";
         string reportPath = Path.Combine(_reportsDirectory, fileName);
         await File.WriteAllTextAsync(reportPath, markdown, cancellationToken).ConfigureAwait(false);

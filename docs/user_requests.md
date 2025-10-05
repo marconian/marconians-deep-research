@@ -62,5 +62,7 @@
 
 [x] provide a diagnostics CLI mode (e.g., `--diagnostics-mode=list-sources`) that emits session sources instantly without regenerating a full report (completed 2025-10-05)
 
+[x] ensure the accepted planner research plan is woven into orchestration synthesis and final reporting so approved steps are visible downstream (completed 2025-10-05)
+
 [ ] run report-only regeneration for the latest research session, analyze resulting logs and report quality, and iterate until the regenerated output meets structural and citation quality goals (analysis started 2025-10-04; pending persistence fixes and report refinements)
 

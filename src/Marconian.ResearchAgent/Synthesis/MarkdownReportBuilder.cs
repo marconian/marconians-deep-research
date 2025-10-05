@@ -4,6 +4,7 @@ using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 using Marconian.ResearchAgent.Models.Reporting;
+using Marconian.ResearchAgent.Models.Research;
 
 namespace Marconian.ResearchAgent.Synthesis;
 
@@ -17,7 +18,8 @@ public sealed class MarkdownReportBuilder
         string executiveSummary,
         ReportOutline outline,
         IReadOnlyList<ReportSectionDraft> sections,
-        IReadOnlyList<ResearchFinding> findings)
+        IReadOnlyList<ResearchFinding> findings,
+        ResearchPlan? plan = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(rootQuestion);
         executiveSummary ??= string.Empty;
@@ -41,6 +43,15 @@ public sealed class MarkdownReportBuilder
         if (!string.IsNullOrWhiteSpace(outline.Notes))
         {
             builder.AppendLine($"> {outline.Notes.Trim()}");
+            builder.AppendLine();
+        }
+
+        string plannerOverview = BuildPlannerOverview(plan);
+        if (!string.IsNullOrWhiteSpace(plannerOverview))
+        {
+            builder.AppendLine("## Planner Overview");
+            builder.AppendLine();
+            builder.AppendLine(plannerOverview);
             builder.AppendLine();
         }
 
@@ -359,6 +370,118 @@ public sealed class MarkdownReportBuilder
         builder.AppendLine();
         AppendCitations(builder, citationOrder, citationIndexMap);
         return true;
+    }
+
+    private static string BuildPlannerOverview(ResearchPlan? plan)
+    {
+        if (plan is null || !plan.PlannerContextApplied)
+        {
+            return string.Empty;
+        }
+
+        var builder = new StringBuilder();
+        bool contentAdded = false;
+
+        if (!string.IsNullOrWhiteSpace(plan.Summary))
+        {
+            builder.AppendLine(plan.Summary.Trim());
+            contentAdded = true;
+        }
+
+        var normalizedSteps = plan.PlanSteps
+            .Where(static step => !string.IsNullOrWhiteSpace(step))
+            .Select(step => NormalizeWhitespace(step))
+            .Where(static step => !string.IsNullOrEmpty(step))
+            .ToList();
+
+        if (normalizedSteps.Count > 0)
+        {
+            if (contentAdded)
+            {
+                builder.AppendLine();
+            }
+
+            builder.AppendLine("### Planned Steps");
+            builder.AppendLine();
+
+            for (int index = 0; index < normalizedSteps.Count; index++)
+            {
+                builder.AppendLine($"{index + 1}. {normalizedSteps[index]}");
+            }
+
+            builder.AppendLine();
+            contentAdded = true;
+        }
+
+        var normalizedQuestions = plan.KeyQuestions
+            .Where(static question => !string.IsNullOrWhiteSpace(question))
+            .Select(question => NormalizeWhitespace(question))
+            .Where(static question => !string.IsNullOrEmpty(question))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        if (normalizedQuestions.Count > 0)
+        {
+            if (contentAdded)
+            {
+                builder.AppendLine();
+            }
+
+            builder.AppendLine("### Key Questions");
+            builder.AppendLine();
+            foreach (string question in normalizedQuestions)
+            {
+                builder.AppendLine($"- {question}");
+            }
+
+            builder.AppendLine();
+            contentAdded = true;
+        }
+
+        var noteSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var normalizedNotes = new List<string>();
+
+        if (!string.IsNullOrWhiteSpace(plan.Notes))
+        {
+            string[] segments = plan.Notes
+                .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (string segment in segments)
+            {
+                string normalized = NormalizeWhitespace(segment);
+                if (!string.IsNullOrEmpty(normalized) && noteSet.Add(normalized))
+                {
+                    normalizedNotes.Add(normalized);
+                }
+            }
+        }
+
+        foreach (string assumption in plan.Assumptions)
+        {
+            string normalized = NormalizeWhitespace(assumption);
+            if (!string.IsNullOrEmpty(normalized) && noteSet.Add(normalized))
+            {
+                normalizedNotes.Add(normalized);
+            }
+        }
+
+        if (normalizedNotes.Count > 0)
+        {
+            if (contentAdded)
+            {
+                builder.AppendLine();
+            }
+
+            builder.AppendLine("### Notes & Assumptions");
+            builder.AppendLine();
+            foreach (string note in normalizedNotes)
+            {
+                builder.AppendLine($"- {note}");
+            }
+
+            builder.AppendLine();
+        }
+
+        return builder.ToString().Trim();
     }
 
     private static string ResolveReportTitle(ReportOutline outline, string rootQuestion)

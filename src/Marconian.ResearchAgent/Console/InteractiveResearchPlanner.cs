@@ -19,7 +19,7 @@ internal sealed class InteractiveResearchPlanner
         """
         {
             "type": "object",
-            "required": ["action", "summary", "keyQuestions"],
+            "required": ["action", "summary", "keyQuestions", "proposedPlan", "followUp", "notes"],
             "properties": {
                 "action": {
                     "type": "string",
@@ -29,6 +29,10 @@ internal sealed class InteractiveResearchPlanner
                     "type": "string"
                 },
                 "keyQuestions": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                },
+                "proposedPlan": {
                     "type": "array",
                     "items": { "type": "string" }
                 },
@@ -81,17 +85,20 @@ internal sealed class InteractiveResearchPlanner
             switch (response.Action)
             {
                 case PlannerAction.RequestClarification:
-                    Console.WriteLine();
-                    Console.WriteLine("# Planner Clarification");
-                    Console.WriteLine(string.IsNullOrWhiteSpace(response.FollowUp)
-                        ? "The planner needs more details before creating a plan."
-                        : response.FollowUp);
+                    DisplayClarificationRequest(response, currentObjective);
                     Console.Write("Your answer (leave blank to cancel): ");
                     string? clarification = (await ReadLineAsync(cancellationToken).ConfigureAwait(false))?.Trim();
                     if (string.IsNullOrWhiteSpace(clarification))
                     {
                         Console.WriteLine("Planner cancelled. Returning to menu.");
                         return null;
+                    }
+
+                    if (string.Equals(clarification, "accept", StringComparison.OrdinalIgnoreCase))
+                    {
+                        history.Add(new("user", "Proceed with this plan using your recommended assumptions. No further clarifications available."));
+                        response = await InvokePlannerAsync(history, cancellationToken).ConfigureAwait(false);
+                        continue;
                     }
 
                     history.Add(new("user", $"Clarification: {clarification}"));
@@ -195,7 +202,7 @@ internal sealed class InteractiveResearchPlanner
             JsonSchemaFormat: new OpenAiChatJsonSchemaFormat("planner_response", PlannerResponseSchema));
 
         string response = await _openAiService.GenerateTextAsync(request, cancellationToken).ConfigureAwait(false);
-        _logger.LogDebug("Planner response payload: {Payload}", response);
+        _logger.LogTrace("Planner response payload: {Payload}", response);
         return PlannerResponse.Parse(response);
     }
 
@@ -205,6 +212,15 @@ internal sealed class InteractiveResearchPlanner
         {
             $"PlannerSummary: {response.Summary}"
         };
+
+        if (response.ProposedPlan.Count > 0)
+        {
+            int step = 1;
+            foreach (string planStep in response.ProposedPlan)
+            {
+                hints.Add($"PlannerPlanStep{step++}: {planStep}");
+            }
+        }
 
         if (response.KeyQuestions.Count > 0)
         {
@@ -226,6 +242,16 @@ internal sealed class InteractiveResearchPlanner
         Console.WriteLine($"Objective: {objective}");
         Console.WriteLine();
         Console.WriteLine(response.Summary);
+        if (response.ProposedPlan.Count > 0)
+        {
+            Console.WriteLine();
+            Console.WriteLine("Proposed Research Plan:");
+            int index = 1;
+            foreach (string step in response.ProposedPlan)
+            {
+                Console.WriteLine($" {index++}. {step}");
+            }
+        }
         if (!string.IsNullOrWhiteSpace(response.Notes))
         {
             Console.WriteLine();
@@ -245,6 +271,62 @@ internal sealed class InteractiveResearchPlanner
         }
     }
 
+    private static void DisplayClarificationRequest(PlannerResponse response, string objective)
+    {
+        Console.WriteLine();
+        Console.WriteLine("# Planner Clarification Needed");
+        if (!string.IsNullOrWhiteSpace(objective))
+        {
+            Console.WriteLine($"Objective: {objective}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(response.Summary))
+        {
+            Console.WriteLine();
+            Console.WriteLine("Summary:");
+            Console.WriteLine(response.Summary);
+        }
+
+        if (response.ProposedPlan.Count > 0)
+        {
+            Console.WriteLine();
+            Console.WriteLine("Current Draft Plan:");
+            int index = 1;
+            foreach (string step in response.ProposedPlan)
+            {
+                Console.WriteLine($" {index++}. {step}");
+            }
+        }
+
+        if (response.KeyQuestions.Count > 0)
+        {
+            Console.WriteLine();
+            Console.WriteLine("Optional Clarification Questions (answer any to refine the plan):");
+            int index = 1;
+            foreach (string question in response.KeyQuestions)
+            {
+                Console.WriteLine($" {index++}. {question}");
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(response.Notes))
+        {
+            Console.WriteLine();
+            Console.WriteLine("Notes:");
+            Console.WriteLine(response.Notes);
+        }
+
+        Console.WriteLine();
+        if (!string.IsNullOrWhiteSpace(response.FollowUp))
+        {
+            Console.WriteLine(response.FollowUp);
+            Console.WriteLine();
+        }
+
+        Console.WriteLine("Type your clarifications, or enter 'accept' to proceed with the plan using these assumptions.");
+        Console.WriteLine();
+    }
+
     private static async Task<string?> ReadLineAsync(CancellationToken cancellationToken)
         => await Task.Run(Console.ReadLine, cancellationToken).ConfigureAwait(false);
 
@@ -255,13 +337,13 @@ internal sealed class InteractiveResearchPlanner
         Abort
     }
 
-    private sealed record PlannerResponse(PlannerAction Action, string Summary, IReadOnlyList<string> KeyQuestions, string? FollowUp, string? Notes)
+    private sealed record PlannerResponse(PlannerAction Action, string Summary, IReadOnlyList<string> KeyQuestions, IReadOnlyList<string> ProposedPlan, string? FollowUp, string? Notes)
     {
         public static PlannerResponse Parse(string content)
         {
             if (string.IsNullOrWhiteSpace(content))
             {
-                return new PlannerResponse(PlannerAction.Abort, string.Empty, Array.Empty<string>(), null, null);
+                return new PlannerResponse(PlannerAction.Abort, string.Empty, Array.Empty<string>(), Array.Empty<string>(), null, null);
             }
 
             try
@@ -282,24 +364,59 @@ internal sealed class InteractiveResearchPlanner
                     }
                 }
 
-                string? followUp = root.TryGetProperty("followUp", out var followUpElement) && followUpElement.ValueKind == JsonValueKind.String
-                    ? followUpElement.GetString()
-                    : null;
-                string? notes = root.TryGetProperty("notes", out var notesElement) && notesElement.ValueKind == JsonValueKind.String
-                    ? notesElement.GetString()
-                    : null;
+                var proposedPlan = new List<string>();
+                if (root.TryGetProperty("proposedPlan", out var planElement) && planElement.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (JsonElement element in planElement.EnumerateArray())
+                    {
+                        if (element.ValueKind == JsonValueKind.String)
+                        {
+                            string? value = element.GetString();
+                            if (!string.IsNullOrWhiteSpace(value))
+                            {
+                                proposedPlan.Add(value);
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    proposedPlan.Add("Outline key steps for this research plan.");
+                }
+
+                string? followUp = null;
+                if (root.TryGetProperty("followUp", out var followUpElement) && followUpElement.ValueKind == JsonValueKind.String)
+                {
+                    string? raw = followUpElement.GetString();
+                    if (!string.IsNullOrWhiteSpace(raw))
+                    {
+                        followUp = raw;
+                    }
+                }
+
+                string? notes = null;
+                if (root.TryGetProperty("notes", out var notesElement) && notesElement.ValueKind == JsonValueKind.String)
+                {
+                    string? raw = notesElement.GetString();
+                    if (!string.IsNullOrWhiteSpace(raw))
+                    {
+                        notes = raw;
+                    }
+                }
+
+                IReadOnlyList<string> planSegments = proposedPlan.Count == 0 ? Array.Empty<string>() : proposedPlan;
 
                 return action switch
                 {
-                    "ask" => new PlannerResponse(PlannerAction.RequestClarification, summary, keyQuestions, followUp, notes),
-                    "plan" => new PlannerResponse(PlannerAction.PlanReady, summary, keyQuestions, followUp, notes),
-                    "abort" => new PlannerResponse(PlannerAction.Abort, summary, keyQuestions, followUp, notes),
-                    _ => new PlannerResponse(PlannerAction.PlanReady, summary, keyQuestions, followUp, notes)
+                    "ask" => new PlannerResponse(PlannerAction.RequestClarification, summary, keyQuestions, planSegments, followUp, notes),
+                    "plan" => new PlannerResponse(PlannerAction.PlanReady, summary, keyQuestions, planSegments, followUp, notes),
+                    "abort" => new PlannerResponse(PlannerAction.Abort, summary, keyQuestions, planSegments, followUp, notes),
+                    _ => new PlannerResponse(PlannerAction.PlanReady, summary, keyQuestions, planSegments, followUp, notes)
                 };
             }
             catch (JsonException)
             {
-                return new PlannerResponse(PlannerAction.Abort, string.Empty, Array.Empty<string>(), null, null);
+                return new PlannerResponse(PlannerAction.Abort, string.Empty, Array.Empty<string>(), Array.Empty<string>(), null, null);
             }
         }
     }

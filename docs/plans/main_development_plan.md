@@ -114,6 +114,7 @@
 - [x] Capture iterative outline artifacts in memory and flow tracker for auditability.
 - [x] Update synthesis/report builder logic to honour section ordering and outline decisions.
 - [x] Allow outline sections to be marked structural-only so drafting skips headings that don't need narrative (2025-10-04)
+- [x] Surface accepted planner plans throughout synthesis and reporting pipelines so the final report reflects the confirmed research strategy (2025-10-05)
 
 ## M18 - CAPTCHA Mitigation & Stealth Browser Posture
 - [ ] Integrate Playwright stealth configuration (navigator.webdriver patches, realistic UA/timezone/viewport, persistent contexts, manual launch flags) in computer-use services per stealth blueprint.

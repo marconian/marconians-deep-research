@@ -64,7 +64,13 @@ public sealed class ResearchFlowTracker
                 return;
             }
 
-            _planNode ??= CreateNodeUnsafe($"Plan ready\nBranches: {plan.Branches.Count}", NodeShape.Diamond);
+            string label = $"Plan ready\nBranches: {plan.Branches.Count}";
+            if (!string.IsNullOrWhiteSpace(plan.Summary))
+            {
+                label += $"\n{plan.Summary.Trim().Truncate(120)}";
+            }
+
+            _planNode = CreateNodeUnsafe(label, NodeShape.Diamond);
             AddEdgeUnsafe(_sessionNode.Id, _planNode.Id, "planning");
 
             foreach (var branch in plan.Branches)
