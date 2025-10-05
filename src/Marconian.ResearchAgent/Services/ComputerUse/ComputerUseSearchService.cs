@@ -933,6 +933,18 @@ You control a Chromium browser. Investigate the query, open promising results, a
 
         void ProcessToolCandidate(JsonElement candidate)
         {
+            try
+            {
+                RecordTimelineEvent("tool_call", new Dictionary<string, object?>
+                {
+                    ["raw"] = candidate.GetRawText()
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Failed to capture raw tool call for timeline entry.");
+            }
+
             if (TryExtractSummaryFunction(candidate, out ExplorationPayload? payload, out string? rawJson, out string? callId))
             {
                 summaryPayload = payload;
@@ -1090,17 +1102,13 @@ You control a Chromium browser. Investigate the query, open promising results, a
 
         if (capturedSegments is not null && capturedSegments.Count > 0)
         {
-            string[] logged = capturedSegments
-                .Select(segment => segment.Length > 512 ? segment[..512] + "…" : segment)
-                .ToArray();
-
             RecordTimelineEvent("model_text", new Dictionary<string, object?>
             {
                 ["count"] = capturedSegments.Count,
-                ["segments"] = logged
+                ["segments"] = capturedSegments.ToArray()
             });
 
-            foreach (string snippet in logged)
+            foreach (string snippet in capturedSegments.Select(segment => segment.Length > 512 ? segment[..512] + "…" : segment))
             {
                 _logger.LogDebug("Computer-use model text: {Snippet}", snippet);
             }

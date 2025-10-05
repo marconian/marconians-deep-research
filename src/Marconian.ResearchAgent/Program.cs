@@ -1019,6 +1019,98 @@ internal static class Program
     {
         if (!string.IsNullOrWhiteSpace(exploration.StructuredSummaryJson))
         {
+            try
+            {
+                using JsonDocument document = JsonDocument.Parse(exploration.StructuredSummaryJson);
+                JsonElement root = document.RootElement;
+
+                var summaryBuilder = new StringBuilder();
+
+                if (root.TryGetProperty("summary", out JsonElement summaryElement) && summaryElement.ValueKind == JsonValueKind.String)
+                {
+                    string? summary = summaryElement.GetString();
+                    if (!string.IsNullOrWhiteSpace(summary))
+                    {
+                        summaryBuilder.AppendLine("Summary:");
+                        summaryBuilder.AppendLine(summary.Trim());
+                        summaryBuilder.AppendLine();
+                    }
+                }
+
+                if (root.TryGetProperty("findings", out JsonElement findingsElement) && findingsElement.ValueKind == JsonValueKind.Array)
+                {
+                    var findings = findingsElement
+                        .EnumerateArray()
+                        .Select(item => item.ValueKind == JsonValueKind.String ? item.GetString() : null)
+                        .Where(item => !string.IsNullOrWhiteSpace(item))
+                        .Select(item => item!.Trim())
+                        .ToArray();
+
+                    if (findings.Length > 0)
+                    {
+                        summaryBuilder.AppendLine("Findings:");
+                        foreach (string finding in findings)
+                        {
+                            summaryBuilder.AppendLine($" - {finding}");
+                        }
+                        summaryBuilder.AppendLine();
+                    }
+                }
+
+                if (root.TryGetProperty("flagged", out JsonElement flaggedElement) && flaggedElement.ValueKind == JsonValueKind.Array)
+                {
+                    var flaggedEntries = new List<(string Title, string Url, string? Type)>();
+
+                    foreach (JsonElement item in flaggedElement.EnumerateArray())
+                    {
+                        if (item.ValueKind != JsonValueKind.Object)
+                        {
+                            continue;
+                        }
+
+                        string? title = item.TryGetProperty("title", out JsonElement titleElement) && titleElement.ValueKind == JsonValueKind.String
+                            ? titleElement.GetString()
+                            : null;
+                        string? url = item.TryGetProperty("url", out JsonElement urlElement) && urlElement.ValueKind == JsonValueKind.String
+                            ? urlElement.GetString()
+                            : null;
+                        string? type = item.TryGetProperty("type", out JsonElement typeElement) && typeElement.ValueKind == JsonValueKind.String
+                            ? typeElement.GetString()
+                            : null;
+
+                        if (string.IsNullOrWhiteSpace(url))
+                        {
+                            continue;
+                        }
+
+                        string displayTitle = string.IsNullOrWhiteSpace(title) ? url! : title!.Trim();
+                        string? trimmedType = string.IsNullOrWhiteSpace(type) ? null : type!.Trim();
+                        flaggedEntries.Add((displayTitle, url!.Trim(), trimmedType));
+                    }
+
+                    if (flaggedEntries.Count > 0)
+                    {
+                        summaryBuilder.AppendLine("Flagged Resources:");
+                        foreach ((string Title, string Url, string? Type) entry in flaggedEntries)
+                        {
+                            string suffix = string.IsNullOrWhiteSpace(entry.Type) ? string.Empty : $" [{entry.Type}]";
+                            summaryBuilder.AppendLine($" - {entry.Title}{suffix}\n   {entry.Url}");
+                        }
+                        summaryBuilder.AppendLine();
+                    }
+                }
+
+                string formatted = summaryBuilder.ToString().Trim();
+                if (!string.IsNullOrWhiteSpace(formatted))
+                {
+                    return formatted;
+                }
+            }
+            catch (JsonException)
+            {
+                // Fall back to raw payload if parsing fails.
+            }
+
             return exploration.StructuredSummaryJson!.Trim();
         }
 
@@ -1027,7 +1119,7 @@ internal static class Program
             return "No summary was produced by the exploration session.";
         }
 
-        var builder = new StringBuilder();
+        var transcriptBuilder = new StringBuilder();
         foreach (string segment in exploration.Transcript.TakeLast(3))
         {
             if (string.IsNullOrWhiteSpace(segment))
@@ -1035,17 +1127,17 @@ internal static class Program
                 continue;
             }
 
-            if (builder.Length > 0)
+            if (transcriptBuilder.Length > 0)
             {
-                builder.AppendLine();
+                transcriptBuilder.AppendLine();
             }
 
-            builder.Append(segment.Trim());
+            transcriptBuilder.Append(segment.Trim());
         }
 
-        return builder.Length == 0
+        return transcriptBuilder.Length == 0
             ? "No summary was produced by the exploration session."
-            : builder.ToString();
+            : transcriptBuilder.ToString();
     }
     private static async Task RunCosmosDiagnosticsAsync(
         Settings.AppSettings settings,
