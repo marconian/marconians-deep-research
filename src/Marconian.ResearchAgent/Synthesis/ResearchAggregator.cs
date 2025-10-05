@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Marconian.ResearchAgent.Models.Reporting;
 using Marconian.ResearchAgent.Models.Research;
+using Marconian.ResearchAgent.Utilities;
 
 namespace Marconian.ResearchAgent.Synthesis;
 
@@ -36,11 +37,15 @@ public sealed class ResearchAggregator
             .ThenBy(f => f.Title, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
-        var uniqueCitations = mergedFindings
-            .SelectMany(f => f.Citations)
-            .Where(c => c is not null)
-            .GroupBy(c => c.SourceId)
-            .Select(group => group.First())
+        foreach (var finding in mergedFindings)
+        {
+            finding.Citations = SourceCitationDeduplicator.Deduplicate(finding.Citations)
+                .Select(c => new SourceCitation(c.SourceId, c.Title, c.Url, c.Snippet))
+                .ToList();
+        }
+
+        var uniqueCitations = SourceCitationDeduplicator
+            .Deduplicate(mergedFindings.SelectMany(f => f.Citations))
             .ToList();
 
         return new ResearchAggregationResult
@@ -54,14 +59,20 @@ public sealed class ResearchAggregator
         => string.IsNullOrWhiteSpace(value) ? "(untitled)" : value.Trim();
 
     private static ResearchFinding CloneFinding(ResearchFinding finding)
-        => new()
+    {
+        var deduplicated = SourceCitationDeduplicator.Deduplicate(finding.Citations)
+            .Select(c => new SourceCitation(c.SourceId, c.Title, c.Url, c.Snippet))
+            .ToList();
+
+        return new ResearchFinding
         {
             Id = finding.Id,
             Title = finding.Title,
             Content = finding.Content,
-            Citations = finding.Citations.ToList(),
+            Citations = deduplicated,
             Confidence = finding.Confidence
         };
+    }
 
     private static void MergeFinding(ResearchFinding existing, ResearchFinding incoming)
     {
@@ -83,14 +94,10 @@ public sealed class ResearchAggregator
                     .Distinct());
         }
 
-        var citationMap = existing.Citations.ToDictionary(c => c.SourceId, StringComparer.Ordinal);
-        foreach (var citation in incoming.Citations)
-        {
-            if (!citationMap.ContainsKey(citation.SourceId))
-            {
-                existing.Citations.Add(citation);
-            }
-        }
+        existing.Citations = SourceCitationDeduplicator
+            .Deduplicate(existing.Citations.Concat(incoming.Citations))
+            .Select(c => new SourceCitation(c.SourceId, c.Title, c.Url, c.Snippet))
+            .ToList();
     }
 }
 

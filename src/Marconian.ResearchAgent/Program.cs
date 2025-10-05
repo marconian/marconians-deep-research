@@ -26,6 +26,7 @@ using Microsoft.Azure.Cosmos;
 using System.Collections.ObjectModel;
 using Marconian.ResearchAgent.Logging;
 using Marconian.ResearchAgent.Tracking;
+using Marconian.ResearchAgent.Utilities;
 
 namespace Marconian.ResearchAgent;
 
@@ -868,57 +869,15 @@ internal static class Program
 
     private static IReadOnlyList<SourceCitation> CollectUniqueCitations(IEnumerable<ResearchFinding> findings)
     {
-        var results = new List<SourceCitation>();
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        ArgumentNullException.ThrowIfNull(findings);
 
-        foreach (var finding in findings)
-        {
-            if (finding?.Citations is null)
-            {
-                continue;
-            }
+        var allCitations = findings
+            .Where(f => f?.Citations is not null)
+            .SelectMany(f => f.Citations!)
+            .Where(c => c is not null)
+            .ToList();
 
-            foreach (var citation in finding.Citations)
-            {
-                if (citation is null)
-                {
-                    continue;
-                }
-
-                string key = ResolveCitationKey(citation);
-                if (seen.Add(key))
-                {
-                    results.Add(citation);
-                }
-            }
-        }
-
-        return results;
-    }
-
-    private static string ResolveCitationKey(SourceCitation citation)
-    {
-        if (!string.IsNullOrWhiteSpace(citation.SourceId))
-        {
-            return citation.SourceId;
-        }
-
-        if (!string.IsNullOrWhiteSpace(citation.Url))
-        {
-            return citation.Url;
-        }
-
-        if (!string.IsNullOrWhiteSpace(citation.Title))
-        {
-            return citation.Title;
-        }
-
-        if (!string.IsNullOrWhiteSpace(citation.Snippet))
-        {
-            return citation.Snippet;
-        }
-
-        return Guid.NewGuid().ToString("N");
+        return SourceCitationDeduplicator.Deduplicate(allCitations);
     }
 
     private static void ParseCommandLine(
