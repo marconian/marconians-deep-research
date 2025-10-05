@@ -85,6 +85,7 @@
 ## M13 - Operational Diagnostics
 - [x] Add CLI or scripted diagnostic path to enumerate Cosmos tool outputs for a session
 - [x] Document workflow for inspecting stored scrape content when computer-use is disabled
+- [x] Introduce `--diagnostics-mode` fast paths (starting with list-sources output) to avoid full regeneration cycles when only summaries are needed (completed 2025-10-05)
 ## M14 - Hybrid Search Exploration
 - [x] Route hybrid Google API search results through an agent-driven selection step
 - [x] Launch computer-use browsing sessions for each selected citation to capture richer context

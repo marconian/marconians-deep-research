@@ -146,6 +146,7 @@ This architecture allows for massive parallelism, resilience, and specialization
 1.  **Session dump CLI:** The console application exposes `--dump-session <sessionId>` to export long-term memory artifacts (defaulting to `tool_output::WebScraper` records) into Markdown files for offline review.
 2.  **Filtering & Limits:** Optional flags `--dump-type`, `--dump-dir`, and `--dump-limit` customize which records are exported, where they land on disk, and how many entries are collected.
 3.  **Use Cases:** This path lets operators review previously scraped HTML payloads even when Playwright/computer-use tooling is disabled on the current machine.
+4.  **Diagnostics Mode:** Introduce `--diagnostics-mode` CLI switches beginning with `list-sources`, which consumes stored findings for a session and emits the sources section without invoking long-running regeneration flows.
 
 3.  **Content Writing:** It will then iterate through the outline, writing detailed content for each section, pulling in the evidence and synthesized knowledge from its memory.
 4.  **Citation Management:** As it writes, the agent will be prompted to include citations. The `Source` documents stored in Cosmos DB will be used to generate formatted citations (e.g., `[Source 1: URL]`).

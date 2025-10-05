@@ -10,6 +10,7 @@ namespace Marconian.ResearchAgent.Synthesis;
 public sealed class MarkdownReportBuilder
 {
     private static readonly Regex CitationTagRegex = new("<<ref:(?<tag>[A-Za-z0-9_-]+)>>", RegexOptions.Compiled);
+    private static readonly Regex WhitespaceCollapseRegex = new(@"\s+", RegexOptions.Compiled);
 
     public string Build(
         string rootQuestion,
@@ -77,6 +78,41 @@ public sealed class MarkdownReportBuilder
         }
 
         return builder.ToString();
+    }
+
+    public string BuildSourcesSection(IEnumerable<SourceCitation> citations, bool includeHeading = true)
+    {
+        var citationOrder = new List<SourceCitation>();
+        var citationIndexMap = new Dictionary<string, int>(StringComparer.Ordinal);
+
+        if (citations is not null)
+        {
+            foreach (var citation in citations)
+            {
+                if (citation is null)
+                {
+                    continue;
+                }
+
+                EnsureCitationRegistered(citation, citationOrder, citationIndexMap);
+            }
+        }
+
+        if (citationOrder.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        var builder = new StringBuilder();
+
+        if (includeHeading)
+        {
+            builder.AppendLine("## Sources");
+            builder.AppendLine();
+        }
+
+        AppendCitations(builder, citationOrder, citationIndexMap);
+        return builder.ToString().TrimEnd();
     }
 
     private static void RenderLayoutNode(
@@ -198,9 +234,9 @@ public sealed class MarkdownReportBuilder
                 continue;
             }
 
-            string displayTitle = string.IsNullOrWhiteSpace(citation.Title) ? citation.SourceId : citation.Title!.Trim();
-            string displayUrl = string.IsNullOrWhiteSpace(citation.Url) ? string.Empty : citation.Url.Trim();
-            string snippet = string.IsNullOrWhiteSpace(citation.Snippet) ? string.Empty : citation.Snippet.Trim();
+            string displayTitle = NormalizeWhitespaceOrFallback(citation.Title, citation.SourceId);
+            string displayUrl = NormalizeWhitespace(citation.Url);
+            string snippet = NormalizeWhitespace(citation.Snippet);
 
             var parts = new List<string> { displayTitle };
             if (!string.IsNullOrEmpty(displayUrl))
@@ -215,6 +251,23 @@ public sealed class MarkdownReportBuilder
 
             builder.AppendLine($"[^{index}]: {string.Join(" – ", parts)}");
         }
+    }
+
+    private static string NormalizeWhitespace(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return string.Empty;
+        }
+
+        string collapsed = WhitespaceCollapseRegex.Replace(text, " ");
+        return collapsed.Trim();
+    }
+
+    private static string NormalizeWhitespaceOrFallback(string? text, string fallback)
+    {
+        string normalized = NormalizeWhitespace(text);
+        return string.IsNullOrEmpty(normalized) ? fallback : normalized;
     }
 
     private static string ReplaceCitationTags(

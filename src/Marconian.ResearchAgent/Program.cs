@@ -1,3 +1,4 @@
+using System;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using System.Collections.Generic;
@@ -9,8 +10,10 @@ using Marconian.ResearchAgent.Configuration;
 using Marconian.ResearchAgent.Memory;
 using Marconian.ResearchAgent.Models.Agents;
 using Marconian.ResearchAgent.Models.Memory;
+using Marconian.ResearchAgent.Models.Reporting;
 using Marconian.ResearchAgent.Models.Tools;
 using Marconian.ResearchAgent.Services.Caching;
+using Marconian.ResearchAgent.Synthesis;
 using Marconian.ResearchAgent.Services.ComputerUse;
 using Marconian.ResearchAgent.Services.Cosmos;
 using Marconian.ResearchAgent.Services.Files;
@@ -114,11 +117,6 @@ internal static class Program
             flowTracker = new ResearchFlowTracker(loggerFactory.CreateLogger<ResearchFlowTracker>());
 
             var openAiService = new AzureOpenAiService(settings, loggerFactory.CreateLogger<AzureOpenAiService>());
-            var longTermMemory = new LongTermMemoryManager(
-                cosmosService,
-                openAiService,
-                settings.AzureOpenAiEmbeddingDeployment,
-                loggerFactory.CreateLogger<LongTermMemoryManager>());
             var documentService = new DocumentIntelligenceService(settings, loggerFactory.CreateLogger<DocumentIntelligenceService>());
             var fileRegistryService = new FileRegistryService();
             using var sharedHttpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
@@ -211,9 +209,33 @@ internal static class Program
                 out string? dumpType,
                 out int dumpLimit,
                 out string? diagnoseComputerUseArgument,
-                out string? reportOnlySessionId);
+                out string? reportOnlySessionId,
+                out string? diagnosticsMode);
 
-            bool reportOnlyMode = !string.IsNullOrWhiteSpace(reportOnlySessionId);
+            bool diagnosticsRequested = !string.IsNullOrWhiteSpace(diagnosticsMode);
+            bool reportOnlyMode = !diagnosticsRequested && !string.IsNullOrWhiteSpace(reportOnlySessionId);
+
+            if (diagnosticsRequested)
+            {
+                if (!string.IsNullOrWhiteSpace(dumpSessionId) || !string.IsNullOrWhiteSpace(diagnoseComputerUseArgument))
+                {
+                    logger.LogError("--diagnostics-mode cannot be combined with dump or computer-use diagnosis operations.");
+                    Console.Error.WriteLine("--diagnostics-mode cannot be combined with dump or computer-use diagnosis operations.");
+                    return 1;
+                }
+
+                if (!string.IsNullOrWhiteSpace(providedQuery))
+                {
+                    logger.LogWarning("Ignoring --query argument because diagnostics mode was requested.");
+                    providedQuery = null;
+                }
+
+                if (!string.IsNullOrWhiteSpace(reportOnlySessionId))
+                {
+                    resumeSessionId = reportOnlySessionId;
+                }
+            }
+
             if (reportOnlyMode)
             {
                 if (!string.IsNullOrWhiteSpace(dumpSessionId) || !string.IsNullOrWhiteSpace(diagnoseComputerUseArgument))
@@ -231,6 +253,21 @@ internal static class Program
 
                 resumeSessionId = reportOnlySessionId;
                 providedQuery = null;
+            }
+
+            string? diagnosticsSessionId = null;
+            if (diagnosticsRequested)
+            {
+                diagnosticsSessionId = !string.IsNullOrWhiteSpace(resumeSessionId)
+                    ? resumeSessionId
+                    : reportOnlySessionId;
+
+                if (string.IsNullOrWhiteSpace(diagnosticsSessionId))
+                {
+                    logger.LogError("--diagnostics-mode requires --resume or --report-session to specify a session id.");
+                    Console.Error.WriteLine("--diagnostics-mode requires --resume or --report-session to specify a session id.");
+                    return 1;
+                }
             }
 
             if (!string.IsNullOrWhiteSpace(dumpSessionId))
@@ -254,6 +291,25 @@ internal static class Program
 
                 logger.LogInformation("Session dump complete for {SessionId}. Files written to {Destination}.", dumpSessionId, destination);
                 return 0;
+            }
+
+            var longTermMemory = new LongTermMemoryManager(
+                cosmosService,
+                openAiService,
+                settings.AzureOpenAiEmbeddingDeployment,
+                loggerFactory.CreateLogger<LongTermMemoryManager>());
+
+            if (diagnosticsRequested)
+            {
+                var diagnosticsLogger = loggerFactory.CreateLogger("DiagnosticsMode");
+                int diagnosticsExitCode = await RunDiagnosticsModeAsync(
+                        diagnosticsMode!,
+                        diagnosticsSessionId!,
+                        longTermMemory,
+                        diagnosticsLogger,
+                        cts.Token)
+                    .ConfigureAwait(false);
+                return diagnosticsExitCode;
             }
 
             string reportDirectory = string.IsNullOrWhiteSpace(reportDirectoryArgument)
@@ -758,6 +814,113 @@ internal static class Program
         return sanitized.Length > 64 ? sanitized[..64] : sanitized;
     }
 
+    private static async Task<int> RunDiagnosticsModeAsync(
+        string diagnosticsMode,
+        string sessionId,
+        LongTermMemoryManager longTermMemoryManager,
+        ILogger diagnosticsLogger,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(diagnosticsMode))
+        {
+            diagnosticsLogger.LogError("Diagnostics mode flag was empty.");
+            Console.Error.WriteLine("Diagnostics mode flag cannot be empty.");
+            return 1;
+        }
+
+        string normalizedMode = diagnosticsMode.Trim().ToLowerInvariant();
+        switch (normalizedMode)
+        {
+            case "list-sources":
+            case "sources":
+                var findings = await longTermMemoryManager
+                    .RestoreFindingsAsync(sessionId, cancellationToken: cancellationToken)
+                    .ConfigureAwait(false);
+
+                if (findings.Count == 0)
+                {
+                    diagnosticsLogger.LogWarning("No stored findings available for session {SessionId}.", sessionId);
+                    Console.WriteLine($"No stored findings available for session {sessionId}.");
+                    return 0;
+                }
+
+                var uniqueCitations = CollectUniqueCitations(findings);
+                if (uniqueCitations.Count == 0)
+                {
+                    diagnosticsLogger.LogInformation("Session {SessionId} contains no stored citations.", sessionId);
+                    Console.WriteLine($"No stored citations available for session {sessionId}.");
+                    return 0;
+                }
+
+                var reportBuilder = new MarkdownReportBuilder();
+                string sourcesBlock = reportBuilder.BuildSourcesSection(uniqueCitations);
+                Console.WriteLine($"# Diagnostics: Sources for {sessionId}");
+                Console.WriteLine();
+                Console.WriteLine(sourcesBlock);
+                return 0;
+
+            default:
+                diagnosticsLogger.LogError("Unknown diagnostics mode: {Mode}", diagnosticsMode);
+                Console.Error.WriteLine($"Unknown diagnostics mode: {diagnosticsMode}");
+                return 1;
+        }
+    }
+
+    private static IReadOnlyList<SourceCitation> CollectUniqueCitations(IEnumerable<ResearchFinding> findings)
+    {
+        var results = new List<SourceCitation>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var finding in findings)
+        {
+            if (finding?.Citations is null)
+            {
+                continue;
+            }
+
+            foreach (var citation in finding.Citations)
+            {
+                if (citation is null)
+                {
+                    continue;
+                }
+
+                string key = ResolveCitationKey(citation);
+                if (seen.Add(key))
+                {
+                    results.Add(citation);
+                }
+            }
+        }
+
+        return results;
+    }
+
+    private static string ResolveCitationKey(SourceCitation citation)
+    {
+        if (!string.IsNullOrWhiteSpace(citation.SourceId))
+        {
+            return citation.SourceId;
+        }
+
+        if (!string.IsNullOrWhiteSpace(citation.Url))
+        {
+            return citation.Url;
+        }
+
+        if (!string.IsNullOrWhiteSpace(citation.Title))
+        {
+            return citation.Title;
+        }
+
+        if (!string.IsNullOrWhiteSpace(citation.Snippet))
+        {
+            return citation.Snippet;
+        }
+
+        return Guid.NewGuid().ToString("N");
+    }
+
     private static void ParseCommandLine(
         string[] args,
         out string? resumeSessionId,
@@ -768,7 +931,8 @@ internal static class Program
         out string? dumpType,
         out int dumpLimit,
         out string? diagnoseComputerUse,
-        out string? reportSessionId)
+        out string? reportSessionId,
+        out string? diagnosticsMode)
     {
         resumeSessionId = null;
         query = null;
@@ -779,6 +943,7 @@ internal static class Program
         dumpLimit = 200;
         diagnoseComputerUse = null;
         reportSessionId = null;
+        diagnosticsMode = null;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -840,9 +1005,15 @@ internal static class Program
                         reportSessionId = args[++i];
                     }
                     break;
+                case "--diagnostics-mode":
+                    if (i + 1 < args.Length)
+                    {
+                        diagnosticsMode = args[++i];
+                    }
+                    break;
                 case "--help":
                 case "-h":
-                    Console.WriteLine("Usage: dotnet run [--query \"question\"] [--resume sessionId] [--reports path] [--dump-session sessionId [--dump-type type] [--dump-dir path] [--dump-limit N]] [--diagnose-computer-use \"url|objective\"] [--report-session sessionId]");
+                    Console.WriteLine("Usage: dotnet run [--query \"question\"] [--resume sessionId] [--reports path] [--dump-session sessionId [--dump-type type] [--dump-dir path] [--dump-limit N]] [--diagnose-computer-use \"url|objective\"] [--report-session sessionId] [--diagnostics-mode mode]");
                     Environment.Exit(0);
                     break;
             }
