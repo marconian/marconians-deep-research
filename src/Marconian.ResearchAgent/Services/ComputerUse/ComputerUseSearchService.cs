@@ -27,24 +27,67 @@ public sealed class ComputerUseSearchService : IAsyncDisposable, IComputerUseExp
     private const int MaxIterations = 12;
     private const int MaxContinuationAttempts = 3;
     private const string ExplorationInstructions = """
-You control a Chromium browser. Navigate the page, scroll to gather supporting evidence, follow relevant outbound links, and stop once you can provide the structured summary (summary text, findings list, flagged resources). Respond only by calling the submit_summary function once you are ready to conclude.
+You control a Chromium browser. Navigate the page, scroll to gather supporting evidence, and follow outbound links until you locate the primary articles or downloadable resources that answer the research objective. Whenever you confirm a high-value resource (never a search results page or navigation hub), immediately call the flag_resource function with its direct URL and details. Continue gathering material until the objective is satisfied, then call the submit_summary function exactly once with the final structured summary.
 """;
-
     private const string ExplorationSummaryPrompt = "You have finished gathering observations. Call the submit_summary function with a concise summary, at least three findings, and any notable resources. Do not perform further computer actions.";
     private const string ExplorationSummaryInstructions = "You have completed browsing. Finish by calling the submit_summary function with the final structured summary.";
     private const string SearchInstructions = """
-You control a Chromium browser. Investigate the query, open promising results, and gather enough evidence to justify conclusions. When you are confident in your findings, call the submit_summary function exactly once with the structured summary payload (summary string, findings array, flagged resources array).
+You control a Chromium browser. Investigate the query, open promising results, and gather enough evidence to justify conclusions. Each time you reach a definitive article or downloadable resource, call the flag_resource function with its direct URL (do not flag search or listing pages). Continue exploring until all critical resources are flagged, then call the submit_summary function exactly once with the structured summary payload (summary string, findings array, flagged resources array).
 """;
     private const string ExplorationContinuationPrompt = "Continue exploring the current page or follow promising links to gather more evidence before calling submit_summary.";
 
     private const string SummaryFunctionName = "submit_summary";
+    private const string FlagResourceFunctionName = "flag_resource";
     private const int MinExplorationIterations = 3;
+
+    private static readonly JsonObject FlagResourceFunctionDefinition = new()
+    {
+        ["type"] = "function",
+        ["name"] = FlagResourceFunctionName,
+        ["description"] = "Register a high-value resource (article, file, download) discovered during exploration. Never call this for search pages or navigation hubs.",
+        ["strict"] = true,
+        ["parameters"] = new JsonObject
+        {
+            ["type"] = "object",
+            ["additionalProperties"] = false,
+            ["properties"] = new JsonObject
+            {
+                ["url"] = new JsonObject
+                {
+                    ["type"] = "string",
+                    ["description"] = "Direct URL to the source resource. Must not be a search or listing page."
+                },
+                ["title"] = new JsonObject
+                {
+                    ["type"] = new JsonArray("string", "null"),
+                    ["description"] = "Readable title for the resource."
+                },
+                ["notes"] = new JsonObject
+                {
+                    ["type"] = new JsonArray("string", "null"),
+                    ["description"] = "Optional rationale explaining why this resource matters."
+                },
+                ["mimeType"] = new JsonObject
+                {
+                    ["type"] = new JsonArray("string", "null"),
+                    ["description"] = "Optional MIME type (for example, application/pdf)."
+                },
+                ["type"] = new JsonObject
+                {
+                    ["type"] = new JsonArray("string", "null"),
+                    ["description"] = "Resource classification.",
+                    ["enum"] = new JsonArray("page", "file", "download")
+                }
+            },
+            ["required"] = new JsonArray("url")
+        }
+    };
 
     private static readonly JsonObject SummaryFunctionDefinition = new()
     {
         ["type"] = "function",
         ["name"] = SummaryFunctionName,
-        ["description"] = "Finalize the exploration by returning the structured findings and flagged resources.",
+        ["description"] = "Finalize the exploration by returning the structured findings and previously flagged resources.",
         ["strict"] = true,
         ["parameters"] = new JsonObject
         {
@@ -70,28 +113,22 @@ You control a Chromium browser. Investigate the query, open promising results, a
                 ["flagged"] = new JsonObject
                 {
                     ["type"] = "array",
-                    ["description"] = "Resources (pages, files, downloads) worth revisiting.",
+                    ["description"] = "Resources worth revisiting that were discovered via flag_resource.",
                     ["items"] = new JsonObject
                     {
                         ["type"] = "object",
                         ["additionalProperties"] = false,
                         ["properties"] = new JsonObject
                         {
-                            ["type"] = new JsonObject
-                            {
-                                ["type"] = "string",
-                                ["enum"] = new JsonArray("page", "file", "download"),
-                                ["description"] = "Resource type classification."
-                            },
-                            ["title"] = new JsonObject
-                            {
-                                ["type"] = "string",
-                                ["description"] = "Human-readable title for the resource."
-                            },
                             ["url"] = new JsonObject
                             {
                                 ["type"] = "string",
                                 ["description"] = "Fully-qualified URL pointing to the resource."
+                            },
+                            ["title"] = new JsonObject
+                            {
+                                ["type"] = new JsonArray("string", "null"),
+                                ["description"] = "Human-readable title for the resource."
                             },
                             ["notes"] = new JsonObject
                             {
@@ -102,9 +139,15 @@ You control a Chromium browser. Investigate the query, open promising results, a
                             {
                                 ["type"] = new JsonArray("string", "null"),
                                 ["description"] = "Optional MIME type if known (e.g., application/pdf)."
+                            },
+                            ["type"] = new JsonObject
+                            {
+                                ["type"] = new JsonArray("string", "null"),
+                                ["description"] = "Resource type classification.",
+                                ["enum"] = new JsonArray("page", "file", "download")
                             }
                         },
-                        ["required"] = new JsonArray("type", "title", "url", "notes", "mimeType")
+                        ["required"] = new JsonArray("url")
                     }
                 }
             },
@@ -184,6 +227,8 @@ You control a Chromium browser. Investigate the query, open promising results, a
     };
 
     private bool _supportsSummaryFunction = true;
+
+    private readonly List<FlaggedResource> _flaggedResources = new();
 
     private const string ConsentDismissScript = @"() => {
         const selectors = ['#bnp_btn_reject', '#bnp_btn_decline', '[aria-label*=""Reject"" i]', '[aria-label*=""Decline"" i]'];
@@ -335,6 +380,8 @@ You control a Chromium browser. Investigate the query, open promising results, a
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(query);
 
+        _flaggedResources.Clear();
+
         CancellationToken effectiveToken = cancellationToken;
         CancellationTokenSource? timeoutCts = null;
         Stopwatch? stopwatch = null;
@@ -458,6 +505,8 @@ You control a Chromium browser. Investigate the query, open promising results, a
     public async Task<ComputerUseExplorationResult> ExploreAsync(string url, string? objective = null, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(url);
+
+        _flaggedResources.Clear();
 
         CancellationToken originalToken = cancellationToken;
         CancellationToken effectiveToken = cancellationToken;
@@ -804,6 +853,8 @@ You control a Chromium browser. Investigate the query, open promising results, a
             tools.Add(SummaryFunctionDefinition.DeepClone());
         }
 
+        tools.Add(FlagResourceFunctionDefinition.DeepClone());
+
         return tools;
     }
 
@@ -880,7 +931,7 @@ You control a Chromium browser. Investigate the query, open promising results, a
         string? summaryResponseId = null;
         List<string>? capturedSegments = null;
 
-        void ProcessSummaryCandidate(JsonElement candidate)
+        void ProcessToolCandidate(JsonElement candidate)
         {
             if (TryExtractSummaryFunction(candidate, out ExplorationPayload? payload, out string? rawJson, out string? callId))
             {
@@ -891,6 +942,11 @@ You control a Chromium browser. Investigate the query, open promising results, a
                     summaryCallId = callId;
                     summaryResponseId = responseId;
                 }
+            }
+
+            if (TryExtractFlagResourceFunction(candidate, out FlaggedResource resource, out string? flagRaw))
+            {
+                RegisterFlaggedResource(resource, flagRaw);
             }
         }
 
@@ -969,11 +1025,11 @@ You control a Chromium browser. Investigate the query, open promising results, a
                                 }
                             }
 
-                            ProcessSummaryCandidate(content);
+                            ProcessToolCandidate(content);
                         }
                     }
 
-                    ProcessSummaryCandidate(item);
+                    ProcessToolCandidate(item);
                 }
                 else if (string.Equals(type, "reasoning", StringComparison.OrdinalIgnoreCase))
                 {
@@ -1027,7 +1083,7 @@ You control a Chromium browser. Investigate the query, open promising results, a
                 }
                 else
                 {
-                    ProcessSummaryCandidate(item);
+                    ProcessToolCandidate(item);
                 }
             }
         }
@@ -1052,17 +1108,47 @@ You control a Chromium browser. Investigate the query, open promising results, a
 
         if (summaryPayload is not null)
         {
-            RecordTimelineEvent("submit_summary", new Dictionary<string, object?>
+            int summaryFlaggedCount = summaryPayload.Flagged?.Count ?? 0;
+            int toolFlaggedCount = _flaggedResources.Count;
+
+            var distinctUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (summaryPayload.Flagged is not null)
+            {
+                foreach (ExplorationPayloadResource? resource in summaryPayload.Flagged)
+                {
+                    string? url = resource?.Url;
+                    if (!string.IsNullOrWhiteSpace(url))
+                    {
+                        distinctUrls.Add(url.Trim());
+                    }
+                }
+            }
+
+            foreach (FlaggedResource resource in _flaggedResources)
+            {
+                distinctUrls.Add(resource.Url);
+            }
+
+            int totalFlaggedCount = distinctUrls.Count;
+
+            var timelinePayload = new Dictionary<string, object?>
             {
                 ["summary"] = summaryPayload.Summary,
                 ["findings"] = summaryPayload.Findings?.Count ?? 0,
-                ["flagged"] = summaryPayload.Flagged?.Count ?? 0,
+                ["flagged"] = totalFlaggedCount,
+                ["summaryFlagged"] = summaryFlaggedCount,
+                ["toolFlagged"] = toolFlaggedCount,
                 ["raw"] = summaryRawJson
-            });
+            };
 
-            _logger.LogInformation("Captured submit_summary payload with {FindingsCount} findings and {FlaggedCount} flagged resources.",
+            RecordTimelineEvent("submit_summary", timelinePayload);
+
+            _logger.LogInformation(
+                "Captured submit_summary payload with {FindingsCount} findings, {SummaryFlaggedCount} summary resources, {ToolFlaggedCount} tool-flagged resources (total distinct {TotalFlaggedCount}).",
                 summaryPayload.Findings?.Count ?? 0,
-                summaryPayload.Flagged?.Count ?? 0);
+                summaryFlaggedCount,
+                toolFlaggedCount,
+                totalFlaggedCount);
         }
 
         return new ComputerUseResponseState(responseId, call, completed, summaryCallId)
@@ -1079,75 +1165,14 @@ You control a Chromium browser. Investigate the query, open promising results, a
         rawJson = null;
         callId = null;
 
-        if (element.ValueKind != JsonValueKind.Object)
-        {
-            return false;
-        }
-
-        string? name = null;
-        JsonElement? argumentsElement = null;
-        string? callIdCandidate = ResolveCallId(element);
-
-        if (element.TryGetProperty("name", out var directName) && directName.ValueKind == JsonValueKind.String)
-        {
-            name = directName.GetString();
-        }
-
-        if (element.TryGetProperty("arguments", out var directArgs) && directArgs.ValueKind != JsonValueKind.Undefined)
-        {
-            argumentsElement = directArgs;
-        }
-
-        if (argumentsElement is null && element.TryGetProperty("function", out var functionElement) && functionElement.ValueKind == JsonValueKind.Object)
-        {
-            if (string.IsNullOrWhiteSpace(name) && functionElement.TryGetProperty("name", out var functionName) && functionName.ValueKind == JsonValueKind.String)
-            {
-                name = functionName.GetString();
-            }
-
-            if (functionElement.TryGetProperty("arguments", out var functionArgs) && functionArgs.ValueKind != JsonValueKind.Undefined)
-            {
-                argumentsElement = functionArgs;
-            }
-
-            callIdCandidate ??= ResolveCallId(functionElement);
-        }
-
-        if (argumentsElement is null && element.TryGetProperty("tool", out var toolElement) && toolElement.ValueKind == JsonValueKind.Object)
-        {
-            if (string.IsNullOrWhiteSpace(name) && toolElement.TryGetProperty("name", out var toolName) && toolName.ValueKind == JsonValueKind.String)
-            {
-                name = toolName.GetString();
-            }
-
-            if (toolElement.TryGetProperty("arguments", out var toolArgs) && toolArgs.ValueKind != JsonValueKind.Undefined)
-            {
-                argumentsElement = toolArgs;
-            }
-
-            callIdCandidate ??= ResolveCallId(toolElement);
-        }
-
-        if (!string.Equals(name, SummaryFunctionName, StringComparison.OrdinalIgnoreCase) || argumentsElement is null)
-        {
-            return false;
-        }
-
-        string? rawArguments = argumentsElement.Value.ValueKind switch
-        {
-            JsonValueKind.String => argumentsElement.Value.GetString(),
-            JsonValueKind.Object or JsonValueKind.Array => argumentsElement.Value.GetRawText(),
-            _ => null
-        };
-
-        if (string.IsNullOrWhiteSpace(rawArguments))
+        if (!TryExtractFunctionArguments(element, SummaryFunctionName, out string? rawArguments, out string? callIdCandidate))
         {
             return false;
         }
 
         try
         {
-            ExplorationPayload? parsed = JsonSerializer.Deserialize<ExplorationPayload>(rawArguments, SerializerOptions);
+            ExplorationPayload? parsed = JsonSerializer.Deserialize<ExplorationPayload>(rawArguments!, SerializerOptions);
             if (parsed is null)
             {
                 return false;
@@ -1163,36 +1188,198 @@ You control a Chromium browser. Investigate the query, open promising results, a
             _logger.LogWarning(ex, "Failed to parse submit_summary payload: {Payload}", rawArguments);
             return false;
         }
+    }
 
-        static string? ResolveCallId(JsonElement candidate)
+    private bool TryExtractFlagResourceFunction(JsonElement element, out FlaggedResource resource, out string? rawJson)
+    {
+        resource = null!;
+        rawJson = null;
+
+        if (!TryExtractFunctionArguments(element, FlagResourceFunctionName, out string? rawArguments, out _))
         {
-            if (candidate.ValueKind != JsonValueKind.Object)
+            return false;
+        }
+
+        try
+        {
+            ExplorationPayloadResource? parsed = JsonSerializer.Deserialize<ExplorationPayloadResource>(rawArguments!, SerializerOptions);
+            if (parsed is null)
             {
-                return null;
+                return false;
             }
 
-            if (candidate.TryGetProperty("call_id", out var callId) && callId.ValueKind == JsonValueKind.String)
+            FlaggedResource? converted = TryConvertResource(parsed);
+            if (converted is null)
             {
-                return callId.GetString();
+                return false;
             }
 
-            if (candidate.TryGetProperty("tool_call_id", out var toolCallId) && toolCallId.ValueKind == JsonValueKind.String)
+            resource = converted;
+            rawJson = rawArguments;
+            return true;
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogWarning(ex, "Failed to parse flag_resource payload: {Payload}", rawArguments);
+            return false;
+        }
+    }
+
+    private void RegisterFlaggedResource(FlaggedResource resource, string? rawJson)
+    {
+        int existingIndex = _flaggedResources.FindIndex(existing => string.Equals(existing.Url, resource.Url, StringComparison.OrdinalIgnoreCase));
+        bool isNew = existingIndex < 0;
+
+        if (isNew)
+        {
+            _flaggedResources.Add(resource);
+        }
+        else
+        {
+            FlaggedResource merged = MergeFlaggedResource(_flaggedResources[existingIndex], resource);
+            _flaggedResources[existingIndex] = merged;
+            resource = merged;
+        }
+
+        var metadata = new Dictionary<string, object?>
+        {
+            ["url"] = resource.Url,
+            ["title"] = resource.Title,
+            ["type"] = resource.Type.ToString(),
+            ["new"] = isNew
+        };
+
+        if (!string.IsNullOrWhiteSpace(resource.MimeType))
+        {
+            metadata["mimeType"] = resource.MimeType;
+        }
+
+        if (!string.IsNullOrWhiteSpace(resource.Notes))
+        {
+            metadata["notes"] = resource.Notes;
+        }
+
+        if (!string.IsNullOrWhiteSpace(rawJson))
+        {
+            metadata["raw"] = rawJson;
+        }
+
+        RecordTimelineEvent("flag_resource", metadata);
+
+        if (isNew)
+        {
+            _logger.LogInformation("Captured flagged resource {Url} ({Type}) via flag_resource.", resource.Url, resource.Type);
+        }
+        else
+        {
+            _logger.LogInformation("Updated flagged resource {Url} ({Type}) via flag_resource.", resource.Url, resource.Type);
+        }
+    }
+
+    private static bool TryExtractFunctionArguments(JsonElement element, string functionName, out string? rawArguments, out string? callId)
+    {
+        rawArguments = null;
+        callId = null;
+
+        if (element.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+
+        string? name = null;
+        JsonElement? argumentsElement = null;
+        string? callIdCandidate = ResolveFunctionCallId(element);
+
+        if (element.TryGetProperty("name", out var directName) && directName.ValueKind == JsonValueKind.String)
+        {
+            name = directName.GetString();
+        }
+
+        if (element.TryGetProperty("arguments", out var directArgs) && directArgs.ValueKind != JsonValueKind.Undefined)
+        {
+            argumentsElement = directArgs;
+        }
+
+        if (argumentsElement is null && element.TryGetProperty("function", out var functionElement) && functionElement.ValueKind == JsonValueKind.Object)
+        {
+            if (string.IsNullOrWhiteSpace(name) && functionElement.TryGetProperty("name", out var functionNameElement) && functionNameElement.ValueKind == JsonValueKind.String)
             {
-                return toolCallId.GetString();
+                name = functionNameElement.GetString();
             }
 
-            if (candidate.TryGetProperty("id", out var idElement) && idElement.ValueKind == JsonValueKind.String)
+            if (functionElement.TryGetProperty("arguments", out var functionArgs) && functionArgs.ValueKind != JsonValueKind.Undefined)
             {
-                return idElement.GetString();
+                argumentsElement = functionArgs;
             }
 
-            if (candidate.TryGetProperty("callId", out var camelCase) && camelCase.ValueKind == JsonValueKind.String)
+            callIdCandidate ??= ResolveFunctionCallId(functionElement);
+        }
+
+        if (argumentsElement is null && element.TryGetProperty("tool", out var toolElement) && toolElement.ValueKind == JsonValueKind.Object)
+        {
+            if (string.IsNullOrWhiteSpace(name) && toolElement.TryGetProperty("name", out var toolName) && toolName.ValueKind == JsonValueKind.String)
             {
-                return camelCase.GetString();
+                name = toolName.GetString();
             }
 
+            if (toolElement.TryGetProperty("arguments", out var toolArgs) && toolArgs.ValueKind != JsonValueKind.Undefined)
+            {
+                argumentsElement = toolArgs;
+            }
+
+            callIdCandidate ??= ResolveFunctionCallId(toolElement);
+        }
+
+        if (!string.Equals(name, functionName, StringComparison.OrdinalIgnoreCase) || argumentsElement is null)
+        {
+            return false;
+        }
+
+        rawArguments = argumentsElement.Value.ValueKind switch
+        {
+            JsonValueKind.String => argumentsElement.Value.GetString(),
+            JsonValueKind.Object or JsonValueKind.Array => argumentsElement.Value.GetRawText(),
+            _ => null
+        };
+
+        if (string.IsNullOrWhiteSpace(rawArguments))
+        {
+            rawArguments = null;
+            return false;
+        }
+
+        callId = callIdCandidate;
+        return true;
+    }
+
+    private static string? ResolveFunctionCallId(JsonElement candidate)
+    {
+        if (candidate.ValueKind != JsonValueKind.Object)
+        {
             return null;
         }
+
+        if (candidate.TryGetProperty("call_id", out var callId) && callId.ValueKind == JsonValueKind.String)
+        {
+            return callId.GetString();
+        }
+
+        if (candidate.TryGetProperty("tool_call_id", out var toolCallId) && toolCallId.ValueKind == JsonValueKind.String)
+        {
+            return toolCallId.GetString();
+        }
+
+        if (candidate.TryGetProperty("id", out var idElement) && idElement.ValueKind == JsonValueKind.String)
+        {
+            return idElement.GetString();
+        }
+
+        if (candidate.TryGetProperty("callId", out var camelCase) && camelCase.ValueKind == JsonValueKind.String)
+        {
+            return camelCase.GetString();
+        }
+
+        return null;
     }
 
     private static ComputerUseAction? ParseAction(JsonElement element)
@@ -2742,14 +2929,18 @@ You control a Chromium browser. Investigate the query, open promising results, a
 
     private ExplorationStructuredOutput ParseExplorationStructuredOutput(IReadOnlyList<string> transcript, ExplorationPayload? summaryPayload, string? summaryRawJson)
     {
+        FlaggedResource[] flaggedFromToolCalls = _flaggedResources.Count == 0
+            ? Array.Empty<FlaggedResource>()
+            : _flaggedResources.ToArray();
+
         if (summaryPayload is not null)
         {
-            return ConvertPayloadToStructuredOutput(summaryPayload, summaryRawJson);
+            return ConvertPayloadToStructuredOutput(summaryPayload, summaryRawJson, flaggedFromToolCalls);
         }
 
         if (transcript.Count == 0)
         {
-            return new ExplorationStructuredOutput(null, Array.Empty<string>(), Array.Empty<FlaggedResource>(), null);
+            return new ExplorationStructuredOutput(null, Array.Empty<string>(), flaggedFromToolCalls, null);
         }
 
         for (int index = transcript.Count - 1; index >= 0; index--)
@@ -2760,13 +2951,13 @@ You control a Chromium browser. Investigate the query, open promising results, a
                 continue;
             }
 
-            return ConvertPayloadToStructuredOutput(payload, rawJson);
+            return ConvertPayloadToStructuredOutput(payload, rawJson, flaggedFromToolCalls);
         }
 
-        return new ExplorationStructuredOutput(null, Array.Empty<string>(), Array.Empty<FlaggedResource>(), null);
+        return new ExplorationStructuredOutput(null, Array.Empty<string>(), flaggedFromToolCalls, null);
     }
 
-    private static ExplorationStructuredOutput ConvertPayloadToStructuredOutput(ExplorationPayload payload, string? rawJson)
+    private static ExplorationStructuredOutput ConvertPayloadToStructuredOutput(ExplorationPayload payload, string? rawJson, IReadOnlyCollection<FlaggedResource> flaggedFromToolCalls)
     {
         IReadOnlyList<string> findings = payload.Findings is { Count: > 0 }
             ? payload.Findings
@@ -2777,14 +2968,44 @@ You control a Chromium browser. Investigate the query, open promising results, a
                 .ToArray()
             : Array.Empty<string>();
 
-        List<FlaggedResource> flagged = payload.Flagged is null
+        var flaggedLookup = new Dictionary<string, FlaggedResource>(StringComparer.OrdinalIgnoreCase);
+        var order = new List<string>();
+
+        void AddOrMerge(FlaggedResource candidate)
+        {
+            if (flaggedLookup.TryGetValue(candidate.Url, out var existing))
+            {
+                flaggedLookup[candidate.Url] = MergeFlaggedResource(existing, candidate);
+            }
+            else
+            {
+                flaggedLookup[candidate.Url] = candidate;
+                order.Add(candidate.Url);
+            }
+        }
+
+        if (payload.Flagged is not null)
+        {
+            foreach (FlaggedResource? resource in payload.Flagged.Select(TryConvertResource))
+            {
+                if (resource is not null)
+                {
+                    AddOrMerge(resource);
+                }
+            }
+        }
+
+        if (flaggedFromToolCalls.Count > 0)
+        {
+            foreach (FlaggedResource resource in flaggedFromToolCalls)
+            {
+                AddOrMerge(resource);
+            }
+        }
+
+        List<FlaggedResource> flagged = order.Count == 0
             ? new List<FlaggedResource>()
-            : payload.Flagged
-                .Select(TryConvertResource)
-                .Where(static resource => resource is not null)
-                .Select(static resource => resource!)
-                .DistinctBy(static resource => resource.Url, StringComparer.OrdinalIgnoreCase)
-                .ToList();
+            : order.Select(url => flaggedLookup[url]).ToList();
 
         return new ExplorationStructuredOutput(payload.Summary, findings, flagged, rawJson);
     }
@@ -2865,6 +3086,66 @@ You control a Chromium browser. Investigate the query, open promising results, a
         }
 
         return new FlaggedResource(type, title, url, mime, notes);
+    }
+
+    private static FlaggedResource MergeFlaggedResource(FlaggedResource existing, FlaggedResource incoming)
+    {
+        FlaggedResourceType type = existing.Type;
+        if (type == FlaggedResourceType.Page && incoming.Type != FlaggedResourceType.Page)
+        {
+            type = incoming.Type;
+        }
+
+        string title = SelectPreferredTitle(existing.Title, incoming.Title, existing.Url);
+        string? mimeType = SelectPreferredOptional(existing.MimeType, incoming.MimeType);
+        string? notes = SelectPreferredOptional(existing.Notes, incoming.Notes);
+
+        return existing with
+        {
+            Type = type,
+            Title = title,
+            MimeType = mimeType,
+            Notes = notes
+        };
+    }
+
+    private static string SelectPreferredTitle(string currentTitle, string incomingTitle, string url)
+    {
+        string normalizedCurrent = string.IsNullOrWhiteSpace(currentTitle) ? url : currentTitle.Trim();
+        string normalizedIncoming = string.IsNullOrWhiteSpace(incomingTitle) ? url : incomingTitle.Trim();
+
+        bool currentIsPlaceholder = string.Equals(normalizedCurrent, url, StringComparison.OrdinalIgnoreCase);
+        bool incomingIsPlaceholder = string.Equals(normalizedIncoming, url, StringComparison.OrdinalIgnoreCase);
+
+        if (currentIsPlaceholder && !incomingIsPlaceholder)
+        {
+            return normalizedIncoming;
+        }
+
+        if (!incomingIsPlaceholder && normalizedIncoming.Length > normalizedCurrent.Length)
+        {
+            return normalizedIncoming;
+        }
+
+        return normalizedCurrent;
+    }
+
+    private static string? SelectPreferredOptional(string? current, string? incoming)
+    {
+        string? normalizedCurrent = string.IsNullOrWhiteSpace(current) ? null : current.Trim();
+        string? normalizedIncoming = string.IsNullOrWhiteSpace(incoming) ? null : incoming.Trim();
+
+        if (normalizedIncoming is null)
+        {
+            return normalizedCurrent;
+        }
+
+        if (normalizedCurrent is null)
+        {
+            return normalizedIncoming;
+        }
+
+        return normalizedCurrent.Length >= normalizedIncoming.Length ? normalizedCurrent : normalizedIncoming;
     }
 
     private static bool LooksLikePdf(string url, string? mime)
