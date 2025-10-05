@@ -62,8 +62,10 @@ public static class Settings
             provider = WebSearchProvider.GoogleApi;
         }
 
-        string googleApiKey = configuration["GOOGLE_API_KEY"]?.Trim() ?? string.Empty;
-        string googleSearchEngineId = configuration["GOOGLE_SEARCH_ENGINE_ID"]?.Trim() ?? string.Empty;
+    string googleApiKey = configuration["GOOGLE_API_KEY"]?.Trim() ?? string.Empty;
+    string googleSearchEngineId = configuration["GOOGLE_SEARCH_ENGINE_ID"]?.Trim() ?? string.Empty;
+    string? reasoningEffortLevel = configuration["AzureOpenAI:ReasoningEffortLevel"]?.Trim();
+    reasoningEffortLevel ??= configuration["AZURE_OPENAI_REASONING_EFFORT_LEVEL"]?.Trim();
     string? computerUseDeployment = configuration["AZURE_OPENAI_COMPUTER_USE_DEPLOYMENT"]?.Trim();
     bool computerUseEnabled = true;
     ComputerUseMode computerUseMode = ComputerUseMode.Hybrid;
@@ -120,7 +122,8 @@ public static class Settings
             ComputerUseMode = computerUseMode,
             CacheDirectory = ResolveDirectory(configuration["CACHE_DIRECTORY"], Path.Combine("debug", "cache")),
             ReportsDirectory = ResolveDirectory(configuration["REPORTS_DIRECTORY"], Path.Combine("debug", "reports")),
-            PrimaryResearchObjective = configuration["PRIMARY_RESEARCH_OBJECTIVE"]?.Trim()
+            PrimaryResearchObjective = configuration["PRIMARY_RESEARCH_OBJECTIVE"]?.Trim(),
+            AzureOpenAiReasoningEffortLevel = reasoningEffortLevel
         };
 
         if (missing.Count > 0)
@@ -169,6 +172,7 @@ public static class Settings
         public required string CacheDirectory { get; init; }
         public required string ReportsDirectory { get; init; }
         public string? PrimaryResearchObjective { get; init; }
+        public string? AzureOpenAiReasoningEffortLevel { get; init; }
     }
 }
 

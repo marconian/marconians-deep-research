@@ -10,6 +10,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using System.ClientModel;
 
+#pragma warning disable OPENAI001
 namespace Marconian.ResearchAgent.Services.OpenAI;
 
 public sealed class AzureOpenAiService : IAzureOpenAiService
@@ -19,6 +20,7 @@ public sealed class AzureOpenAiService : IAzureOpenAiService
     private readonly string _chatDeploymentName;
     private readonly string _embeddingDeploymentName;
     private readonly ILogger<AzureOpenAiService> _logger;
+    private readonly ChatReasoningEffortLevel? _reasoningEffortLevel;
 
     public AzureOpenAiService(Settings.AppSettings settings, ILogger<AzureOpenAiService>? logger = null)
     {
@@ -30,6 +32,18 @@ public sealed class AzureOpenAiService : IAzureOpenAiService
         _embeddingDeploymentName = settings.AzureOpenAiEmbeddingDeployment;
         _chatClient = client.GetChatClient(_chatDeploymentName);
         _embeddingsClient = client.GetEmbeddingClient(_embeddingDeploymentName);
+
+        if (!string.IsNullOrWhiteSpace(settings.AzureOpenAiReasoningEffortLevel))
+        {
+            if (Enum.TryParse(settings.AzureOpenAiReasoningEffortLevel, ignoreCase: true, out ChatReasoningEffortLevel parsedLevel))
+            {
+                _reasoningEffortLevel = parsedLevel;
+            }
+            else
+            {
+                _logger.LogWarning("Unknown Azure OpenAI reasoning effort level '{ReasoningEffortLevel}'. Falling back to service default.", settings.AzureOpenAiReasoningEffortLevel);
+            }
+        }
     }
 
     public async Task<string> GenerateTextAsync(OpenAiChatRequest request, CancellationToken cancellationToken = default)
@@ -71,6 +85,11 @@ public sealed class AzureOpenAiService : IAzureOpenAiService
                 request.JsonSchemaFormat.SchemaName,
                 BinaryData.FromString(request.JsonSchemaFormat.Schema.ToJsonString()),
                 jsonSchemaIsStrict: request.JsonSchemaFormat.Strict);
+        }
+
+        if (_reasoningEffortLevel is { } configuredEffortLevel)
+        {
+            options.ReasoningEffortLevel = configuredEffortLevel;
         }
 
         try
@@ -151,3 +170,4 @@ public sealed class AzureOpenAiService : IAzureOpenAiService
         return builder.ToString().Trim();
     }
 }
+#pragma warning restore OPENAI001

@@ -80,6 +80,7 @@ This architecture allows for massive parallelism, resilience, and specialization
     - `GOOGLE_SEARCH_ENGINE_ID`
     - `[Optional] COMPUTER_USE_ENABLED` (set to `false` to skip Playwright/computer-use search and force Google API mode)
     - `[Optional] PRIMARY_RESEARCH_OBJECTIVE` (default question when CLI args are omitted)
+    - `[Optional] AzureOpenAI:ReasoningEffortLevel` (maps to the Azure OpenAI chat `ReasoningEffortLevel`; accepted values are `low`, `medium`, or `high`; omit to accept the model default)
     - `[Optional] CACHE_DIRECTORY` (overrides the default `debug/cache` relative path)
     - `[Optional] REPORTS_DIRECTORY` (overrides the default `debug/reports` relative path)
 
