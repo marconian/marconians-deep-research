@@ -79,7 +79,7 @@ You control a Chromium browser. Investigate the query, open promising results, a
                     ["enum"] = new JsonArray("page", "file", "download")
                 }
             },
-            ["required"] = new JsonArray("url")
+            ["required"] = new JsonArray("url", "title", "notes", "mimeType", "type")
         }
     };
 
@@ -147,7 +147,7 @@ You control a Chromium browser. Investigate the query, open promising results, a
                                 ["enum"] = new JsonArray("page", "file", "download")
                             }
                         },
-                        ["required"] = new JsonArray("url")
+                        ["required"] = new JsonArray("url", "title", "notes", "mimeType", "type")
                     }
                 }
             },
@@ -1871,11 +1871,46 @@ You control a Chromium browser. Investigate the query, open promising results, a
         string json = await _page.EvaluateAsync<string>(script).ConfigureAwait(false);
         try
         {
+            var normalizedResults = new List<ComputerUseSearchResultItem>();
             var items = JsonSerializer.Deserialize<List<ComputerUseSearchResultItem>>(json, SerializerOptions);
-            var filtered = items?.Where(item => !string.IsNullOrWhiteSpace(item.Title) && !string.IsNullOrWhiteSpace(item.Url)).ToList()
-                           ?? new List<ComputerUseSearchResultItem>();
 
-            if (filtered.Count == 0)
+            if (items is not null)
+            {
+                var seenUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var item in items)
+                {
+                    if (item is null || string.IsNullOrWhiteSpace(item.Title) || string.IsNullOrWhiteSpace(item.Url))
+                    {
+                        continue;
+                    }
+
+                    string? normalizedUrl = NormalizeNavigableUrl(item.Url);
+                    if (string.IsNullOrWhiteSpace(normalizedUrl))
+                    {
+                        continue;
+                    }
+
+                    if (LooksLikeSearchHub(normalizedUrl))
+                    {
+                        _logger.LogDebug("Skipping search hub URL '{Url}' when extracting results for query '{Query}'.", item.Url, query);
+                        continue;
+                    }
+
+                    if (!seenUrls.Add(normalizedUrl))
+                    {
+                        continue;
+                    }
+
+                    if (!string.Equals(item.Url, normalizedUrl, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _logger.LogDebug("Normalized search result URL from '{Original}' to '{Normalized}' for query '{Query}'.", item.Url, normalizedUrl, query);
+                    }
+
+                    normalizedResults.Add(new ComputerUseSearchResultItem(item.Title, normalizedUrl, item.Snippet ?? string.Empty));
+                }
+            }
+
+            if (normalizedResults.Count == 0)
             {
                 string transcriptSummary = transcript.Count == 0 ? "<empty>" : string.Join(" | ", transcript.Take(8));
                 string? currentUrl = _page?.Url;
@@ -1883,7 +1918,7 @@ You control a Chromium browser. Investigate the query, open promising results, a
                 await PersistDebugArtifactsAsync(query, json, cancellationToken).ConfigureAwait(false);
             }
 
-            return filtered;
+            return normalizedResults;
         }
         catch (JsonException ex)
         {
@@ -3069,6 +3104,14 @@ You control a Chromium browser. Investigate the query, open promising results, a
             return null;
         }
 
+        string? normalizedUrl = NormalizeNavigableUrl(url);
+        if (string.IsNullOrWhiteSpace(normalizedUrl) || LooksLikeSearchHub(normalizedUrl))
+        {
+            return null;
+        }
+
+        url = normalizedUrl;
+
         string title = string.IsNullOrWhiteSpace(resource.Title) ? url : resource.Title!.Trim();
         string? mime = string.IsNullOrWhiteSpace(resource.MimeType) ? null : resource.MimeType!.Trim();
         string? notes = string.IsNullOrWhiteSpace(resource.Notes) ? null : resource.Notes!.Trim();
@@ -3165,6 +3208,233 @@ You control a Chromium browser. Investigate the query, open promising results, a
         }
         else if (url.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
         {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static string? NormalizeNavigableUrl(string url, int depth = 0)
+    {
+        if (string.IsNullOrWhiteSpace(url) || depth > 2)
+        {
+            return url;
+        }
+
+        if (!TryCreateAbsoluteUri(url, out var uri))
+        {
+            // Attempt to coerce bare redirect paths from Google results into absolute URIs.
+            if (url.StartsWith("/url", StringComparison.OrdinalIgnoreCase) &&
+                Uri.TryCreate("https://www.google.com" + url, UriKind.Absolute, out var corrected))
+            {
+                uri = corrected;
+            }
+            else
+            {
+                return url;
+            }
+        }
+
+        string host = uri.Host;
+        string path = uri.AbsolutePath;
+
+        if (IsGoogleWebHost(host))
+        {
+            if (path.Equals("/url", StringComparison.OrdinalIgnoreCase))
+            {
+                var query = ParseQueryParameters(uri.Query);
+                if (TryResolveTarget(query, ["url", "q"], out var candidate))
+                {
+                    return NormalizeNavigableUrl(candidate!, depth + 1);
+                }
+            }
+            else if (path.Equals("/imgres", StringComparison.OrdinalIgnoreCase))
+            {
+                var query = ParseQueryParameters(uri.Query);
+                if (TryResolveTarget(query, ["imgurl", "imgrefurl"], out var imageTarget))
+                {
+                    return NormalizeNavigableUrl(imageTarget!, depth + 1);
+                }
+            }
+        }
+        else if (IsBingWebHost(host))
+        {
+            if (path.Equals("/ck/a", StringComparison.OrdinalIgnoreCase) || path.Equals("/r", StringComparison.OrdinalIgnoreCase))
+            {
+                var query = ParseQueryParameters(uri.Query);
+                if (TryResolveTarget(query, ["u", "url"], out var targetUrl))
+                {
+                    return NormalizeNavigableUrl(targetUrl!, depth + 1);
+                }
+            }
+        }
+
+        return uri?.AbsoluteUri ?? url;
+    }
+
+    private static bool LooksLikeSearchHub(string url)
+    {
+        if (string.IsNullOrWhiteSpace(url) || !Uri.TryCreate(url, UriKind.Absolute, out var uri))
+        {
+            if (!TryCreateAbsoluteUri(url, out uri))
+            {
+                return false;
+            }
+        }
+
+        string host = uri.Host;
+        string path = uri.AbsolutePath;
+
+        if (IsGoogleWebHost(host))
+        {
+            if (path is "/" or "/search" || path.StartsWith("/search", StringComparison.OrdinalIgnoreCase) || path.StartsWith("/webhp", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        if (IsBingWebHost(host))
+        {
+            if (path is "/" || path.StartsWith("/search", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsGoogleWebHost(string host)
+    {
+        if (string.IsNullOrWhiteSpace(host))
+        {
+            return false;
+        }
+
+        host = host.Trim().ToLowerInvariant();
+        if (host.Equals("google.com", StringComparison.Ordinal) || host.Equals("www.google.com", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        if (host.EndsWith(".google.com", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        if (host.StartsWith("google.", StringComparison.Ordinal) || host.StartsWith("www.google.", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        return host.Contains(".google.", StringComparison.Ordinal);
+    }
+
+    private static bool IsBingWebHost(string host)
+    {
+        if (string.IsNullOrWhiteSpace(host))
+        {
+            return false;
+        }
+
+        host = host.Trim().ToLowerInvariant();
+        if (host.Equals("bing.com", StringComparison.Ordinal) || host.Equals("www.bing.com", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        if (host.EndsWith(".bing.com", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        return host.StartsWith("www.bing.", StringComparison.Ordinal);
+    }
+
+    private static Dictionary<string, string> ParseQueryParameters(string query)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(query))
+        {
+            return result;
+        }
+
+        string trimmed = query[0] == '?' ? query[1..] : query;
+        foreach (string segment in trimmed.Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            int separator = segment.IndexOf('=');
+            string key;
+            string value;
+
+            if (separator < 0)
+            {
+                key = WebUtility.UrlDecode(segment);
+                value = string.Empty;
+            }
+            else
+            {
+                key = WebUtility.UrlDecode(segment[..separator]);
+                value = WebUtility.UrlDecode(segment[(separator + 1)..]);
+            }
+
+            if (string.IsNullOrWhiteSpace(key) || result.ContainsKey(key))
+            {
+                continue;
+            }
+
+            result[key] = value;
+        }
+
+        return result;
+    }
+
+    private static bool TryResolveTarget(Dictionary<string, string> parameters, ReadOnlySpan<string> preferredKeys, out string? target)
+    {
+        foreach (string key in preferredKeys)
+        {
+            if (parameters.TryGetValue(key, out string? value) && !string.IsNullOrWhiteSpace(value))
+            {
+                string trimmed = value.Trim();
+                if (TryCreateAbsoluteUri(trimmed, out var candidate))
+                {
+                    target = candidate.AbsoluteUri;
+                    return true;
+                }
+            }
+        }
+
+        target = null;
+        return false;
+    }
+
+    private static bool TryCreateAbsoluteUri(string value, out Uri uri)
+    {
+        uri = null!;
+
+        if (Uri.TryCreate(value, UriKind.Absolute, out var absolute))
+        {
+            uri = absolute;
+            return true;
+        }
+
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        string trimmed = value.Trim();
+        if (trimmed.StartsWith("//", StringComparison.Ordinal))
+        {
+            trimmed = "https:" + trimmed;
+        }
+        else if (!trimmed.StartsWith("http://", StringComparison.OrdinalIgnoreCase) && !trimmed.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        {
+            trimmed = "https://" + trimmed;
+        }
+
+        if (Uri.TryCreate(trimmed, UriKind.Absolute, out absolute))
+        {
+            uri = absolute;
             return true;
         }
 

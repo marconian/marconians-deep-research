@@ -35,7 +35,7 @@ public sealed class AzureOpenAiService : IAzureOpenAiService
 
         if (!string.IsNullOrWhiteSpace(settings.AzureOpenAiReasoningEffortLevel))
         {
-            if (Enum.TryParse(settings.AzureOpenAiReasoningEffortLevel, ignoreCase: true, out ChatReasoningEffortLevel parsedLevel))
+            if (TryResolveReasoningEffortLevel(settings.AzureOpenAiReasoningEffortLevel, out var parsedLevel))
             {
                 _reasoningEffortLevel = parsedLevel;
             }
@@ -168,6 +168,31 @@ public sealed class AzureOpenAiService : IAzureOpenAiService
         }
 
         return builder.ToString().Trim();
+    }
+
+    private static bool TryResolveReasoningEffortLevel(string value, out ChatReasoningEffortLevel effortLevel)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            effortLevel = default;
+            return false;
+        }
+
+        switch (value.Trim().ToLowerInvariant())
+        {
+            case "low":
+                effortLevel = ChatReasoningEffortLevel.Low;
+                return true;
+            case "medium":
+                effortLevel = ChatReasoningEffortLevel.Medium;
+                return true;
+            case "high":
+                effortLevel = ChatReasoningEffortLevel.High;
+                return true;
+            default:
+                effortLevel = default;
+                return false;
+        }
     }
 }
 #pragma warning restore OPENAI001
