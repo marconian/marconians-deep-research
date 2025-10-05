@@ -221,6 +221,52 @@ public sealed class CosmosMemoryService : ICosmosMemoryService
         }
     }
 
+    public async Task<int> DeleteSessionAsync(string researchSessionId, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(researchSessionId))
+        {
+            return 0;
+        }
+
+        var container = await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
+        var query = new QueryDefinition("SELECT c.id FROM c WHERE c.researchSessionId = @session")
+            .WithParameter("@session", researchSessionId);
+
+        int deleted = 0;
+
+        using FeedIterator<CosmosIdOnly> iterator = container.GetItemQueryIterator<CosmosIdOnly>(
+            query,
+            requestOptions: new QueryRequestOptions
+            {
+                PartitionKey = new PartitionKey(researchSessionId)
+            });
+
+        while (iterator.HasMoreResults)
+        {
+            FeedResponse<CosmosIdOnly> response = await iterator.ReadNextAsync(cancellationToken).ConfigureAwait(false);
+            foreach (var item in response)
+            {
+                if (string.IsNullOrWhiteSpace(item.Id))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    await container.DeleteItemAsync<Dictionary<string, object?>>(item.Id, new PartitionKey(researchSessionId), cancellationToken: cancellationToken).ConfigureAwait(false);
+                    deleted++;
+                }
+                catch (CosmosException ex)
+                {
+                    _logger.LogWarning(ex, "Failed to delete record {RecordId} for session {SessionId}.", item.Id, researchSessionId);
+                }
+            }
+        }
+
+        _logger.LogInformation("Deleted {Count} records for session {SessionId}.", deleted, researchSessionId);
+        return deleted;
+    }
+
     public async ValueTask DisposeAsync()
     {
         _client.Dispose();
@@ -437,5 +483,11 @@ public sealed class CosmosMemoryService : ICosmosMemoryService
 
         [JsonPropertyName("distance")]
         public double Distance { get; init; }
+    }
+
+    private sealed class CosmosIdOnly
+    {
+        [JsonPropertyName("id")]
+        public string Id { get; init; } = string.Empty;
     }
 }

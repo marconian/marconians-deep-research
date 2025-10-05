@@ -16,4 +16,6 @@ public interface ICosmosMemoryService : IAsyncDisposable
 
     Task<IReadOnlyList<MemorySearchResult>> QuerySimilarAsync(string researchSessionId, IReadOnlyList<float> embedding, int limit, CancellationToken cancellationToken = default);
 
+    Task<int> DeleteSessionAsync(string researchSessionId, CancellationToken cancellationToken = default);
+
 }

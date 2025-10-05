@@ -7,6 +7,7 @@ using System.IO;
 using System.Net.Http;
 using Marconian.ResearchAgent.Agents;
 using Marconian.ResearchAgent.Configuration;
+using Marconian.ResearchAgent.ConsoleApp;
 using Marconian.ResearchAgent.Memory;
 using Marconian.ResearchAgent.Models.Agents;
 using Marconian.ResearchAgent.Models.Memory;
@@ -35,6 +36,16 @@ internal static class Program
     private const string SessionRecordType = "session_metadata";
 
     private sealed record SessionInfo(string SessionId, string Objective, string Status, DateTimeOffset CreatedAtUtc, DateTimeOffset UpdatedAtUtc, MemoryRecord Record);
+
+    private enum MenuAction
+    {
+        StartNew,
+        Resume,
+        RegenerateReport,
+        Exit
+    }
+
+    private sealed record MenuSelection(MenuAction Action, SessionInfo? SelectedSession, PlannerOutcome? PlannerOutcome);
 
     private static async Task<int> Main(string[] args)
     {
@@ -200,18 +211,46 @@ internal static class Program
                     ? WebSearchProvider.GoogleApi
                     : WebSearchProvider.ComputerUse;
 
-            ParseCommandLine(
-                args,
-                out string? resumeSessionId,
-                out string? providedQuery,
-                out string? reportDirectoryArgument,
-                out string? dumpSessionId,
-                out string? dumpDirectory,
-                out string? dumpType,
-                out int dumpLimit,
-                out string? diagnoseComputerUseArgument,
-                out string? reportOnlySessionId,
-                out string? diagnosticsMode);
+            CommandLineOptions options = CommandLineOptions.Parse(args);
+
+            if (options.ShowHelp)
+            {
+                PrintUsage();
+                return 0;
+            }
+
+            string? resumeSessionId = options.ResumeSessionId;
+            string? providedQuery = options.Query;
+            string? reportDirectoryArgument = options.ReportsDirectory;
+            string? dumpSessionId = options.DumpSessionId;
+            string? dumpDirectory = options.DumpDirectory;
+            string? dumpType = options.DumpType;
+            int dumpLimit = options.DumpLimit;
+            string? diagnoseComputerUseArgument = options.DiagnoseComputerUse;
+            string? reportOnlySessionId = options.ReportSessionId;
+            string? diagnosticsMode = options.DiagnosticsMode;
+
+            bool otherOperationsRequested =
+                !string.IsNullOrWhiteSpace(providedQuery) ||
+                !string.IsNullOrWhiteSpace(resumeSessionId) ||
+                !string.IsNullOrWhiteSpace(reportOnlySessionId) ||
+                !string.IsNullOrWhiteSpace(dumpSessionId) ||
+                !string.IsNullOrWhiteSpace(diagnoseComputerUseArgument) ||
+                !string.IsNullOrWhiteSpace(diagnosticsMode);
+
+            if (options.ListSessions && otherOperationsRequested)
+            {
+                logger.LogError("--list-sessions cannot be combined with other operations.");
+                Console.Error.WriteLine("--list-sessions cannot be combined with other operations.");
+                return 1;
+            }
+
+            if (options.HasDeleteRequest && otherOperationsRequested)
+            {
+                logger.LogError("Delete operations cannot be combined with other research actions.");
+                Console.Error.WriteLine("Delete operations cannot be combined with other research actions.");
+                return 1;
+            }
 
             bool diagnosticsRequested = !string.IsNullOrWhiteSpace(diagnosticsMode);
             bool reportOnlyMode = !diagnosticsRequested && !string.IsNullOrWhiteSpace(reportOnlySessionId);
@@ -472,6 +511,11 @@ internal static class Program
                 return tools;
             };
 
+            var planner = new InteractiveResearchPlanner(
+                openAiService,
+                settings.AzureOpenAiChatDeployment,
+                loggerFactory.CreateLogger<InteractiveResearchPlanner>());
+
             var orchestrator = new OrchestratorAgent(
                 openAiService,
                 longTermMemory,
@@ -491,6 +535,18 @@ internal static class Program
             var sessionInfos = existingSessionRecords.Select(MapSession).OrderByDescending(info => info.UpdatedAtUtc).ToList();
             logger.LogInformation("{SessionCount} stored sessions loaded.", sessionInfos.Count);
 
+            if (options.ListSessions)
+            {
+                PrintSessionTable(sessionInfos);
+                return 0;
+            }
+
+            if (options.HasDeleteRequest)
+            {
+                int deleteExitCode = await HandleDeleteRequestAsync(options, sessionInfos, sessionLookup, cosmosService, logger, cts.Token).ConfigureAwait(false);
+                return deleteExitCode;
+            }
+
             SessionInfo? sessionToResume = null;
             if (!string.IsNullOrWhiteSpace(resumeSessionId))
             {
@@ -507,12 +563,66 @@ internal static class Program
                 }
             }
 
+            var contextHints = new List<string>();
+
+            if (!string.IsNullOrWhiteSpace(providedQuery))
+            {
+                if (options.SkipPlanner)
+                {
+                    contextHints.Add("PlannerSkipped: true");
+                }
+                else
+                {
+                    try
+                    {
+                        PlannerOutcome plannerOutcome = await planner.RunNonInteractiveAsync(providedQuery, cts.Token).ConfigureAwait(false);
+                        providedQuery = plannerOutcome.Objective;
+                        contextHints.AddRange(plannerOutcome.ContextHints);
+                        logger.LogInformation("Interactive planner prepared pre-flight plan for objective '{Objective}'.", providedQuery);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogWarning(ex, "Planner pre-check failed for objective '{Objective}'. Proceeding without planner context.", providedQuery);
+                    }
+                }
+            }
+
             string? researchObjective = providedQuery;
             if (sessionToResume is null && string.IsNullOrWhiteSpace(researchObjective))
             {
-                var selection = await PromptForSessionSelectionAsync(sessionInfos, cts.Token).ConfigureAwait(false);
-                sessionToResume = selection.SelectedSession;
-                researchObjective = selection.Objective;
+                var menuSelection = await RunInteractiveMenuAsync(sessionInfos, sessionLookup, planner, cosmosService, logger, options.SkipPlanner, cts.Token).ConfigureAwait(false);
+                if (menuSelection.Action == MenuAction.Exit)
+                {
+                    logger.LogInformation("No console operation selected. Exiting.");
+                    return 0;
+                }
+
+                switch (menuSelection.Action)
+                {
+                    case MenuAction.StartNew:
+                        if (menuSelection.PlannerOutcome is null)
+                        {
+                            logger.LogError("Planner outcome missing after StartNew selection.");
+                            return 1;
+                        }
+
+                        researchObjective = menuSelection.PlannerOutcome.Objective;
+                        contextHints.Clear();
+                        contextHints.AddRange(menuSelection.PlannerOutcome.ContextHints);
+                        break;
+                    case MenuAction.Resume:
+                        sessionToResume = menuSelection.SelectedSession;
+                        researchObjective = sessionToResume?.Objective;
+                        break;
+                    case MenuAction.RegenerateReport:
+                        sessionToResume = menuSelection.SelectedSession;
+                        researchObjective = sessionToResume?.Objective;
+                        reportOnlyMode = true;
+                        break;
+                    default:
+                        logger.LogError("Unhandled menu selection {Action}.", menuSelection.Action);
+                        return 1;
+                }
             }
 
             if (sessionToResume is not null)
@@ -571,7 +681,7 @@ internal static class Program
                 ResearchSessionId = sessionId,
                 Objective = researchObjective,
                 Parameters = new Dictionary<string, string>(),
-                ContextHints = new List<string>()
+                ContextHints = new List<string>(contextHints)
             };
 
             if (reportOnlyMode)
@@ -880,103 +990,29 @@ internal static class Program
         return SourceCitationDeduplicator.Deduplicate(allCitations);
     }
 
-    private static void ParseCommandLine(
-        string[] args,
-        out string? resumeSessionId,
-        out string? query,
-        out string? reportsDirectory,
-        out string? dumpSessionId,
-        out string? dumpDirectory,
-        out string? dumpType,
-        out int dumpLimit,
-        out string? diagnoseComputerUse,
-        out string? reportSessionId,
-        out string? diagnosticsMode)
+    private static void PrintUsage()
     {
-        resumeSessionId = null;
-        query = null;
-        reportsDirectory = null;
-        dumpSessionId = null;
-        dumpDirectory = null;
-        dumpType = null;
-        dumpLimit = 200;
-        diagnoseComputerUse = null;
-        reportSessionId = null;
-        diagnosticsMode = null;
-
-        for (int i = 0; i < args.Length; i++)
-        {
-            string current = args[i];
-            switch (current)
-            {
-                case "--resume":
-                    if (i + 1 < args.Length)
-                    {
-                        resumeSessionId = args[++i];
-                    }
-                    break;
-                case "--query":
-                    if (i + 1 < args.Length)
-                    {
-                        query = args[++i];
-                    }
-                    break;
-                case "--reports":
-                    if (i + 1 < args.Length)
-                    {
-                        reportsDirectory = args[++i];
-                    }
-                    break;
-                case "--dump-session":
-                    if (i + 1 < args.Length)
-                    {
-                        dumpSessionId = args[++i];
-                    }
-                    break;
-                case "--dump-dir":
-                case "--dump-output":
-                    if (i + 1 < args.Length)
-                    {
-                        dumpDirectory = args[++i];
-                    }
-                    break;
-                case "--dump-type":
-                    if (i + 1 < args.Length)
-                    {
-                        dumpType = args[++i];
-                    }
-                    break;
-                case "--dump-limit":
-                    if (i + 1 < args.Length && int.TryParse(args[++i], out int parsedLimit) && parsedLimit > 0)
-                    {
-                        dumpLimit = parsedLimit;
-                    }
-                    break;
-                case "--diagnose-computer-use":
-                    if (i + 1 < args.Length)
-                    {
-                        diagnoseComputerUse = args[++i];
-                    }
-                    break;
-                case "--report-session":
-                    if (i + 1 < args.Length)
-                    {
-                        reportSessionId = args[++i];
-                    }
-                    break;
-                case "--diagnostics-mode":
-                    if (i + 1 < args.Length)
-                    {
-                        diagnosticsMode = args[++i];
-                    }
-                    break;
-                case "--help":
-                case "-h":
-                    Console.WriteLine("Usage: dotnet run [--query \"question\"] [--resume sessionId] [--reports path] [--dump-session sessionId [--dump-type type] [--dump-dir path] [--dump-limit N]] [--diagnose-computer-use \"url|objective\"] [--report-session sessionId] [--diagnostics-mode mode]");
-                    Environment.Exit(0);
-                    break;
-            }
-        }
+        Console.WriteLine("Usage: dotnet run [options]");
+        Console.WriteLine();
+        Console.WriteLine("Options:");
+        Console.WriteLine("  --query <text>                Start a new research session with the provided objective.");
+        Console.WriteLine("  --resume <session-id>         Resume an existing research session.");
+        Console.WriteLine("  --reports <path>              Override the directory used for report output.");
+        Console.WriteLine("  --dump-session <session-id>   Export session artifacts to disk.");
+        Console.WriteLine("      --dump-type <types>       Optional comma-separated list of memory record types to export.");
+        Console.WriteLine("      --dump-dir <path>         Destination directory for session dump output.");
+        Console.WriteLine("      --dump-limit <N>          Maximum number of records to export (default 200).");
+        Console.WriteLine("  --diagnose-computer-use <url|objective>");
+        Console.WriteLine("                                Run a single computer-use exploration for diagnostics.");
+        Console.WriteLine("  --report-session <session-id> Regenerate the report for an existing session.");
+        Console.WriteLine("  --diagnostics-mode <mode>     Run diagnostics utilities (e.g., list-sources).");
+        Console.WriteLine("  --delete-session <session-id> Delete all memory records for the specified session.");
+        Console.WriteLine("  --delete-incomplete           Delete all sessions that are not marked completed.");
+        Console.WriteLine("  --delete-all                  Delete all stored research sessions.");
+        Console.WriteLine("  --skip-planner                Skip the interactive research planner pre-check.");
+        Console.WriteLine("  --list-sessions               List stored sessions and exit.");
+        Console.WriteLine("  --cosmos-diagnostics          Run Cosmos DB diagnostics and exit.");
+        Console.WriteLine("  --help, -h                    Show this message and exit.");
     }
 
     private static string BuildExplorationSummary(ComputerUseExplorationResult exploration)
@@ -1331,34 +1367,652 @@ internal static class Program
         await QueryPartitionAsync("session_state_typed_no_embedding", partition).ConfigureAwait(false);
     }
 
-    private static async Task<(SessionInfo? SelectedSession, string? Objective)> PromptForSessionSelectionAsync(IReadOnlyList<SessionInfo> sessions, CancellationToken token)
+    private static async Task<MenuSelection> RunInteractiveMenuAsync(
+        List<SessionInfo> sessions,
+        Dictionary<string, MemoryRecord> sessionLookup,
+        InteractiveResearchPlanner planner,
+        ICosmosMemoryService cosmosService,
+        ILogger logger,
+        bool skipPlanner,
+        CancellationToken cancellationToken)
     {
-        if (sessions.Count > 0)
+        while (true)
         {
-            Console.WriteLine("Existing research sessions:");
+            DisplaySessionsOverview(sessions);
+            Console.WriteLine();
+            Console.WriteLine("Select an option:");
+            Console.WriteLine("  1) Start new research session");
+            Console.WriteLine("  2) Resume existing session");
+            Console.WriteLine("  3) Regenerate completed report");
+            Console.WriteLine("  4) Delete sessions");
+            Console.WriteLine("  5) Exit console");
+            Console.Write("Choice: ");
+
+            string? input = (await ReadLineAsync(cancellationToken).ConfigureAwait(false))?.Trim().ToLowerInvariant();
+            switch (input)
+            {
+                case "1":
+                case "start":
+                case "n":
+                    Console.Write("Enter a research objective: ");
+                    string? objective = (await ReadLineAsync(cancellationToken).ConfigureAwait(false))?.Trim();
+                    if (string.IsNullOrWhiteSpace(objective))
+                    {
+                        Console.WriteLine("Objective cannot be empty.");
+                        continue;
+                    }
+
+                    if (skipPlanner)
+                    {
+                        var hints = new List<string> { "PlannerSkipped: true" };
+                        var skippedOutcome = new PlannerOutcome(objective, "Planner skipped by request.", Array.Empty<string>(), hints);
+                        return new MenuSelection(MenuAction.StartNew, null, skippedOutcome);
+                    }
+
+                    PlannerOutcome? plannerOutcome = await planner.RunAsync(objective, cancellationToken).ConfigureAwait(false);
+                    if (plannerOutcome is null)
+                    {
+                        Console.WriteLine("Planner cancelled. Returning to menu.");
+                        continue;
+                    }
+
+                    return new MenuSelection(MenuAction.StartNew, null, plannerOutcome);
+
+                case "2":
+                case "resume":
+                case "r":
+                    {
+                        SessionInfo? resumeSession = await SelectSessionAsync(
+                            sessions,
+                            static _ => true,
+                            "Select a session to resume",
+                            cancellationToken).ConfigureAwait(false);
+
+                        if (resumeSession is null)
+                        {
+                            continue;
+                        }
+
+                        return new MenuSelection(MenuAction.Resume, resumeSession, null);
+                    }
+
+                case "3":
+                case "report":
+                case "g":
+                    {
+                        SessionInfo? completedSession = await SelectSessionAsync(
+                            sessions,
+                            static session => IsSessionCompleted(session),
+                            "Select a completed session to regenerate",
+                            cancellationToken).ConfigureAwait(false);
+
+                        if (completedSession is null)
+                        {
+                            continue;
+                        }
+
+                        return new MenuSelection(MenuAction.RegenerateReport, completedSession, null);
+                    }
+
+                case "4":
+                case "delete":
+                case "d":
+                    {
+                        bool deleted = await HandleDeletionMenuAsync(
+                            sessions,
+                            sessionLookup,
+                            cosmosService,
+                            logger,
+                            cancellationToken).ConfigureAwait(false);
+
+                        if (deleted)
+                        {
+                            Console.WriteLine("Deletion complete. Returning to menu.");
+                        }
+                        continue;
+                    }
+
+                case "5":
+                case "exit":
+                case "q":
+                    return new MenuSelection(MenuAction.Exit, null, null);
+
+                default:
+                    Console.WriteLine("Unknown selection. Choose 1-5.");
+                    continue;
+            }
+        }
+    }
+
+    private static void DisplaySessionsOverview(IReadOnlyList<SessionInfo> sessions)
+    {
+        Console.WriteLine();
+        Console.WriteLine("# Research Console");
+        if (sessions.Count == 0)
+        {
+            Console.WriteLine("No stored sessions. Start a new investigation!");
+            return;
+        }
+
+        Console.WriteLine($"Stored sessions: {sessions.Count}");
+        var grouped = sessions
+            .GroupBy(session => string.IsNullOrWhiteSpace(session.Status) ? "unknown" : session.Status.ToLowerInvariant())
+            .OrderByDescending(group => group.Count());
+        foreach (var group in grouped)
+        {
+            Console.WriteLine($" - {group.Key}: {group.Count()}");
+        }
+
+        Console.WriteLine();
+        Console.WriteLine("Recent sessions:");
+        foreach (var session in sessions.Take(8))
+        {
+            Console.WriteLine($"  {session.SessionId} | {session.Status} | {session.UpdatedAtUtc:yyyy-MM-dd HH:mm}Z | {Truncate(session.Objective, 72)}");
+        }
+    }
+
+    private static async Task<bool> HandleDeletionMenuAsync(
+        List<SessionInfo> sessions,
+        Dictionary<string, MemoryRecord> sessionLookup,
+        ICosmosMemoryService cosmosService,
+        ILogger logger,
+        CancellationToken cancellationToken)
+    {
+        Console.WriteLine();
+        Console.WriteLine("Delete options:");
+        Console.WriteLine("  1) Delete a specific session");
+        Console.WriteLine("  2) Delete all incomplete sessions");
+        Console.WriteLine("  3) Delete all sessions");
+        Console.WriteLine("  4) Cancel");
+        Console.Write("Choice: ");
+
+        string? input = (await ReadLineAsync(cancellationToken).ConfigureAwait(false))?.Trim().ToLowerInvariant();
+        switch (input)
+        {
+            case "1":
+            case "session":
+                {
+                    IReadOnlyList<SessionInfo> targets = await SelectSessionsForDeletionAsync(
+                        sessions,
+                        cancellationToken).ConfigureAwait(false);
+
+                    if (targets.Count == 0)
+                    {
+                        return false;
+                    }
+
+                    if (targets.Count == 1)
+                    {
+                        string sessionId = targets[0].SessionId;
+                        bool confirmedSingle = await ConfirmDeletionAsync(
+                                $"Type DELETE to confirm removal of session {sessionId}: ",
+                                cancellationToken)
+                            .ConfigureAwait(false);
+                        if (!confirmedSingle)
+                        {
+                            Console.WriteLine("Deletion cancelled.");
+                            return false;
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine("Selected sessions:");
+                        foreach (var session in targets)
+                        {
+                            Console.WriteLine($" - {session.SessionId} | {session.Status} | {Truncate(session.Objective, 72)}");
+                        }
+
+                        bool confirmedMultiple = await ConfirmDeletionAsync(
+                                $"Type DELETE to confirm removal of {targets.Count} session(s): ",
+                                cancellationToken)
+                            .ConfigureAwait(false);
+                        if (!confirmedMultiple)
+                        {
+                            Console.WriteLine("Deletion cancelled.");
+                            return false;
+                        }
+                    }
+
+                    int deletedRecords = await DeleteSessionsAsync(targets, cosmosService, logger, cancellationToken).ConfigureAwait(false);
+                    RemoveSessionsFromCollections(targets, sessions, sessionLookup);
+
+                    if (targets.Count == 1)
+                    {
+                        Console.WriteLine($"Deleted session {targets[0].SessionId} (removed {deletedRecords} record(s)).");
+                    }
+                    else
+                    {
+                        Console.WriteLine($"Deleted {targets.Count} session(s) (removed {deletedRecords} record(s)).");
+                    }
+
+                    return true;
+                }
+
+            case "2":
+            case "incomplete":
+                {
+                    var incompleteSessions = sessions.Where(session => !IsSessionCompleted(session)).ToList();
+                    if (incompleteSessions.Count == 0)
+                    {
+                        Console.WriteLine("No incomplete sessions to delete.");
+                        return false;
+                    }
+
+                    bool confirmed = await ConfirmDeletionAsync(
+                        $"Type DELETE to remove {incompleteSessions.Count} incomplete session(s): ",
+                        cancellationToken).ConfigureAwait(false);
+                    if (!confirmed)
+                    {
+                        Console.WriteLine("Deletion cancelled.");
+                        return false;
+                    }
+
+                    int deletedRecords = await DeleteSessionsAsync(incompleteSessions, cosmosService, logger, cancellationToken).ConfigureAwait(false);
+                    RemoveSessionsFromCollections(incompleteSessions, sessions, sessionLookup);
+                    Console.WriteLine($"Deleted {incompleteSessions.Count} incomplete session(s) (removed {deletedRecords} record(s)).");
+                    return true;
+                }
+
+            case "3":
+            case "all":
+                {
+                    if (sessions.Count == 0)
+                    {
+                        Console.WriteLine("No sessions stored.");
+                        return false;
+                    }
+
+                    bool confirmed = await ConfirmDeletionAsync(
+                        $"Type DELETE to remove ALL {sessions.Count} session(s): ",
+                        cancellationToken).ConfigureAwait(false);
+                    if (!confirmed)
+                    {
+                        Console.WriteLine("Deletion cancelled.");
+                        return false;
+                    }
+
+                    int deletedRecords = await DeleteSessionsAsync(sessions.ToList(), cosmosService, logger, cancellationToken).ConfigureAwait(false);
+                    sessionLookup.Clear();
+                    sessions.Clear();
+                    Console.WriteLine($"Deleted all sessions (removed {deletedRecords} record(s)).");
+                    return true;
+                }
+
+            default:
+                Console.WriteLine("Deletion cancelled.");
+                return false;
+        }
+    }
+
+    private static async Task<SessionInfo?> SelectSessionAsync(
+        IReadOnlyList<SessionInfo> sessions,
+        Func<SessionInfo, bool> filter,
+        string prompt,
+        CancellationToken cancellationToken)
+    {
+        var filtered = sessions.Where(filter).ToList();
+        if (filtered.Count == 0)
+        {
+            Console.WriteLine("No sessions available for this action.");
+            return null;
+        }
+
+        Console.WriteLine();
+        Console.WriteLine(prompt);
+        for (int index = 0; index < filtered.Count; index++)
+        {
+            var session = filtered[index];
+            Console.WriteLine($"[{index + 1}] {session.SessionId} | {session.Status} | {session.UpdatedAtUtc:yyyy-MM-dd HH:mm}Z | {Truncate(session.Objective, 72)}");
+        }
+
+        Console.Write("Enter a number, session ID, or 'b' to cancel: ");
+        string? selection = (await ReadLineAsync(cancellationToken).ConfigureAwait(false))?.Trim();
+        if (string.IsNullOrWhiteSpace(selection) || selection.Equals("b", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        if (int.TryParse(selection, out int indexChoice) && indexChoice >= 1 && indexChoice <= filtered.Count)
+        {
+            return filtered[indexChoice - 1];
+        }
+
+        SessionInfo? match = filtered.FirstOrDefault(session => string.Equals(session.SessionId, selection, StringComparison.OrdinalIgnoreCase));
+        if (match is not null)
+        {
+            return match;
+        }
+
+        Console.WriteLine("Invalid selection.");
+        return null;
+    }
+
+    private static async Task<IReadOnlyList<SessionInfo>> SelectSessionsForDeletionAsync(
+        IReadOnlyList<SessionInfo> sessions,
+        CancellationToken cancellationToken)
+    {
+        if (sessions.Count == 0)
+        {
+            Console.WriteLine("No sessions available for this action.");
+            return Array.Empty<SessionInfo>();
+        }
+
+        while (true)
+        {
+            Console.WriteLine();
+            Console.WriteLine("Select session(s) to delete");
             for (int index = 0; index < sessions.Count; index++)
             {
                 var session = sessions[index];
-                Console.WriteLine($"[{index + 1}] {session.SessionId} | {session.Objective} | Status: {session.Status}");
+                Console.WriteLine($"[{index + 1}] {session.SessionId} | {session.Status} | {session.UpdatedAtUtc:yyyy-MM-dd HH:mm}Z | {Truncate(session.Objective, 72)}");
             }
 
-            Console.Write("Enter the number of a session to resume or press Enter to start a new session: ");
-            string? choice = await ReadLineAsync(token).ConfigureAwait(false);
-            if (int.TryParse(choice, out int selection) && selection >= 1 && selection <= sessions.Count)
+            Console.Write("Enter number(s) or ranges (e.g., 1,3-5). Session IDs are also accepted. Enter 'b' to cancel: ");
+            string? input = (await ReadLineAsync(cancellationToken).ConfigureAwait(false))?.Trim();
+
+            if (string.IsNullOrWhiteSpace(input) || input.Equals("b", StringComparison.OrdinalIgnoreCase))
             {
-                var selected = sessions[selection - 1];
-                return (selected, selected.Objective);
+                return Array.Empty<SessionInfo>();
+            }
+
+            if (TryResolveSessionSelections(input, sessions, out var selected))
+            {
+                return selected;
+            }
+
+            Console.WriteLine("Invalid selection. Use comma-separated numbers, ranges (e.g., 1-3), or session IDs.");
+        }
+    }
+
+    private static bool TryResolveSessionSelections(
+        string input,
+        IReadOnlyList<SessionInfo> sessions,
+        out List<SessionInfo> selected)
+    {
+        ArgumentNullException.ThrowIfNull(sessions);
+
+    var selectedSessions = new List<SessionInfo>();
+    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        string[] tokens = input.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        if (tokens.Length == 0)
+        {
+            selected = new List<SessionInfo>();
+            return false;
+        }
+
+        foreach (string token in tokens)
+        {
+            if (token.Contains('-', StringComparison.Ordinal))
+            {
+                string[] parts = token.Split('-', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length == 2 &&
+                    int.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out int start) &&
+                    int.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out int end))
+                {
+                    if (!AddRange(start, end))
+                    {
+                        selected = new List<SessionInfo>();
+                        return false;
+                    }
+
+                    continue;
+                }
+            }
+
+            if (int.TryParse(token, NumberStyles.Integer, CultureInfo.InvariantCulture, out int indexValue))
+            {
+                if (!AddIndex(indexValue))
+                {
+                    selected = new List<SessionInfo>();
+                    return false;
+                }
+
+                continue;
+            }
+
+            SessionInfo? match = sessions.FirstOrDefault(session => string.Equals(session.SessionId, token, StringComparison.OrdinalIgnoreCase));
+            if (match is null)
+            {
+                selected = new List<SessionInfo>();
+                return false;
+            }
+
+            if (seen.Add(match.SessionId))
+            {
+                selectedSessions.Add(match);
             }
         }
 
-        Console.Write("Enter a new research objective: ");
-        string? objective = (await ReadLineAsync(token).ConfigureAwait(false))?.Trim();
-        return (null, objective);
+        if (selectedSessions.Count == 0)
+        {
+            selected = new List<SessionInfo>();
+            return false;
+        }
+
+        selected = selectedSessions;
+        return true;
+
+        bool AddRange(int start, int end)
+        {
+            if (start <= 0 || end <= 0)
+            {
+                return false;
+            }
+
+            if (end < start)
+            {
+                (start, end) = (end, start);
+            }
+
+            for (int index = start; index <= end; index++)
+            {
+                if (!AddIndex(index))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        bool AddIndex(int index)
+        {
+            if (index < 1 || index > sessions.Count)
+            {
+                return false;
+            }
+
+            var session = sessions[index - 1];
+            if (seen.Add(session.SessionId))
+            {
+                selectedSessions.Add(session);
+            }
+
+            return true;
+        }
+    }
+
+    private static async Task<bool> ConfirmDeletionAsync(string prompt, CancellationToken cancellationToken)
+    {
+        Console.Write(prompt);
+        string? confirmation = (await ReadLineAsync(cancellationToken).ConfigureAwait(false))?.Trim();
+        return string.Equals(confirmation, "DELETE", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static async Task<int> HandleDeleteRequestAsync(
+        CommandLineOptions options,
+        List<SessionInfo> sessions,
+        Dictionary<string, MemoryRecord> sessionLookup,
+        ICosmosMemoryService cosmosService,
+        ILogger logger,
+        CancellationToken cancellationToken)
+    {
+        var targets = new Dictionary<string, SessionInfo>(StringComparer.OrdinalIgnoreCase);
+
+        if (options.DeleteAll)
+        {
+            foreach (var session in sessions)
+            {
+                targets[session.SessionId] = session;
+            }
+        }
+
+        if (options.DeleteIncomplete)
+        {
+            foreach (var session in sessions.Where(static session => !IsSessionCompleted(session)))
+            {
+                targets[session.SessionId] = session;
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(options.DeleteSessionId))
+        {
+            var match = sessions.FirstOrDefault(session => string.Equals(session.SessionId, options.DeleteSessionId, StringComparison.OrdinalIgnoreCase));
+            if (match is null)
+            {
+                logger.LogError("Session {SessionId} not found for deletion.", options.DeleteSessionId);
+                Console.Error.WriteLine($"No session found with ID '{options.DeleteSessionId}'.");
+                return 1;
+            }
+
+            targets[match.SessionId] = match;
+        }
+
+        if (targets.Count == 0)
+        {
+            Console.WriteLine("No sessions matched the deletion request.");
+            return 0;
+        }
+
+        var toDelete = targets.Values.ToList();
+        Console.WriteLine("# Deleting sessions");
+        foreach (var session in toDelete)
+        {
+            Console.WriteLine($" - {session.SessionId} | {session.Status} | {Truncate(session.Objective, 80)}");
+        }
+
+        int deletedRecords = await DeleteSessionsAsync(toDelete, cosmosService, logger, cancellationToken).ConfigureAwait(false);
+        RemoveSessionsFromCollections(toDelete, sessions, sessionLookup);
+
+        logger.LogInformation("CLI deletion removed {SessionCount} session(s) and {RecordCount} record(s).", toDelete.Count, deletedRecords);
+        Console.WriteLine($"Deleted {toDelete.Count} session(s); removed {deletedRecords} record(s).");
+        return 0;
+    }
+
+    private static async Task<int> DeleteSessionsAsync(
+        IEnumerable<SessionInfo> sessions,
+        ICosmosMemoryService cosmosService,
+        ILogger logger,
+        CancellationToken cancellationToken)
+    {
+        var sessionList = sessions.ToList();
+        int totalRecords = 0;
+        foreach (var session in sessionList)
+        {
+            int removed = await cosmosService.DeleteSessionAsync(session.SessionId, cancellationToken).ConfigureAwait(false);
+            totalRecords += removed;
+            DeleteReportArtifacts(session, logger);
+        }
+
+        if (sessionList.Count > 0)
+        {
+            logger.LogInformation(
+                "Deleted {SessionCount} session(s); removed {RecordCount} record(s) from Cosmos.",
+                sessionList.Count,
+                totalRecords);
+        }
+
+        return totalRecords;
+    }
+
+    private static void RemoveSessionsFromCollections(
+        IEnumerable<SessionInfo> deleted,
+        List<SessionInfo> sessions,
+        Dictionary<string, MemoryRecord> sessionLookup)
+    {
+        foreach (var session in deleted)
+        {
+            sessions.RemoveAll(info => string.Equals(info.SessionId, session.SessionId, StringComparison.OrdinalIgnoreCase));
+            sessionLookup.Remove(session.SessionId);
+        }
+    }
+
+    private static bool IsSessionCompleted(SessionInfo session)
+        => string.Equals(session.Status, "completed", StringComparison.OrdinalIgnoreCase);
+
+    private static void DeleteReportArtifacts(SessionInfo session, ILogger logger)
+    {
+        if (session.Record.Metadata.TryGetValue("lastReportPath", out var lastReport) && !string.IsNullOrWhiteSpace(lastReport))
+        {
+            TryDeleteFile(lastReport, logger);
+        }
+
+        if (session.Record.Metadata.TryGetValue("reportPath", out var reportPath) && !string.IsNullOrWhiteSpace(reportPath))
+        {
+            TryDeleteFile(reportPath, logger);
+        }
+    }
+
+    private static void TryDeleteFile(string path, ILogger logger)
+    {
+        try
+        {
+            string resolved = Path.GetFullPath(path);
+            if (File.Exists(resolved))
+            {
+                File.Delete(resolved);
+                logger.LogInformation("Deleted artifact {Path}.", resolved);
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Failed to delete artifact {Path}.", path);
+        }
+    }
+
+    private static void PrintSessionTable(IReadOnlyList<SessionInfo> sessions)
+    {
+        Console.WriteLine("# Stored Sessions");
+        if (sessions.Count == 0)
+        {
+            Console.WriteLine("No sessions found.");
+            return;
+        }
+
+        Console.WriteLine("SessionId            | Status      | Updated (UTC)       | Objective");
+        Console.WriteLine(new string('-', 90));
+        foreach (var session in sessions.Take(25))
+        {
+            Console.WriteLine(
+                string.Format(
+                    CultureInfo.InvariantCulture,
+                    "{0,-20} | {1,-10} | {2:yyyy-MM-dd HH:mm} | {3}",
+                    session.SessionId,
+                    session.Status,
+                    session.UpdatedAtUtc,
+                    Truncate(session.Objective, 60)));
+        }
+
+        if (sessions.Count > 25)
+        {
+            Console.WriteLine($"... ({sessions.Count - 25} more not shown)");
+        }
+    }
+
+    private static string Truncate(string? value, int length)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        return value!.Length <= length ? value : value[..length] + "…";
     }
 
     private static async Task<string?> ReadLineAsync(CancellationToken token)
     {
-        return await Task.Run(() => Console.ReadLine(), token).ConfigureAwait(false);
+        return await Task.Run(Console.ReadLine, token).ConfigureAwait(false);
     }
 
     private static SessionInfo MapSession(MemoryRecord record)

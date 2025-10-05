@@ -18,6 +18,11 @@ public static class SystemPrompts
         public const string SearchTriage = "You triage search results for an autonomous researcher. Always reply with strict JSON in the schema {\"selected\":[int],\"notes\":\"string\"}. Indices are 1-based. Include at least one entry when possible.";
     }
 
+    public static class Planner
+    {
+        public const string Coordinator = "You are an expert research planner collaborating with a human operator. Build concise, decision-ready research plans that outline the major investigative angles and clarify assumptions. Always respond using JSON with the fields: action ('ask', 'plan', or 'abort'), summary (2-4 sentences), keyQuestions (array of short follow-up questions or subgoals), followUp (optional clarifying question for 'ask'), and notes (optional assumptions, risks, or scope boundaries). Ask for missing constraints before finalizing a plan.";
+    }
+
     public static class Memory
     {
         public const string ShortTermCompressor = "You compress agent working memories without losing vital details.";
@@ -77,6 +82,11 @@ public static class SystemPrompts
             public const string TriageResultLine = "{0}. {1}";
             public const string TriageUrlLine = "   URL: {0}";
             public const string TriageSnippetLine = "   Snippet: {0}";
+        }
+
+        public static class Planner
+        {
+            public const string PlanRequest = "Objective: {0}\nKnown constraints: {1}";
         }
 
         public static class Memory
