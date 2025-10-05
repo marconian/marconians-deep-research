@@ -26,15 +26,48 @@ public sealed class ComputerUseSearchService : IAsyncDisposable, IComputerUseExp
     private const int DisplayHeight = 720;
     private const int MaxIterations = 12;
     private const int MaxContinuationAttempts = 3;
+    private const int MaxFlagReminderAttempts = 6;
     private const string ExplorationInstructions = """
-You control a Chromium browser. Navigate the page, scroll to gather supporting evidence, and follow outbound links until you locate the primary articles or downloadable resources that answer the research objective. Whenever you confirm a high-value resource (never a search results page or navigation hub), immediately call the flag_resource function with its direct URL and details. Continue gathering material until the objective is satisfied, then call the submit_summary function exactly once with the final structured summary.
+You are an expert researcher controlling a browser to find high-quality resources that answer a complex objective. Your goal is not just to browse, but to explore with intent and curiosity.
+
+1.  **Strategize**: Formulate a plan to find definitive, high-quality resources (e.g., articles, papers, datasets). Start with broad searches and progressively narrow your focus.
+2.  **Explore**: Navigate, scroll, and follow promising links. Prioritize primary sources and in-depth articles over blogs or forums.
+3.  **Flag Resources**: When you discover a resource that directly contributes to the objective, use the `flag_resource` function to mark it. Do not flag search result pages or navigation hubs.
+4.  **Persist**: Do not stop at the first relevant link. Continue exploring until you are confident you have found the best possible resources or have exhausted all promising paths.
+5.  **Summarize**: Only when your exploration is complete, call `submit_summary` to provide a synthesis of your findings, supported by the resources you flagged. If you get stuck (e.g., paywall, login), note it and conclude.
 """;
     private const string ExplorationSummaryPrompt = "You have finished gathering observations. Call the submit_summary function with a concise summary, at least three findings, and any notable resources. Do not perform further computer actions.";
     private const string ExplorationSummaryInstructions = "You have completed browsing. Finish by calling the submit_summary function with the final structured summary.";
     private const string SearchInstructions = """
-You control a Chromium browser. Investigate the query, open promising results, and gather enough evidence to justify conclusions. Each time you reach a definitive article or downloadable resource, call the flag_resource function with its direct URL (do not flag search or listing pages). Continue exploring until all critical resources are flagged, then call the submit_summary function exactly once with the structured summary payload (summary string, findings array, flagged resources array).
+You are an expert researcher controlling a browser to answer a query. You are currently on a search results page.
+
+1.  **Analyze Results**: Examine the search results on the screen. Identify the most promising organic result that appears to be a direct link to an article or primary source.
+2.  **Click the Link**: Execute a `click` action on the most promising link to navigate to the content page. Do NOT use the search bar again.
+3.  **Explore and Flag**: Once on a content page, explore it. If it is a high-quality resource, use the `flag_resource` function.
+4.  **Summarize**: After exploring and flagging, call `submit_summary` to complete the task.
 """;
     private const string ExplorationContinuationPrompt = "Continue exploring the current page or follow promising links to gather more evidence before calling submit_summary.";
+    private const string FlagResourceReminderPromptSingle = "You have not flagged any resources yet. Locate a high-value article, dataset, or downloadable file that addresses the objective and call the flag_resource function with its metadata before summarizing.";
+    private const string FlagResourceReminderInstructionsSuffixSingle = "Priority: identify the strongest candidate resource (page, PDF, dataset) and call flag_resource with its URL, title, notes, mimeType, and type before invoking submit_summary. Do not conclude without at least one flagged resource.";
+
+    private static readonly Regex FlagCountDigitPattern = new("(?<count>\\d+)\\s+(?:resources?|links?|articles?)", RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+    private static readonly Regex FlagCountWordPattern = new("(?<word>one|two|three|four|five|six|seven|eight|nine|ten)\\s+(?:resources?|links?|articles?)", RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+    private static readonly Regex AtLeastDigitPattern = new("at least\\s+(?<count>\\d+)", RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+    private static readonly Regex AtLeastWordPattern = new("at least\\s+(?<word>one|two|three|four|five|six|seven|eight|nine|ten)", RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+
+    private static readonly IReadOnlyDictionary<string, int> FlagNumberWords = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["one"] = 1,
+        ["two"] = 2,
+        ["three"] = 3,
+        ["four"] = 4,
+        ["five"] = 5,
+        ["six"] = 6,
+        ["seven"] = 7,
+        ["eight"] = 8,
+        ["nine"] = 9,
+        ["ten"] = 10
+    };
 
     private const string SummaryFunctionName = "submit_summary";
     private const string FlagResourceFunctionName = "flag_resource";
@@ -465,8 +498,12 @@ You control a Chromium browser. Investigate the query, open promising results, a
 
             await NavigateToStartAsync(cancellationToken).ConfigureAwait(false);
             var transcript = new List<string>();
+            var acknowledgedFlaggedCallIds = new HashSet<string>(StringComparer.Ordinal);
+            string? lastResponseId = null;
 
             ComputerUseResponseState response = await SendInitialRequestAsync(query, transcript, cancellationToken).ConfigureAwait(false);
+            lastResponseId = response.ResponseId;
+            (response, lastResponseId) = await HandleFlaggedFunctionCallsAsync(response, transcript, acknowledgedFlaggedCallIds, lastResponseId, cancellationToken).ConfigureAwait(false);
             int iteration = 0;
 
             while (response.Call is not null && iteration < MaxIterations)
@@ -474,6 +511,7 @@ You control a Chromium browser. Investigate the query, open promising results, a
                 iteration++;
                 await HandleComputerCallAsync(response.Call, cancellationToken).ConfigureAwait(false);
                 response = await SendFollowupRequestAsync(response, transcript, cancellationToken, SearchInstructions).ConfigureAwait(false);
+                (response, lastResponseId) = await HandleFlaggedFunctionCallsAsync(response, transcript, acknowledgedFlaggedCallIds, lastResponseId, cancellationToken).ConfigureAwait(false);
 
                 if (response.Call is null || response.Completed)
                 {
@@ -486,6 +524,7 @@ You control a Chromium browser. Investigate the query, open promising results, a
                 _logger.LogWarning("Computer-use search for query '{Query}' reached iteration limit before completion.", query);
             }
 
+            (response, lastResponseId) = await HandleFlaggedFunctionCallsAsync(response, transcript, acknowledgedFlaggedCallIds, lastResponseId, cancellationToken).ConfigureAwait(false);
             await EnsureSearchResultsAsync(query, cancellationToken).ConfigureAwait(false);
             IReadOnlyList<ComputerUseSearchResultItem> items = await ExtractResultsAsync(query, transcript, cancellationToken).ConfigureAwait(false);
             string? finalUrl = _page.Url;
@@ -777,6 +816,59 @@ You control a Chromium browser. Investigate the query, open promising results, a
         }
     }
 
+    private async Task<ComputerUseResponseState> SendFlagResourceAcknowledgementAsync(
+        ComputerUseResponseState previous,
+        List<string> transcript,
+        IReadOnlyList<string> callIds,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(previous.ResponseId) || callIds.Count == 0)
+        {
+            return previous;
+        }
+
+        const string AckPayload = "{\"status\":\"recorded\"}";
+        var inputArray = new JsonArray();
+
+        foreach (string callId in callIds)
+        {
+            if (string.IsNullOrWhiteSpace(callId))
+            {
+                continue;
+            }
+
+            inputArray.Add(new JsonObject
+            {
+                ["type"] = "function_call_output",
+                ["call_id"] = callId,
+                ["output"] = AckPayload
+            });
+
+            RecordTimelineEvent("flag_resource_acknowledged", new Dictionary<string, object?>
+            {
+                ["callId"] = callId,
+                ["payloadLength"] = AckPayload.Length
+            });
+        }
+
+        if (inputArray.Count == 0)
+        {
+            return previous;
+        }
+
+        var payload = new JsonObject
+        {
+            ["input"] = inputArray,
+            ["tools"] = BuildToolsArray(),
+            ["previous_response_id"] = previous.ResponseId,
+            ["truncation"] = "auto",
+            ["model"] = _deployment
+        };
+
+        using JsonDocument response = await SendRequestAsync(payload, cancellationToken).ConfigureAwait(false);
+        return ParseResponse(response, transcript);
+    }
+
     private async Task<ComputerUseResponseState> RequestContinuationAsync(
         ComputerUseResponseState previous,
         List<string> transcript,
@@ -858,6 +950,61 @@ You control a Chromium browser. Investigate the query, open promising results, a
         return tools;
     }
 
+    private async Task<(ComputerUseResponseState State, string? LastResponseId)> HandleFlaggedFunctionCallsAsync(
+        ComputerUseResponseState state,
+        List<string> transcript,
+        HashSet<string> acknowledgedCallIds,
+        string? lastResponseId,
+        CancellationToken cancellationToken)
+    {
+        if (!string.IsNullOrWhiteSpace(state.ResponseId))
+        {
+            lastResponseId = state.ResponseId;
+        }
+
+        if (state.FlaggedFunctionCallIds is null || state.FlaggedFunctionCallIds.Count == 0)
+        {
+            return (state, lastResponseId);
+        }
+
+        string? responseId = !string.IsNullOrWhiteSpace(state.ResponseId) ? state.ResponseId : lastResponseId;
+        if (string.IsNullOrWhiteSpace(responseId))
+        {
+            return (state, lastResponseId);
+        }
+
+        var callIdsToAcknowledge = new List<string>();
+        foreach (string callId in state.FlaggedFunctionCallIds)
+        {
+            if (string.IsNullOrWhiteSpace(callId))
+            {
+                continue;
+            }
+
+            if (acknowledgedCallIds.Add(callId))
+            {
+                callIdsToAcknowledge.Add(callId);
+            }
+        }
+
+        if (callIdsToAcknowledge.Count == 0)
+        {
+            return (state, lastResponseId);
+        }
+
+        var ackState = state with { ResponseId = responseId };
+        ComputerUseResponseState current = await SendFlagResourceAcknowledgementAsync(ackState, transcript, callIdsToAcknowledge, cancellationToken).ConfigureAwait(false);
+
+        string? currentLastResponseId = !string.IsNullOrWhiteSpace(current.ResponseId) ? current.ResponseId : responseId;
+
+        if (current.FlaggedFunctionCallIds is { Count: > 0 })
+        {
+            return await HandleFlaggedFunctionCallsAsync(current, transcript, acknowledgedCallIds, currentLastResponseId, cancellationToken).ConfigureAwait(false);
+        }
+
+        return (current, currentLastResponseId);
+    }
+
     private async Task<JsonDocument> SendRequestAsync(JsonNode payload, CancellationToken cancellationToken)
     {
         string body = payload.ToJsonString(SerializerOptions);
@@ -930,14 +1077,34 @@ You control a Chromium browser. Investigate the query, open promising results, a
         string? summaryCallId = null;
         string? summaryResponseId = null;
         List<string>? capturedSegments = null;
+        List<string>? flaggedFunctionCallIds = null;
+
+        if (root.TryGetProperty("output", out JsonElement outputElementForLogging) && outputElementForLogging.ValueKind == JsonValueKind.Array)
+        {
+            foreach (JsonElement item in outputElementForLogging.EnumerateArray())
+            {
+                try
+                {
+                    RecordTimelineEvent("model_tool_call", new Dictionary<string, object?>
+                    {
+                        ["raw"] = ParseTimelinePayload(item)
+                    });
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Failed to capture raw tool call for timeline entry.");
+                }
+            }
+        }
+
 
         void ProcessToolCandidate(JsonElement candidate)
         {
             try
             {
-                RecordTimelineEvent("tool_call", new Dictionary<string, object?>
+                RecordTimelineEvent("model_tool_call", new Dictionary<string, object?>
                 {
-                    ["raw"] = candidate.GetRawText()
+                    ["raw"] = ParseTimelinePayload(candidate)
                 });
             }
             catch (Exception ex)
@@ -956,9 +1123,13 @@ You control a Chromium browser. Investigate the query, open promising results, a
                 }
             }
 
-            if (TryExtractFlagResourceFunction(candidate, out FlaggedResource resource, out string? flagRaw))
+            if (TryExtractFlagResourceFunction(candidate, out FlaggedResource resource, out string? flagRaw, out string? flagCallId))
             {
                 RegisterFlaggedResource(resource, flagRaw);
+                if (!string.IsNullOrWhiteSpace(flagCallId))
+                {
+                    (flaggedFunctionCallIds ??= new List<string>()).Add(flagCallId);
+                }
             }
         }
 
@@ -1163,8 +1334,24 @@ You control a Chromium browser. Investigate the query, open promising results, a
         {
             SummaryPayload = summaryPayload,
             SummaryRawJson = summaryRawJson,
-            SummaryResponseId = summaryResponseId
+            SummaryResponseId = summaryResponseId,
+            FlaggedFunctionCallIds = flaggedFunctionCallIds is { Count: > 0 } ? flaggedFunctionCallIds.ToArray() : null
         };
+    }
+
+    private object? ParseTimelinePayload(JsonElement element)
+    {
+        string raw = element.GetRawText();
+
+        try
+        {
+            return JsonNode.Parse(raw);
+        }
+        catch (Exception ex) when (ex is JsonException or InvalidOperationException or NotSupportedException)
+        {
+            _logger.LogDebug(ex, "Failed to parse model tool call payload for timeline entry.");
+            return raw;
+        }
     }
 
     private bool TryExtractSummaryFunction(JsonElement element, out ExplorationPayload? payload, out string? rawJson, out string? callId)
@@ -1198,12 +1385,13 @@ You control a Chromium browser. Investigate the query, open promising results, a
         }
     }
 
-    private bool TryExtractFlagResourceFunction(JsonElement element, out FlaggedResource resource, out string? rawJson)
+    private bool TryExtractFlagResourceFunction(JsonElement element, out FlaggedResource resource, out string? rawJson, out string? callId)
     {
         resource = null!;
         rawJson = null;
+        callId = null;
 
-        if (!TryExtractFunctionArguments(element, FlagResourceFunctionName, out string? rawArguments, out _))
+        if (!TryExtractFunctionArguments(element, FlagResourceFunctionName, out string? rawArguments, out string? callIdCandidate))
         {
             return false;
         }
@@ -1224,6 +1412,7 @@ You control a Chromium browser. Investigate the query, open promising results, a
 
             resource = converted;
             rawJson = rawArguments;
+            callId = callIdCandidate;
             return true;
         }
         catch (JsonException ex)
@@ -1269,7 +1458,22 @@ You control a Chromium browser. Investigate the query, open promising results, a
 
         if (!string.IsNullOrWhiteSpace(rawJson))
         {
-            metadata["raw"] = rawJson;
+            object? rawValue = rawJson;
+
+            try
+            {
+                JsonNode? parsedNode = JsonNode.Parse(rawJson);
+                if (parsedNode is not null)
+                {
+                    rawValue = parsedNode;
+                }
+            }
+            catch (JsonException ex)
+            {
+                _logger.LogDebug(ex, "Failed to parse flag_resource raw payload for timeline entry.");
+            }
+
+            metadata["raw"] = rawValue;
         }
 
         RecordTimelineEvent("flag_resource", metadata);
@@ -1282,6 +1486,199 @@ You control a Chromium browser. Investigate the query, open promising results, a
         {
             _logger.LogInformation("Updated flagged resource {Url} ({Type}) via flag_resource.", resource.Url, resource.Type);
         }
+    }
+
+    private bool TryAutoFlagFinalPage(string? finalUrl, string? pageTitle, string? objective, IReadOnlyList<string> transcript)
+    {
+        if (string.IsNullOrWhiteSpace(finalUrl))
+        {
+            return false;
+        }
+
+        string? normalizedUrl = NormalizeNavigableUrl(finalUrl);
+        if (string.IsNullOrWhiteSpace(normalizedUrl) || LooksLikeSearchHub(normalizedUrl))
+        {
+            return false;
+        }
+
+        string title = string.IsNullOrWhiteSpace(pageTitle) ? normalizedUrl : pageTitle!.Trim();
+        string? notes = BuildAutoFlagNotes(objective, transcript);
+        string? mimeType = LooksLikePdf(normalizedUrl, null) ? "application/pdf" : null;
+
+        var resource = new FlaggedResource(FlaggedResourceType.Page, title, normalizedUrl, mimeType, notes);
+        RegisterFlaggedResource(resource, null);
+
+        RecordTimelineEvent("flag_resource_auto", new Dictionary<string, object?>
+        {
+            ["url"] = resource.Url,
+            ["title"] = resource.Title,
+            ["objective"] = objective,
+            ["notes"] = resource.Notes
+        });
+
+        _logger.LogInformation("Auto-flagged final page {Url} ({Title}) after exploration produced no flagged resources.", resource.Url, resource.Title);
+        return true;
+    }
+
+    private static string? BuildAutoFlagNotes(string? objective, IReadOnlyList<string> transcript)
+    {
+        string? trimmedObjective = string.IsNullOrWhiteSpace(objective) ? null : objective.Trim();
+        string? insight = null;
+
+        for (int index = transcript.Count - 1; index >= 0; index--)
+        {
+            string segment = transcript[index];
+            if (string.IsNullOrWhiteSpace(segment))
+            {
+                continue;
+            }
+
+            string trimmed = segment.Trim();
+            if (trimmed.Length < 16)
+            {
+                continue;
+            }
+
+            insight = trimmed.Length > 180 ? trimmed[..180] + "…" : trimmed;
+            break;
+        }
+
+        if (trimmedObjective is null && insight is null)
+        {
+            return null;
+        }
+
+        if (trimmedObjective is null)
+        {
+            return insight;
+        }
+
+        if (insight is null)
+        {
+            return $"Objective: {trimmedObjective}.";
+        }
+
+        return $"Objective: {trimmedObjective}. {insight}";
+    }
+
+    private static int ResolveRequiredFlaggedResourceCount(string? objective)
+    {
+        if (string.IsNullOrWhiteSpace(objective))
+        {
+            return 1;
+        }
+
+        string lowered = objective.ToLowerInvariant();
+        int? candidate = null;
+
+        foreach (Match match in FlagCountDigitPattern.Matches(lowered))
+        {
+            if (int.TryParse(match.Groups["count"].Value, out int parsed) && parsed > 0)
+            {
+                candidate = candidate is null ? parsed : Math.Max(candidate.Value, parsed);
+            }
+        }
+
+        foreach (Match match in FlagCountWordPattern.Matches(lowered))
+        {
+            string word = match.Groups["word"].Value;
+            if (FlagNumberWords.TryGetValue(word, out int parsed) && parsed > 0)
+            {
+                candidate = candidate is null ? parsed : Math.Max(candidate.Value, parsed);
+            }
+        }
+
+        foreach (Match match in AtLeastDigitPattern.Matches(lowered))
+        {
+            if (int.TryParse(match.Groups["count"].Value, out int parsed) && parsed > 0)
+            {
+                candidate = candidate is null ? parsed : Math.Max(candidate.Value, parsed);
+            }
+        }
+
+        foreach (Match match in AtLeastWordPattern.Matches(lowered))
+        {
+            string word = match.Groups["word"].Value;
+            if (FlagNumberWords.TryGetValue(word, out int parsed) && parsed > 0)
+            {
+                candidate = candidate is null ? parsed : Math.Max(candidate.Value, parsed);
+            }
+        }
+
+        if (candidate is null && lowered.Contains("flag", StringComparison.OrdinalIgnoreCase) && lowered.Contains("multiple", StringComparison.OrdinalIgnoreCase))
+        {
+            candidate = 2;
+        }
+
+        int resolved = candidate ?? 1;
+        return Math.Clamp(resolved, 1, 10);
+    }
+
+    private static string BuildFlagRequirementDirective(int requiredCount)
+    {
+        if (requiredCount <= 1)
+        {
+            return "Always call the flag_resource function to capture each high-value resource before summarizing.";
+        }
+
+        return $"Requirement: Flag at least {requiredCount} distinct high-value resources using the flag_resource function before summarizing. Continue exploring until this requirement is satisfied.";
+    }
+
+    private static string BuildFlagReminderPrompt(int requiredCount, int currentCount)
+    {
+        if (requiredCount <= 1)
+        {
+            return FlagResourceReminderPromptSingle;
+        }
+
+        if (currentCount <= 0)
+        {
+            return $"You have not flagged any resources yet. Flag at least {requiredCount} distinct high-value resources using the flag_resource function before summarizing.";
+        }
+
+        return $"You have only flagged {currentCount} resource(s). Flag at least {requiredCount} distinct high-value resources using the flag_resource function before summarizing.";
+    }
+
+    private static string BuildFlagReminderInstructionsSuffix(int requiredCount)
+    {
+        if (requiredCount <= 1)
+        {
+            return FlagResourceReminderInstructionsSuffixSingle;
+        }
+
+        return $"Priority: reach the minimum requirement of {requiredCount} distinct resources flagged via flag_resource (URL, title, notes, mimeType, type) before invoking submit_summary. Do not conclude until this requirement is satisfied.";
+    }
+
+    private int GetDistinctFlaggedResourceCount(ExplorationPayload? summaryPayload)
+    {
+        var distinctUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (FlaggedResource resource in _flaggedResources)
+        {
+            if (!string.IsNullOrWhiteSpace(resource.Url))
+            {
+                distinctUrls.Add(resource.Url);
+            }
+        }
+
+        if (summaryPayload?.Flagged is { Count: > 0 })
+        {
+            foreach (ExplorationPayloadResource? resource in summaryPayload.Flagged)
+            {
+                if (resource is null)
+                {
+                    continue;
+                }
+
+                FlaggedResource? converted = TryConvertResource(resource);
+                if (converted is not null && !string.IsNullOrWhiteSpace(converted.Url))
+                {
+                    distinctUrls.Add(converted.Url);
+                }
+            }
+        }
+
+        return distinctUrls.Count;
     }
 
     private static bool TryExtractFunctionArguments(JsonElement element, string functionName, out string? rawArguments, out string? callId)
@@ -2472,6 +2869,8 @@ You control a Chromium browser. Investigate the query, open promising results, a
         public string? SummaryRawJson { get; init; }
 
         public string? SummaryResponseId { get; init; }
+
+        public IReadOnlyList<string>? FlaggedFunctionCallIds { get; init; }
     }
 
     private sealed record ComputerCall(string CallId, ComputerUseAction Action, IReadOnlyList<ComputerUseSafetyCheck> PendingSafetyChecks);
@@ -2503,10 +2902,18 @@ You control a Chromium browser. Investigate the query, open promising results, a
                 throw new InvalidOperationException("Computer-use browser page was not initialized.");
             }
 
+            int requiredFlaggedResourceCount = ResolveRequiredFlaggedResourceCount(objective);
+            string flagRequirementDirective = BuildFlagRequirementDirective(requiredFlaggedResourceCount);
+            string explorationInstructionSet = string.IsNullOrWhiteSpace(flagRequirementDirective)
+                ? ExplorationInstructions
+                : $"{ExplorationInstructions}\n\n{flagRequirementDirective}";
+            string flagReminderInstructionsSuffix = BuildFlagReminderInstructionsSuffix(requiredFlaggedResourceCount);
+
             RecordTimelineEvent("exploration_start", new Dictionary<string, object?>
             {
                 ["url"] = url,
-                ["objective"] = objective
+                ["objective"] = objective,
+                ["requiredFlaggedResources"] = requiredFlaggedResourceCount
             });
 
             await _page.GotoAsync(url, new PageGotoOptions
@@ -2520,9 +2927,11 @@ You control a Chromium browser. Investigate the query, open promising results, a
             await Task.Delay(250, cancellationToken).ConfigureAwait(false);
 
             var transcript = new List<string>();
-            ComputerUseResponseState response = await SendInitialExplorationRequestAsync(url, objective, transcript, cancellationToken).ConfigureAwait(false);
+            var acknowledgedFlaggedCallIds = new HashSet<string>(StringComparer.Ordinal);
+            ComputerUseResponseState response = await SendInitialExplorationRequestAsync(url, objective, transcript, explorationInstructionSet, flagRequirementDirective, cancellationToken).ConfigureAwait(false);
             int iteration = 0;
             int continuationAttempts = 0;
+            int flagReminderAttempts = 0;
             bool summaryRequested = false;
             string? lastResponseId = response.ResponseId;
             ExplorationPayload? summaryPayload = response.SummaryPayload;
@@ -2530,6 +2939,11 @@ You control a Chromium browser. Investigate the query, open promising results, a
             string? summaryCallId = response.SummaryFunctionCallId;
             string? summaryResponseId = response.SummaryResponseId;
             string? acknowledgedSummaryCallId = null;
+
+            async Task ProcessFlaggedFunctionsAsync()
+            {
+                (response, lastResponseId) = await HandleFlaggedFunctionCallsAsync(response, transcript, acknowledgedFlaggedCallIds, lastResponseId, cancellationToken).ConfigureAwait(false);
+            }
 
             void UpdateSummary(ComputerUseResponseState state)
             {
@@ -2593,6 +3007,7 @@ You control a Chromium browser. Investigate the query, open promising results, a
                 acknowledgedSummaryCallId = callId;
                 summaryResponseId = null;
                 UpdateSummary(response);
+                await ProcessFlaggedFunctionsAsync().ConfigureAwait(false);
 
                 if (!string.IsNullOrWhiteSpace(response.ResponseId))
                 {
@@ -2604,6 +3019,18 @@ You control a Chromium browser. Investigate the query, open promising results, a
                 }
             }
 
+            int GetFlaggedResourceCount()
+            {
+                return GetDistinctFlaggedResourceCount(summaryPayload);
+            }
+
+            bool HasRequiredFlaggedResources()
+            {
+                return GetFlaggedResourceCount() >= requiredFlaggedResourceCount;
+            }
+
+
+            await ProcessFlaggedFunctionsAsync().ConfigureAwait(false);
             UpdateSummary(response);
             await TryAcknowledgeSummaryAsync().ConfigureAwait(false);
 
@@ -2613,7 +3040,8 @@ You control a Chromium browser. Investigate the query, open promising results, a
                 {
                     iteration++;
                     await HandleComputerCallAsync(response.Call, cancellationToken).ConfigureAwait(false);
-                    response = await SendFollowupRequestAsync(response, transcript, cancellationToken, ExplorationInstructions).ConfigureAwait(false);
+                    response = await SendFollowupRequestAsync(response, transcript, cancellationToken, explorationInstructionSet).ConfigureAwait(false);
+                    await ProcessFlaggedFunctionsAsync().ConfigureAwait(false);
                     UpdateSummary(response);
                     await TryAcknowledgeSummaryAsync().ConfigureAwait(false);
                     if (!string.IsNullOrWhiteSpace(response.ResponseId))
@@ -2627,18 +3055,41 @@ You control a Chromium browser. Investigate the query, open promising results, a
                     continue;
                 }
 
-                bool shouldRequestMore = ShouldRequestExplorationContinuation(iteration, transcript);
+                int flaggedResourceCount = GetFlaggedResourceCount();
+                bool hasRequiredFlaggedResources = flaggedResourceCount >= requiredFlaggedResourceCount;
+                bool shouldRequestMore = ShouldRequestExplorationContinuation(iteration, transcript, hasRequiredFlaggedResources);
                 string? effectiveResponseId = !string.IsNullOrWhiteSpace(response.ResponseId) ? response.ResponseId : lastResponseId;
-                bool canRequestActions = !string.IsNullOrWhiteSpace(effectiveResponseId) && continuationAttempts < MaxContinuationAttempts;
+                bool canRequestActions = !string.IsNullOrWhiteSpace(effectiveResponseId) &&
+                    (hasRequiredFlaggedResources
+                        ? continuationAttempts < MaxContinuationAttempts
+                        : flagReminderAttempts < MaxFlagReminderAttempts);
 
                 if (shouldRequestMore && canRequestActions)
                 {
-                    continuationAttempts++;
+                    if (hasRequiredFlaggedResources)
+                    {
+                        continuationAttempts++;
+                    }
+                    else
+                    {
+                        flagReminderAttempts++;
+                    }
+
+                    string attemptType = hasRequiredFlaggedResources ? "continuation" : "flag-reminder";
+                    string continuationPrompt = hasRequiredFlaggedResources
+                        ? ExplorationContinuationPrompt
+                        : BuildFlagReminderPrompt(requiredFlaggedResourceCount, flaggedResourceCount);
+                    string continuationInstructions = hasRequiredFlaggedResources
+                        ? explorationInstructionSet
+                        : $"{explorationInstructionSet}\n\n{flagReminderInstructionsSuffix}";
+
                     _logger.LogInformation(
-                        "Forcing additional computer-use exploration (attempt {Attempt}, iteration {Iteration}, segments={Segments}).",
-                        continuationAttempts,
+                        "Forcing additional computer-use exploration (mode={Mode}, attempt {Attempt}, iteration {Iteration}, segments={Segments}, flagged={Flagged}).",
+                        attemptType,
+                        hasRequiredFlaggedResources ? continuationAttempts : flagReminderAttempts,
                         iteration,
-                        transcript.Count);
+                        transcript.Count,
+                        flaggedResourceCount);
 
                     var continuationState = !string.IsNullOrWhiteSpace(response.ResponseId)
                         ? response
@@ -2647,10 +3098,11 @@ You control a Chromium browser. Investigate the query, open promising results, a
                     response = await RequestContinuationAsync(
                             continuationState,
                             transcript,
-                            ExplorationContinuationPrompt,
-                            ExplorationInstructions,
+                            continuationPrompt,
+                            continuationInstructions,
                             cancellationToken)
                         .ConfigureAwait(false);
+                    await ProcessFlaggedFunctionsAsync().ConfigureAwait(false);
                     UpdateSummary(response);
                     await TryAcknowledgeSummaryAsync().ConfigureAwait(false);
                     if (!string.IsNullOrWhiteSpace(response.ResponseId))
@@ -2664,7 +3116,7 @@ You control a Chromium browser. Investigate the query, open promising results, a
                     continue;
                 }
 
-                bool needsSummary = !summaryRequested && ShouldRequestExplorationSummary(transcript);
+                bool needsSummary = !summaryRequested && ShouldRequestExplorationSummary(transcript, hasRequiredFlaggedResources);
                 bool canRequestSummary = !string.IsNullOrWhiteSpace(effectiveResponseId);
 
                 if (needsSummary && canRequestSummary)
@@ -2686,6 +3138,7 @@ You control a Chromium browser. Investigate the query, open promising results, a
                             ExplorationSummaryInstructions,
                             cancellationToken)
                         .ConfigureAwait(false);
+                    await ProcessFlaggedFunctionsAsync().ConfigureAwait(false);
                     UpdateSummary(response);
                     await TryAcknowledgeSummaryAsync().ConfigureAwait(false);
                     if (!string.IsNullOrWhiteSpace(response.ResponseId))
@@ -2707,7 +3160,7 @@ You control a Chromium browser. Investigate the query, open promising results, a
                 _logger.LogWarning("Computer-use exploration for url '{Url}' reached iteration limit before completion.", url);
             }
 
-            if (!summaryRequested && response.Call is null && !string.IsNullOrWhiteSpace(lastResponseId))
+            if (!summaryRequested && response.Call is null && HasRequiredFlaggedResources() && !string.IsNullOrWhiteSpace(lastResponseId))
             {
                 try
                 {
@@ -2723,8 +3176,9 @@ You control a Chromium browser. Investigate the query, open promising results, a
                             ExplorationSummaryInstructions,
                             cancellationToken)
                         .ConfigureAwait(false);
-                    UpdateSummary(summaryResponse);
                     response = summaryResponse;
+                    await ProcessFlaggedFunctionsAsync().ConfigureAwait(false);
+                    UpdateSummary(summaryResponse);
                     await TryAcknowledgeSummaryAsync().ConfigureAwait(false);
 
                     if (!string.IsNullOrWhiteSpace(summaryResponse.ResponseId))
@@ -2741,7 +3195,8 @@ You control a Chromium browser. Investigate the query, open promising results, a
                         {
                             iteration++;
                             await HandleComputerCallAsync(response.Call, cancellationToken).ConfigureAwait(false);
-                            response = await SendFollowupRequestAsync(response, transcript, cancellationToken, ExplorationInstructions).ConfigureAwait(false);
+                            response = await SendFollowupRequestAsync(response, transcript, cancellationToken, explorationInstructionSet).ConfigureAwait(false);
+                            await ProcessFlaggedFunctionsAsync().ConfigureAwait(false);
                             UpdateSummary(response);
                             await TryAcknowledgeSummaryAsync().ConfigureAwait(false);
 
@@ -2770,6 +3225,9 @@ You control a Chromium browser. Investigate the query, open promising results, a
                 }
             }
 
+            await ProcessFlaggedFunctionsAsync().ConfigureAwait(false);
+            int finalFlaggedCount = GetFlaggedResourceCount();
+            bool finalHasFlaggedResources = finalFlaggedCount > 0;
             string? finalUrl = null;
             string? pageTitle = null;
             try
@@ -2780,6 +3238,17 @@ You control a Chromium browser. Investigate the query, open promising results, a
             catch (Exception ex) when (ex is PlaywrightException or InvalidOperationException)
             {
                 _logger.LogDebug(ex, "Failed to capture final page metadata for exploration '{Url}'.", url);
+            }
+
+            bool attemptedAutoFlag = false;
+            if (!finalHasFlaggedResources)
+            {
+                attemptedAutoFlag = true;
+                if (TryAutoFlagFinalPage(finalUrl, pageTitle, objective, transcript))
+                {
+                    finalHasFlaggedResources = true;
+                    finalFlaggedCount = GetFlaggedResourceCount();
+                }
             }
 
             ExplorationStructuredOutput structured = ParseExplorationStructuredOutput(transcript, summaryPayload, summaryRawJson);
@@ -2815,11 +3284,45 @@ You control a Chromium browser. Investigate the query, open promising results, a
                 }
             }
 
+            int structuredFlaggedCount = structured.FlaggedResources.Count;
+
+            if (structuredFlaggedCount == 0)
+            {
+                RecordTimelineEvent("flagging_failure", new Dictionary<string, object?>
+                {
+                    ["reason"] = "no_resources_flagged",
+                    ["iterations"] = iteration,
+                    ["continuationAttempts"] = continuationAttempts,
+                    ["flagReminderAttempts"] = flagReminderAttempts,
+                    ["autoFlagAttempted"] = attemptedAutoFlag,
+                    ["finalUrl"] = finalUrl,
+                    ["required"] = requiredFlaggedResourceCount,
+                    ["actual"] = structuredFlaggedCount
+                });
+
+                throw new ComputerUseFlaggingException("Exploration completed without any flagged resources.");
+            }
+            else if (structuredFlaggedCount < requiredFlaggedResourceCount)
+            {
+                RecordTimelineEvent("flagging_shortfall", new Dictionary<string, object?>
+                {
+                    ["reason"] = "below_requirement",
+                    ["iterations"] = iteration,
+                    ["continuationAttempts"] = continuationAttempts,
+                    ["flagReminderAttempts"] = flagReminderAttempts,
+                    ["autoFlagAttempted"] = attemptedAutoFlag,
+                    ["finalUrl"] = finalUrl,
+                    ["required"] = requiredFlaggedResourceCount,
+                    ["actual"] = structuredFlaggedCount
+                });
+            }
+
             if (structured.FlaggedResources.Count > 0)
             {
                 RecordTimelineEvent("flagged_resources", new Dictionary<string, object?>
                 {
                     ["count"] = structured.FlaggedResources.Count,
+                    ["required"] = requiredFlaggedResourceCount,
                     ["items"] = structured.FlaggedResources.Select(resource => new Dictionary<string, object?>
                     {
                         ["type"] = resource.Type.ToString(),
@@ -2865,7 +3368,7 @@ You control a Chromium browser. Investigate the query, open promising results, a
         }
     }
 
-    private async Task<ComputerUseResponseState> SendInitialExplorationRequestAsync(string targetUrl, string? objective, List<string> transcript, CancellationToken cancellationToken)
+    private async Task<ComputerUseResponseState> SendInitialExplorationRequestAsync(string targetUrl, string? objective, List<string> transcript, string explorationInstructions, string flagRequirementDirective, CancellationToken cancellationToken)
     {
         await PreparePageForComputerUseAsync(cancellationToken).ConfigureAwait(false);
         string screenshot = await CaptureScreenshotAsync(cancellationToken).ConfigureAwait(false);
@@ -2875,6 +3378,11 @@ You control a Chromium browser. Investigate the query, open promising results, a
             "If the page is a navigation hub or search form, use it to reach the relevant content before summarizing. " +
             "Scroll as needed, open helpful links, and capture evidence. " +
             $"The requested page is {targetUrl}. When you are ready to conclude, call the submit_summary function exactly once with a concise summary, at least three findings, and any important resources or outbound links.";
+
+        if (!string.IsNullOrWhiteSpace(flagRequirementDirective))
+        {
+            userInstruction += $" {flagRequirementDirective}";
+        }
 
         var payload = new JsonObject
         {
@@ -2898,7 +3406,7 @@ You control a Chromium browser. Investigate the query, open promising results, a
                     }
                 }
             },
-            ["instructions"] = ExplorationInstructions,
+                ["instructions"] = explorationInstructions,
             ["tools"] = BuildToolsArray(),
             ["reasoning"] = new JsonObject { ["generate_summary"] = "concise" },
             ["temperature"] = 0.2,
@@ -2911,8 +3419,13 @@ You control a Chromium browser. Investigate the query, open promising results, a
         return ParseResponse(response, transcript);
     }
 
-    private static bool ShouldRequestExplorationContinuation(int iteration, IReadOnlyList<string> transcript)
+    private static bool ShouldRequestExplorationContinuation(int iteration, IReadOnlyList<string> transcript, bool hasRequiredFlaggedResources)
     {
+        if (!hasRequiredFlaggedResources)
+        {
+            return true;
+        }
+
         if (iteration < MinExplorationIterations)
         {
             return true;
@@ -2943,8 +3456,13 @@ You control a Chromium browser. Investigate the query, open promising results, a
         return nonEmptySegments < 3;
     }
 
-    private static bool ShouldRequestExplorationSummary(IReadOnlyList<string> transcript)
+    private static bool ShouldRequestExplorationSummary(IReadOnlyList<string> transcript, bool hasRequiredFlaggedResources)
     {
+        if (!hasRequiredFlaggedResources)
+        {
+            return false;
+        }
+
         if (transcript.Count == 0)
         {
             return true;
@@ -3699,6 +4217,14 @@ public sealed class ComputerUseSummaryFunctionException : InvalidOperationExcept
     }
 
     public string ResponseContent { get; }
+}
+
+public sealed class ComputerUseFlaggingException : InvalidOperationException
+{
+    public ComputerUseFlaggingException(string message)
+        : base(message)
+    {
+    }
 }
 
 public sealed record ComputerUseSearchResult(
