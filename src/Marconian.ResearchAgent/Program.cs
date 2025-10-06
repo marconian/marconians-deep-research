@@ -37,6 +37,8 @@ internal static class Program
 
     private sealed record SessionInfo(string SessionId, string Objective, string Status, DateTimeOffset CreatedAtUtc, DateTimeOffset UpdatedAtUtc, MemoryRecord Record);
 
+    private sealed record DiagnosisOutcome(int Index, ComputerUseExplorationResult? Result, Exception? Exception);
+
     private enum MenuAction
     {
         StartNew,
@@ -138,6 +140,23 @@ internal static class Program
                 throw new InvalidOperationException("AZURE_OPENAI_COMPUTER_USE_DEPLOYMENT must be set when using the computer-use search provider.");
             }
 
+            ComputerUseSearchService CreateComputerUseService(ComputerUseOptions? overrideOptions = null)
+            {
+                if (string.IsNullOrWhiteSpace(settings.AzureOpenAiComputerUseDeployment))
+                {
+                    throw new InvalidOperationException("Computer-use deployment is not configured.");
+                }
+
+                ComputerUseOptions environment = overrideOptions ?? settings.ComputerUse;
+                return new ComputerUseSearchService(
+                    settings.AzureOpenAiEndpoint,
+                    settings.AzureOpenAiApiKey,
+                    settings.AzureOpenAiComputerUseDeployment!,
+                    sharedHttpClient,
+                    loggerFactory.CreateLogger<ComputerUseSearchService>(),
+                    environmentOptions: environment);
+            }
+
             bool computerUseConfigured = settings.ComputerUseEnabled && !string.IsNullOrWhiteSpace(settings.AzureOpenAiComputerUseDeployment);
 
             if (computerUseConfigured)
@@ -149,12 +168,7 @@ internal static class Program
 
                 if (readiness.IsReady)
                 {
-                    computerUseServiceFactory = () => new ComputerUseSearchService(
-                        settings.AzureOpenAiEndpoint,
-                        settings.AzureOpenAiApiKey,
-                        settings.AzureOpenAiComputerUseDeployment!,
-                        sharedHttpClient,
-                        loggerFactory.CreateLogger<ComputerUseSearchService>());
+                    computerUseServiceFactory = () => CreateComputerUseService();
 
                     computerUseSearchService = computerUseServiceFactory();
                     logger.LogInformation(
@@ -385,60 +399,136 @@ internal static class Program
                     Console.WriteLine($"Objective: {objective}");
                 }
 
+                int requestedConcurrency = Math.Clamp(options.DiagnoseComputerUseConcurrency, 1, 16);
+                if (requestedConcurrency > 1 && computerUseServiceFactory is not null)
+                {
+                    Console.WriteLine($"Launching {requestedConcurrency} concurrent sessions...");
+                    var extraServices = new List<ComputerUseSearchService>();
+                    var temporaryProfiles = new List<string>();
+                    string? baseProfileDirectory = settings.ComputerUse.UserDataDirectory;
+                    string? diagnosticsProfileRoot = null;
+                    if (settings.ComputerUse.UsePersistentContext)
+                    {
+                        string defaultProfile = baseProfileDirectory ?? Path.Combine(Directory.GetCurrentDirectory(), "debug", "cache", "computer-use-profile");
+                        diagnosticsProfileRoot = Path.Combine(Path.GetDirectoryName(defaultProfile) ?? defaultProfile, "diagnostics");
+                        Directory.CreateDirectory(diagnosticsProfileRoot);
+                    }
+
+                    string timestampPrefix = DateTimeOffset.UtcNow.ToString("yyyyMMddHHmmssfff", CultureInfo.InvariantCulture);
+                    try
+                    {
+                        var diagnosisTasks = new List<Task<DiagnosisOutcome>>(requestedConcurrency);
+                        for (int i = 0; i < requestedConcurrency; i++)
+                        {
+                            ComputerUseSearchService explorer;
+                            if (i == 0)
+                            {
+                                explorer = computerUseSearchService ?? computerUseServiceFactory();
+                                computerUseSearchService ??= explorer;
+                            }
+                            else
+                            {
+                                ComputerUseSearchService CreateExtraService()
+                                {
+                                    if (!settings.ComputerUse.UsePersistentContext || string.IsNullOrWhiteSpace(diagnosticsProfileRoot))
+                                    {
+                                        return CreateComputerUseService();
+                                    }
+
+                                    string uniqueProfile = Path.Combine(
+                                        diagnosticsProfileRoot,
+                                        $"session_{timestampPrefix}_{i + 1}_{Guid.NewGuid():N}");
+                                    Directory.CreateDirectory(uniqueProfile);
+                                    temporaryProfiles.Add(uniqueProfile);
+
+                                    ComputerUseOptions overrideOptions = settings.ComputerUse with
+                                    {
+                                        UserDataDirectory = uniqueProfile
+                                    };
+
+                                    return CreateComputerUseService(overrideOptions);
+                                }
+
+                                explorer = CreateExtraService();
+                                extraServices.Add(explorer);
+                            }
+
+                            diagnosisTasks.Add(RunConcurrentDiagnosisAsync(explorer, url, objective, i + 1, cts.Token));
+                        }
+
+                        DiagnosisOutcome[] outcomes = await Task.WhenAll(diagnosisTasks).ConfigureAwait(false);
+
+                        bool anySuccess = false;
+                        foreach (DiagnosisOutcome outcome in outcomes.OrderBy(o => o.Index))
+                        {
+                            if (outcome.Result is not null)
+                            {
+                                anySuccess = true;
+                                PrintExplorationReport(outcome.Result, outcome.Index);
+                            }
+                        }
+
+                        bool anyFailure = false;
+                        foreach (DiagnosisOutcome outcome in outcomes.Where(o => o.Exception is not null))
+                        {
+                            anyFailure = true;
+                            switch (outcome.Exception)
+                            {
+                                case ComputerUseSearchBlockedException blockedEx:
+                                    logger.LogError(blockedEx, "Computer-use diagnosis #{Index} blocked for {Url}", outcome.Index, url);
+                                    Console.Error.WriteLine($"Session #{outcome.Index} blocked: {blockedEx.Message}");
+                                    break;
+                                case ComputerUseOperationTimeoutException timeoutEx:
+                                    logger.LogError(timeoutEx, "Computer-use diagnosis #{Index} timed out for {Url}", outcome.Index, url);
+                                    Console.Error.WriteLine($"Session #{outcome.Index} timed out: {timeoutEx.Message}");
+                                    break;
+                                default:
+                                    Exception exception = outcome.Exception!;
+                                    logger.LogError(exception, "Computer-use diagnosis #{Index} failed for {Url}", outcome.Index, url);
+                                    Console.Error.WriteLine($"Session #{outcome.Index} failed: {exception.Message}");
+                                    break;
+                            }
+                        }
+
+                        if (anySuccess)
+                        {
+                            Console.WriteLine();
+                            Console.WriteLine("Diagnosis complete. Detailed timelines saved under debug/computer-use.");
+                        }
+
+                        return anyFailure ? 1 : 0;
+                    }
+                    finally
+                    {
+                        foreach (ComputerUseSearchService service in extraServices)
+                        {
+                            await service.DisposeAsync().ConfigureAwait(false);
+                        }
+
+                        foreach (string profile in temporaryProfiles)
+                        {
+                            try
+                            {
+                                if (Directory.Exists(profile))
+                                {
+                                    Directory.Delete(profile, recursive: true);
+                                }
+                            }
+                            catch (Exception cleanupEx)
+                            {
+                                logger.LogDebug(cleanupEx, "Failed to remove diagnostics profile {Profile}", profile);
+                            }
+                        }
+                    }
+                }
+
                 try
                 {
-                    ComputerUseExplorationResult exploration = await computerUseSearchService
+                    ComputerUseExplorationResult exploration = await (computerUseSearchService ?? computerUseServiceFactory!())
                         .ExploreAsync(url, objective, cts.Token)
                         .ConfigureAwait(false);
 
-                    Console.WriteLine();
-                    Console.WriteLine("# Computer-use Exploration Summary");
-                    Console.WriteLine($"Requested URL : {exploration.RequestedUrl}");
-                    if (!string.IsNullOrWhiteSpace(exploration.FinalUrl))
-                    {
-                        Console.WriteLine($"Final URL      : {exploration.FinalUrl}");
-                    }
-
-                    if (!string.IsNullOrWhiteSpace(exploration.PageTitle))
-                    {
-                        Console.WriteLine($"Page Title     : {exploration.PageTitle}");
-                    }
-
-                    Console.WriteLine();
-                    string summary = BuildExplorationSummary(exploration);
-                    Console.WriteLine(summary);
-
-                    if (exploration.FlaggedResources.Count > 0)
-                    {
-                        Console.WriteLine();
-                        Console.WriteLine("Flagged Resources:");
-                        foreach (FlaggedResource resource in exploration.FlaggedResources)
-                        {
-                            Console.WriteLine($" - [{resource.Type}] {resource.Title ?? resource.Url}");
-                            if (!string.IsNullOrWhiteSpace(resource.Url))
-                            {
-                                Console.WriteLine($"   URL: {resource.Url}");
-                            }
-                            if (!string.IsNullOrWhiteSpace(resource.Notes))
-                            {
-                                Console.WriteLine($"   Notes: {resource.Notes}");
-                            }
-                        }
-                    }
-
-                    if (exploration.Transcript.Count > 0)
-                    {
-                        Console.WriteLine();
-                        Console.WriteLine("Recent Transcript:");
-                        foreach (string segment in exploration.Transcript.TakeLast(5))
-                        {
-                            if (!string.IsNullOrWhiteSpace(segment))
-                            {
-                                Console.WriteLine($" - {segment.Trim()}");
-                            }
-                        }
-                    }
-
+                    PrintExplorationReport(exploration);
                     Console.WriteLine();
                     Console.WriteLine("Diagnosis complete. Detailed timeline saved under debug/computer-use.");
                     return 0;
@@ -474,10 +564,28 @@ internal static class Program
             if (computerUseServiceFactory is not null)
             {
                 int navigatorParallelism = Math.Max(1, researcherOptions.Parallelism?.NavigatorDegreeOfParallelism ?? 1);
-                computerUseExplorerPool = new PooledComputerUseExplorer(
-                    navigatorParallelism,
-                    () => computerUseServiceFactory(),
-                    loggerFactory.CreateLogger<PooledComputerUseExplorer>());
+                int requestedConcurrentSessions = settings.ComputerUse.MaxConcurrentSessions <= 0
+                    ? 1
+                    : settings.ComputerUse.MaxConcurrentSessions;
+                int maxConcurrentSessions = Math.Clamp(requestedConcurrentSessions, 1, navigatorParallelism);
+
+                if (maxConcurrentSessions > 1)
+                {
+                    computerUseExplorerPool = new PooledComputerUseExplorer(
+                        maxConcurrentSessions,
+                        () => computerUseServiceFactory(),
+                        loggerFactory.CreateLogger<PooledComputerUseExplorer>());
+                    logger.LogInformation(
+                        "Computer-use explorer pool initialized with capacity {Capacity} (NavigatorParallelism={Parallelism}).",
+                        maxConcurrentSessions,
+                        navigatorParallelism);
+                }
+                else
+                {
+                    logger.LogInformation(
+                        "Computer-use explorer pool disabled; using shared explorer instance (NavigatorParallelism={Parallelism}).",
+                        navigatorParallelism);
+                }
             }
 
             Func<IEnumerable<ITool>> toolFactory = () =>
@@ -1002,8 +1110,10 @@ internal static class Program
         Console.WriteLine("      --dump-type <types>       Optional comma-separated list of memory record types to export.");
         Console.WriteLine("      --dump-dir <path>         Destination directory for session dump output.");
         Console.WriteLine("      --dump-limit <N>          Maximum number of records to export (default 200).");
-        Console.WriteLine("  --diagnose-computer-use <url|objective>");
-        Console.WriteLine("                                Run a single computer-use exploration for diagnostics.");
+    Console.WriteLine("  --diagnose-computer-use <url|objective>");
+    Console.WriteLine("                                Run a computer-use exploration for diagnostics.");
+    Console.WriteLine("      --diagnose-computer-use-concurrency <N>");
+    Console.WriteLine("                                Optional number of concurrent sessions (default 1, max 16).");
         Console.WriteLine("  --report-session <session-id> Regenerate the report for an existing session.");
         Console.WriteLine("  --diagnostics-mode <mode>     Run diagnostics utilities (e.g., list-sources).");
         Console.WriteLine("  --delete-session <session-id> Delete all memory records for the specified session.");
@@ -1013,6 +1123,90 @@ internal static class Program
         Console.WriteLine("  --list-sessions               List stored sessions and exit.");
         Console.WriteLine("  --cosmos-diagnostics          Run Cosmos DB diagnostics and exit.");
         Console.WriteLine("  --help, -h                    Show this message and exit.");
+    }
+
+    private static async Task<DiagnosisOutcome> RunConcurrentDiagnosisAsync(
+        ComputerUseSearchService explorer,
+        string url,
+        string? objective,
+        int index,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            ComputerUseExplorationResult exploration = await explorer
+                .ExploreAsync(url, objective, cancellationToken)
+                .ConfigureAwait(false);
+
+            return new DiagnosisOutcome(index, exploration, null);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            return new DiagnosisOutcome(index, null, ex);
+        }
+    }
+
+    private static void PrintExplorationReport(ComputerUseExplorationResult exploration, int? index = null)
+    {
+        Console.WriteLine();
+        if (index is int idx)
+        {
+            Console.WriteLine($"# Computer-use Exploration Summary (Session #{idx})");
+        }
+        else
+        {
+            Console.WriteLine("# Computer-use Exploration Summary");
+        }
+
+        Console.WriteLine($"Requested URL : {exploration.RequestedUrl}");
+        if (!string.IsNullOrWhiteSpace(exploration.FinalUrl))
+        {
+            Console.WriteLine($"Final URL      : {exploration.FinalUrl}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(exploration.PageTitle))
+        {
+            Console.WriteLine($"Page Title     : {exploration.PageTitle}");
+        }
+
+        Console.WriteLine();
+        string summary = BuildExplorationSummary(exploration);
+        Console.WriteLine(summary);
+
+        if (exploration.FlaggedResources.Count > 0)
+        {
+            Console.WriteLine();
+            Console.WriteLine("Flagged Resources:");
+            foreach (FlaggedResource resource in exploration.FlaggedResources)
+            {
+                Console.WriteLine($" - [{resource.Type}] {resource.Title ?? resource.Url}");
+                if (!string.IsNullOrWhiteSpace(resource.Url))
+                {
+                    Console.WriteLine($"   URL: {resource.Url}");
+                }
+                if (!string.IsNullOrWhiteSpace(resource.Notes))
+                {
+                    Console.WriteLine($"   Notes: {resource.Notes}");
+                }
+            }
+        }
+
+        if (exploration.Transcript.Count > 0)
+        {
+            Console.WriteLine();
+            Console.WriteLine("Recent Transcript:");
+            foreach (string segment in exploration.Transcript.TakeLast(5))
+            {
+                if (!string.IsNullOrWhiteSpace(segment))
+                {
+                    Console.WriteLine($" - {segment.Trim()}");
+                }
+            }
+        }
     }
 
     private static string BuildExplorationSummary(ComputerUseExplorationResult exploration)

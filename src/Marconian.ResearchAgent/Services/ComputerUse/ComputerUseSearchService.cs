@@ -321,6 +321,7 @@ You are an expert researcher controlling a browser to answer a query. You are cu
     private int _screenshotSequence;
     private List<TimelineEntry>? _timelineEntries;
     private string? _timelinePath;
+    private EventHandler<IPage>? _contextPageHandler;
 
     public ComputerUseSearchService(
         string endpoint,
@@ -381,6 +382,7 @@ You are an expert researcher controlling a browser to answer a query. You are cu
             _browser = _browserSession.Browser;
             _context = _browserSession.Context;
             _page = _browserSession.Page;
+            AttachContextEventHandlers();
             _activeProxy = _browserSession.ProxySelection;
             _interactionSimulator.Reset();
             ApplyDefaultTimeouts();
@@ -2059,6 +2061,184 @@ You are an expert researcher controlling a browser to answer a query. You are cu
         return key;
     }
 
+    private void AttachContextEventHandlers()
+    {
+        if (_context is null)
+        {
+            return;
+        }
+
+        _contextPageHandler ??= HandleContextPage;
+        _context.Page -= _contextPageHandler;
+        _context.Page += _contextPageHandler;
+    }
+
+    private void DetachContextEventHandlers()
+    {
+        if (_context is null || _contextPageHandler is null)
+        {
+            return;
+        }
+
+        try
+        {
+            _context.Page -= _contextPageHandler;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to detach context page handler.");
+        }
+    }
+
+    private async void HandleContextPage(object? sender, IPage page)
+    {
+        if (page is null)
+        {
+            return;
+        }
+
+        if (_page is null || ReferenceEquals(page, _page))
+        {
+            return;
+        }
+
+        string sourceUrl = _page?.Url ?? "(unknown)";
+        _logger.LogDebug("Intercepted popup/new tab request from {SourceUrl} -> {PopupUrl}.", sourceUrl, page.Url);
+
+        await RedirectPopupToPrimaryPageAsync(page).ConfigureAwait(false);
+    }
+
+    private async Task RedirectPopupToPrimaryPageAsync(IPage popup)
+    {
+        IPage? primary = _page;
+        if (primary is null || popup is null)
+        {
+            return;
+        }
+
+        string? popupUrl = await ResolvePopupUrlAsync(popup).ConfigureAwait(false);
+
+        if (string.IsNullOrWhiteSpace(popupUrl) || string.Equals(popupUrl, "about:blank", StringComparison.OrdinalIgnoreCase))
+        {
+            RecordTimelineEvent("popup_discarded", new Dictionary<string, object?>
+            {
+                ["url"] = popupUrl
+            });
+
+            await SafeClosePageAsync(popup).ConfigureAwait(false);
+            return;
+        }
+
+        RecordTimelineEvent("popup_redirecting", new Dictionary<string, object?>
+        {
+            ["url"] = popupUrl
+        });
+
+        bool redirected = false;
+
+        try
+        {
+            await primary.BringToFrontAsync().ConfigureAwait(false);
+            await primary.GotoAsync(popupUrl, new PageGotoOptions
+            {
+                WaitUntil = WaitUntilState.DOMContentLoaded,
+                Timeout = 30000
+            }).ConfigureAwait(false);
+            redirected = true;
+            _logger.LogInformation("Redirected popup navigation to primary page ({Url}).", popupUrl);
+        }
+        catch (Exception ex) when (ex is PlaywrightException or TimeoutException)
+        {
+            _logger.LogDebug(ex, "Popup redirect failed gracefully for {Url}; adopting popup page.", popupUrl);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Popup redirect encountered unexpected error for {Url}; adopting popup page.", popupUrl);
+        }
+
+        if (redirected)
+        {
+            RecordTimelineEvent("popup_redirected", new Dictionary<string, object?>
+            {
+                ["url"] = popupUrl
+            });
+
+            await SafeClosePageAsync(popup).ConfigureAwait(false);
+            return;
+        }
+
+        _page = popup;
+        RecordTimelineEvent("popup_adopted", new Dictionary<string, object?>
+        {
+            ["url"] = popupUrl
+        });
+
+        try
+        {
+            await popup.BringToFrontAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to bring adopted popup to front ({Url}).", popupUrl);
+        }
+    }
+
+    private static async Task<string?> ResolvePopupUrlAsync(IPage popup)
+    {
+        string? popupUrl = null;
+
+        for (int attempt = 0; attempt < 10; attempt++)
+        {
+            try
+            {
+                popupUrl = popup.Url;
+            }
+            catch (PlaywrightException)
+            {
+                break;
+            }
+
+            if (!string.IsNullOrWhiteSpace(popupUrl) && !string.Equals(popupUrl, "about:blank", StringComparison.OrdinalIgnoreCase))
+            {
+                return popupUrl;
+            }
+
+            try
+            {
+                await popup.WaitForLoadStateAsync(LoadState.DOMContentLoaded, new PageWaitForLoadStateOptions { Timeout = 500 }).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+            }
+            catch (PlaywrightException)
+            {
+            }
+
+            await Task.Delay(200).ConfigureAwait(false);
+        }
+
+        try
+        {
+            return popup.Url;
+        }
+        catch (PlaywrightException)
+        {
+            return popupUrl;
+        }
+    }
+
+    private async Task SafeClosePageAsync(IPage page)
+    {
+        try
+        {
+            await page.CloseAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is PlaywrightException or TimeoutException or InvalidOperationException)
+        {
+            _logger.LogDebug(ex, "Failed to close popup page cleanly.");
+        }
+    }
+
     private async Task WaitForPotentialNavigationAsync(CancellationToken cancellationToken)
     {
         if (_page is null || _context is null)
@@ -2795,6 +2975,8 @@ You are an expert researcher controlling a browser to answer a query. You are cu
 
     private async Task ResetBrowserSessionAsync()
     {
+        DetachContextEventHandlers();
+
         if (_browserSession is not null)
         {
             try

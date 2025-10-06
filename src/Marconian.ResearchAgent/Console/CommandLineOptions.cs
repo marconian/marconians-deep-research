@@ -20,6 +20,8 @@ internal sealed class CommandLineOptions
 
     public string? DiagnoseComputerUse { get; set; }
 
+    public int DiagnoseComputerUseConcurrency { get; set; } = 1;
+
     public string? ReportSessionId { get; set; }
 
     public string? DiagnosticsMode { get; set; }
@@ -103,6 +105,14 @@ internal sealed class CommandLineOptions
                     if (TryGetNext(args, ref i, out var diagnose))
                     {
                         options.DiagnoseComputerUse = diagnose;
+                    }
+                    break;
+                case "--diagnose-computer-use-concurrency":
+                    if (TryGetNext(args, ref i, out var diagnoseConcurrency) &&
+                        int.TryParse(diagnoseConcurrency, out int parsedConcurrency) &&
+                        parsedConcurrency > 0)
+                    {
+                        options.DiagnoseComputerUseConcurrency = parsedConcurrency;
                     }
                     break;
                 case "--report-session":

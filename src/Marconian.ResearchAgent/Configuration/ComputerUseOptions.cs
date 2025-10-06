@@ -9,6 +9,8 @@ public sealed record ComputerUseOptions
 
     public bool UsePersistentContext { get; init; } = true;
 
+    public int MaxConcurrentSessions { get; init; } = 1;
+
     public string? UserDataDirectory { get; init; }
         = null;
 
