@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Marconian.ResearchAgent.Configuration;
@@ -121,7 +122,7 @@ public sealed class ComputerUseBrowserFactory
             string.IsNullOrWhiteSpace(requestedTimeZone) ? "(default)" : requestedTimeZone,
             proxySelection?.Endpoint.Uri ?? "none");
 
-    return new ComputerUseBrowserSession(playwright, browser, context, page, stealthProfile, proxySelection, timeZone);
+    return new ComputerUseBrowserSession(playwright, browser, context, page, stealthProfile, proxySelection, timeZone, _logger);
     }
 
     private string NormalizeTimeZoneId(string? timeZoneId)
@@ -238,17 +239,149 @@ public sealed record ComputerUseBrowserSession(
     IPage Page,
     StealthProfile Stealth,
     ComputerUseProxySelection? ProxySelection,
-    string TimeZoneId) : IAsyncDisposable
+    string TimeZoneId,
+    ILogger Logger) : IAsyncDisposable
 {
+    private static readonly TimeSpan DisposeTimeout = TimeSpan.FromSeconds(6);
+
     public async ValueTask DisposeAsync()
     {
         Stealth.Dispose();
-        await Page.CloseAsync().ConfigureAwait(false);
-        await Context.CloseAsync().ConfigureAwait(false);
-        if (Browser is not null)
+
+        await ClosePageAsync(Page, "primary page").ConfigureAwait(false);
+        await CloseAdditionalPagesAsync().ConfigureAwait(false);
+        await CloseContextAsync().ConfigureAwait(false);
+        await CloseBrowserAsync().ConfigureAwait(false);
+        DisposePlaywright();
+    }
+
+    private async Task CloseAdditionalPagesAsync()
+    {
+        IPage[] remainingPages;
+        try
         {
-            await Browser.CloseAsync().ConfigureAwait(false);
+            remainingPages = Context.Pages.ToArray();
         }
-        Playwright.Dispose();
+        catch (Exception ex) when (ex is PlaywrightException or ObjectDisposedException)
+        {
+            Logger.LogDebug(ex, "Unable to enumerate remaining pages during disposal.");
+            return;
+        }
+
+        foreach (IPage page in remainingPages)
+        {
+            if (ReferenceEquals(page, Page))
+            {
+                continue;
+            }
+
+            await ClosePageAsync(page, "secondary page").ConfigureAwait(false);
+        }
+    }
+
+    private async Task ClosePageAsync(IPage page, string description)
+    {
+        try
+        {
+            if (page.IsClosed)
+            {
+                return;
+            }
+
+            await page.CloseAsync(new PageCloseOptions { RunBeforeUnload = false })
+                .WaitAsync(DisposeTimeout).ConfigureAwait(false);
+        }
+        catch (TimeoutException ex)
+        {
+            Logger.LogWarning(ex, "Timed out closing {Description}; continuing with disposal.", description);
+        }
+        catch (Exception ex) when (ex is PlaywrightException or InvalidOperationException or ObjectDisposedException)
+        {
+            Logger.LogDebug(ex, "Failed to close {Description} gracefully; continuing.", description);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Unexpected error while closing {Description}; continuing.", description);
+        }
+    }
+
+    private async Task CloseContextAsync()
+    {
+        try
+        {
+            await Context.CloseAsync()
+                .WaitAsync(DisposeTimeout).ConfigureAwait(false);
+        }
+        catch (TimeoutException ex)
+        {
+            Logger.LogWarning(ex, "Timed out closing browser context; continuing with disposal.");
+        }
+        catch (Exception ex) when (ex is PlaywrightException or InvalidOperationException or ObjectDisposedException)
+        {
+            Logger.LogDebug(ex, "Failed to close browser context gracefully; continuing.");
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Unexpected error while closing browser context; continuing.");
+        }
+    }
+
+    private async Task CloseBrowserAsync()
+    {
+        if (Browser is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await Browser.CloseAsync()
+                .WaitAsync(DisposeTimeout).ConfigureAwait(false);
+        }
+        catch (TimeoutException ex)
+        {
+            Logger.LogWarning(ex, "Timed out closing Playwright browser; attempting DisposeAsync fallback.");
+            await DisposeBrowserFallbackAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is PlaywrightException or InvalidOperationException or ObjectDisposedException)
+        {
+            Logger.LogDebug(ex, "Failed to close Playwright browser gracefully; attempting DisposeAsync fallback.");
+            await DisposeBrowserFallbackAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Unexpected error while closing Playwright browser; attempting DisposeAsync fallback.");
+            await DisposeBrowserFallbackAsync().ConfigureAwait(false);
+        }
+    }
+
+    private async Task DisposeBrowserFallbackAsync()
+    {
+        if (Browser is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await Browser.DisposeAsync().AsTask()
+                .WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Fallback browser dispose failed; browser process may already be terminated.");
+        }
+    }
+
+    private void DisposePlaywright()
+    {
+        try
+        {
+            Playwright.Dispose();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Failed to dispose Playwright cleanly; continuing.");
+        }
     }
 }

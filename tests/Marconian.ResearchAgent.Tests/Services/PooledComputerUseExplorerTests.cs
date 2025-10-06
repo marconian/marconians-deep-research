@@ -41,9 +41,11 @@ public sealed class PooledComputerUseExplorerTests
     }
 
     [Test]
-    public async Task ExploreAsync_ShouldReuseExplorerInstances()
+    public async Task ExploreAsync_ShouldDisposeExplorerInstancesBetweenRuns()
     {
         int created = 0;
+        int disposed = 0;
+        const int iterations = 4;
 
         await using var pool = new PooledComputerUseExplorer(
             maxConcurrentSessions: 1,
@@ -53,16 +55,25 @@ public sealed class PooledComputerUseExplorerTests
                 return new TestExplorer(
                     () => ValueTask.CompletedTask,
                     () => { },
-                    TimeSpan.FromMilliseconds(25));
+                    TimeSpan.FromMilliseconds(25),
+                    () =>
+                    {
+                        Interlocked.Increment(ref disposed);
+                        return ValueTask.CompletedTask;
+                    });
             },
             NullLogger<PooledComputerUseExplorer>.Instance);
 
-        for (int i = 0; i < 4; i++)
+        for (int i = 0; i < iterations; i++)
         {
             await pool.ExploreAsync("https://example.com", null, CancellationToken.None).ConfigureAwait(false);
         }
 
-        Assert.That(created, Is.EqualTo(1), "Single-slot pool should reuse the same explorer instance across calls.");
+        Assert.Multiple(() =>
+        {
+            Assert.That(created, Is.EqualTo(iterations), "Single-slot pool should create a fresh explorer per exploration run.");
+            Assert.That(disposed, Is.EqualTo(iterations), "Each explorer instance should be disposed after use.");
+        });
     }
 
     private static void UpdateMax(ref int target, int candidate)
@@ -79,12 +90,14 @@ public sealed class PooledComputerUseExplorerTests
         private readonly Func<ValueTask> _onStart;
         private readonly Action _onFinish;
         private readonly TimeSpan _delay;
+        private readonly Func<ValueTask> _onDispose;
 
-        public TestExplorer(Func<ValueTask> onStart, Action onFinish, TimeSpan delay)
+        public TestExplorer(Func<ValueTask> onStart, Action onFinish, TimeSpan delay, Func<ValueTask>? onDispose = null)
         {
             _onStart = onStart ?? throw new ArgumentNullException(nameof(onStart));
             _onFinish = onFinish ?? throw new ArgumentNullException(nameof(onFinish));
             _delay = delay;
+            _onDispose = onDispose ?? (() => ValueTask.CompletedTask);
         }
 
         public async Task<ComputerUseExplorationResult> ExploreAsync(string url, string? objective = null, CancellationToken cancellationToken = default)
@@ -109,6 +122,6 @@ public sealed class PooledComputerUseExplorerTests
             }
         }
 
-        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        public ValueTask DisposeAsync() => _onDispose();
     }
 }

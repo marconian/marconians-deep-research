@@ -11,7 +11,6 @@ namespace Marconian.ResearchAgent.Services.ComputerUse;
 public sealed class PooledComputerUseExplorer : IComputerUseExplorer, IAsyncDisposable
 {
     private readonly Func<IComputerUseExplorer> _explorerFactory;
-    private readonly ConcurrentQueue<IComputerUseExplorer> _availableExplorers = new();
     private readonly List<IComputerUseExplorer> _allExplorers = new();
     private readonly SemaphoreSlim _concurrencySemaphore;
     private readonly int _capacity;
@@ -50,7 +49,7 @@ public sealed class PooledComputerUseExplorer : IComputerUseExplorer, IAsyncDisp
         {
             if (explorer is not null)
             {
-                ReturnExplorer(explorer);
+                await ReleaseExplorerAsync(explorer).ConfigureAwait(false);
             }
 
             _concurrencySemaphore.Release();
@@ -59,34 +58,29 @@ public sealed class PooledComputerUseExplorer : IComputerUseExplorer, IAsyncDisp
 
     private IComputerUseExplorer RentExplorer()
     {
-        if (_availableExplorers.TryDequeue(out var explorer))
-        {
-            return explorer;
-        }
-
         lock (_gate)
         {
-            if (_availableExplorers.TryDequeue(out explorer))
-            {
-                return explorer;
-            }
-
-            explorer = _explorerFactory();
+            IComputerUseExplorer explorer = _explorerFactory();
             _allExplorers.Add(explorer);
-            _logger.LogDebug("Created new computer-use explorer instance. Total instances: {Count}.", _allExplorers.Count);
+            _logger.LogDebug("Created new computer-use explorer instance. Active instances: {Count}.", _allExplorers.Count);
             return explorer;
         }
     }
 
-    private void ReturnExplorer(IComputerUseExplorer explorer)
+    private async ValueTask ReleaseExplorerAsync(IComputerUseExplorer explorer)
     {
         if (_disposed)
         {
-            _ = DisposeExplorerAsync(explorer);
+            await DisposeExplorerAsync(explorer).ConfigureAwait(false);
             return;
         }
 
-        _availableExplorers.Enqueue(explorer);
+        lock (_gate)
+        {
+            _allExplorers.Remove(explorer);
+        }
+
+        await DisposeExplorerAsync(explorer).ConfigureAwait(false);
     }
 
     public async ValueTask DisposeAsync()
@@ -107,10 +101,6 @@ public sealed class PooledComputerUseExplorer : IComputerUseExplorer, IAsyncDisp
             _disposed = true;
             explorers = new List<IComputerUseExplorer>(_allExplorers);
             _allExplorers.Clear();
-        }
-
-        while (_availableExplorers.TryDequeue(out _))
-        {
         }
 
         for (int i = 0; i < _capacity; i++)

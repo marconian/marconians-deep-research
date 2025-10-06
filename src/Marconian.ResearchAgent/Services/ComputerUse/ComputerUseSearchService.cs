@@ -78,6 +78,7 @@ You are an expert researcher controlling a browser to answer a query. You are cu
     private ComputerUseProxySelection? _activeProxy;
     private readonly int _viewportWidth;
     private readonly int _viewportHeight;
+    private static readonly TimeSpan ResourceDisposalTimeout = TimeSpan.FromSeconds(6);
 
     private static readonly JsonObject FlagResourceFunctionDefinition = new()
     {
@@ -3004,50 +3005,23 @@ You are an expert researcher controlling a browser to answer a query. You are cu
         {
             if (_page is not null)
             {
-                try
-                {
-                    await _page.CloseAsync().ConfigureAwait(false);
-                }
-                catch (Exception ex) when (ex is PlaywrightException or TimeoutException or InvalidOperationException)
-                {
-                    _logger.LogDebug(ex, "Failed to close Playwright page during timeout recovery.");
-                }
+                await ClosePageWithTimeoutAsync(_page, "timeout recovery (primary page)").ConfigureAwait(false);
             }
 
             if (_context is not null)
             {
-                try
-                {
-                    await _context.CloseAsync().ConfigureAwait(false);
-                }
-                catch (Exception ex) when (ex is PlaywrightException or TimeoutException or InvalidOperationException)
-                {
-                    _logger.LogDebug(ex, "Failed to close Playwright context during timeout recovery.");
-                }
+                await CloseContextPagesAsync(_context, _page, "timeout recovery (context pages)").ConfigureAwait(false);
+                await CloseContextWithTimeoutAsync(_context, "timeout recovery (context)").ConfigureAwait(false);
             }
 
             if (_browser is not null)
             {
-                try
-                {
-                    await _browser.CloseAsync().ConfigureAwait(false);
-                }
-                catch (Exception ex) when (ex is PlaywrightException or TimeoutException or InvalidOperationException)
-                {
-                    _logger.LogDebug(ex, "Failed to close Playwright browser during timeout recovery.");
-                }
+                await CloseBrowserWithTimeoutAsync(_browser, "timeout recovery (browser)").ConfigureAwait(false);
             }
 
             if (_playwright is not null)
             {
-                try
-                {
-                    _playwright.Dispose();
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogDebug(ex, "Failed to dispose Playwright during timeout recovery.");
-                }
+                DisposePlaywrightSafe(_playwright, "timeout recovery");
             }
         }
 
@@ -3057,12 +3031,132 @@ You are an expert researcher controlling a browser to answer a query. You are cu
         _browser = null;
         _playwright = null;
         _activeProxy = null;
-    _interactionSimulator.Reset();
+        _interactionSimulator.Reset();
         _initialized = false;
         _lastScreenshot = null;
         _currentSessionId = null;
         _timelineEntries = null;
         _timelinePath = null;
+    }
+
+    private async Task CloseContextPagesAsync(IBrowserContext context, IPage? primaryPage, string scenario)
+    {
+        IPage[] pages;
+        try
+        {
+            pages = context.Pages.ToArray();
+        }
+        catch (Exception ex) when (ex is PlaywrightException or ObjectDisposedException)
+        {
+            _logger.LogDebug(ex, "Unable to enumerate context pages during {Scenario}.", scenario);
+            return;
+        }
+
+        foreach (IPage page in pages)
+        {
+            if (ReferenceEquals(page, primaryPage))
+            {
+                continue;
+            }
+
+            await ClosePageWithTimeoutAsync(page, scenario).ConfigureAwait(false);
+        }
+    }
+
+    private async Task ClosePageWithTimeoutAsync(IPage page, string scenario)
+    {
+        try
+        {
+            if (page.IsClosed)
+            {
+                return;
+            }
+
+            await page.CloseAsync()
+                .WaitAsync(ResourceDisposalTimeout).ConfigureAwait(false);
+        }
+        catch (TimeoutException ex)
+        {
+            _logger.LogDebug(ex, "Timed out closing Playwright page during {Scenario}.", scenario);
+        }
+        catch (Exception ex) when (ex is PlaywrightException or InvalidOperationException or ObjectDisposedException)
+        {
+            _logger.LogDebug(ex, "Failed to close Playwright page during {Scenario}.", scenario);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Unexpected error closing Playwright page during {Scenario}.", scenario);
+        }
+    }
+
+    private async Task CloseContextWithTimeoutAsync(IBrowserContext context, string scenario)
+    {
+        try
+        {
+            await context.CloseAsync()
+                .WaitAsync(ResourceDisposalTimeout).ConfigureAwait(false);
+        }
+        catch (TimeoutException ex)
+        {
+            _logger.LogDebug(ex, "Timed out closing Playwright context during {Scenario}.", scenario);
+        }
+        catch (Exception ex) when (ex is PlaywrightException or InvalidOperationException or ObjectDisposedException)
+        {
+            _logger.LogDebug(ex, "Failed to close Playwright context during {Scenario}.", scenario);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Unexpected error closing Playwright context during {Scenario}.", scenario);
+        }
+    }
+
+    private async Task CloseBrowserWithTimeoutAsync(IBrowser browser, string scenario)
+    {
+        try
+        {
+            await browser.CloseAsync()
+                .WaitAsync(ResourceDisposalTimeout).ConfigureAwait(false);
+        }
+        catch (TimeoutException ex)
+        {
+            _logger.LogDebug(ex, "Timed out closing Playwright browser during {Scenario}; attempting DisposeAsync fallback.", scenario);
+            await DisposeBrowserFallbackAsync(browser, scenario).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is PlaywrightException or InvalidOperationException or ObjectDisposedException)
+        {
+            _logger.LogDebug(ex, "Failed to close Playwright browser during {Scenario}; attempting DisposeAsync fallback.", scenario);
+            await DisposeBrowserFallbackAsync(browser, scenario).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Unexpected error closing Playwright browser during {Scenario}; attempting DisposeAsync fallback.", scenario);
+            await DisposeBrowserFallbackAsync(browser, scenario).ConfigureAwait(false);
+        }
+    }
+
+    private async Task DisposeBrowserFallbackAsync(IBrowser browser, string scenario)
+    {
+        try
+        {
+            await browser.DisposeAsync().AsTask()
+                .WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Fallback browser dispose failed during {Scenario}.", scenario);
+        }
+    }
+
+    private void DisposePlaywrightSafe(IPlaywright playwright, string scenario)
+    {
+        try
+        {
+            playwright.Dispose();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to dispose Playwright during {Scenario}.", scenario);
+        }
     }
 
     public async ValueTask DisposeAsync()
