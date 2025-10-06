@@ -55,7 +55,7 @@ internal static class Program
     {
         bool cosmosDiagnostics = args.Any(argument => string.Equals(argument, "--cosmos-diagnostics", StringComparison.OrdinalIgnoreCase));
         string defaultReportDirectory;
-        string fileLoggerPath = Path.Combine(Directory.GetCurrentDirectory(), "debug", "marconian.log");
+        string fileLoggerPath = Path.Combine(Directory.GetCurrentDirectory(), "debug", "logs", "marconian.log");
 
         using ILoggerFactory loggerFactory = LoggerFactory.Create(builder =>
         {
@@ -92,10 +92,10 @@ internal static class Program
         };
         Console.CancelKeyPress += cancelHandler;
 
-    ComputerUseSearchService? computerUseSearchService = null;
-    PooledComputerUseExplorer? computerUseExplorerPool = null;
-    Func<ComputerUseSearchService>? computerUseServiceFactory = null;
-    List<string>? pooledProfileDirectories = null;
+        ComputerUseSearchService? computerUseSearchService = null;
+        PooledComputerUseExplorer? computerUseExplorerPool = null;
+        Func<ComputerUseSearchService>? computerUseServiceFactory = null;
+        List<string>? pooledProfileDirectories = null;
         string? computerUseDisabledReason = null;
 
         ResearchFlowTracker? flowTracker = null;
@@ -1208,10 +1208,10 @@ internal static class Program
         Console.WriteLine("      --dump-type <types>       Optional comma-separated list of memory record types to export.");
         Console.WriteLine("      --dump-dir <path>         Destination directory for session dump output.");
         Console.WriteLine("      --dump-limit <N>          Maximum number of records to export (default 200).");
-    Console.WriteLine("  --diagnose-computer-use <url|objective>");
-    Console.WriteLine("                                Run a computer-use exploration for diagnostics.");
-    Console.WriteLine("      --diagnose-computer-use-concurrency <N>");
-    Console.WriteLine("                                Optional number of concurrent sessions (default 1, max 16).");
+        Console.WriteLine("  --diagnose-computer-use <url|objective>");
+        Console.WriteLine("                                Run a computer-use exploration for diagnostics.");
+        Console.WriteLine("      --diagnose-computer-use-concurrency <N>");
+        Console.WriteLine("                                Optional number of concurrent sessions (default 1, max 16).");
         Console.WriteLine("  --report-session <session-id> Regenerate the report for an existing session.");
         Console.WriteLine("  --diagnostics-mode <mode>     Run diagnostics utilities (e.g., list-sources).");
         Console.WriteLine("  --delete-session <session-id> Delete all memory records for the specified session.");
@@ -2115,8 +2115,8 @@ internal static class Program
     {
         ArgumentNullException.ThrowIfNull(sessions);
 
-    var selectedSessions = new List<SessionInfo>();
-    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var selectedSessions = new List<SessionInfo>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         string[] tokens = input.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
         if (tokens.Length == 0)
