@@ -22,8 +22,6 @@ namespace Marconian.ResearchAgent.Services.ComputerUse;
 public sealed class ComputerUseSearchService : IAsyncDisposable, IComputerUseExplorer
 {
     private const string ResponsesApiVersion = "2024-08-01-preview";
-    private const int DisplayWidth = 1280;
-    private const int DisplayHeight = 720;
     private const int MaxIterations = 12;
     private const int MaxContinuationAttempts = 3;
     private const int MaxFlagReminderAttempts = 6;
@@ -72,6 +70,14 @@ You are an expert researcher controlling a browser to answer a query. You are cu
     private const string SummaryFunctionName = "submit_summary";
     private const string FlagResourceFunctionName = "flag_resource";
     private const int MinExplorationIterations = 3;
+
+    private readonly ComputerUseOptions _environmentOptions;
+    private readonly ComputerUseBrowserFactory _browserFactory;
+    private readonly HumanInteractionSimulator _interactionSimulator;
+    private ComputerUseBrowserSession? _browserSession;
+    private ComputerUseProxySelection? _activeProxy;
+    private readonly int _viewportWidth;
+    private readonly int _viewportHeight;
 
     private static readonly JsonObject FlagResourceFunctionDefinition = new()
     {
@@ -322,7 +328,10 @@ You are an expert researcher controlling a browser to answer a query. You are cu
         string deployment,
         HttpClient httpClient,
         ILogger<ComputerUseSearchService>? logger = null,
-        ComputerUseTimeoutOptions? timeouts = null)
+        ComputerUseTimeoutOptions? timeouts = null,
+        ComputerUseOptions? environmentOptions = null,
+        ComputerUseBrowserFactory? browserFactory = null,
+        HumanInteractionSimulator? interactionSimulator = null)
     {
         if (string.IsNullOrWhiteSpace(endpoint))
         {
@@ -345,6 +354,11 @@ You are an expert researcher controlling a browser to answer a query. You are cu
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _logger = logger ?? NullLogger<ComputerUseSearchService>.Instance;
         _timeouts = timeouts ?? ComputerUseTimeoutOptions.Default;
+        _environmentOptions = environmentOptions ?? new ComputerUseOptions();
+        _viewportWidth = Math.Clamp(_environmentOptions.Viewport.Width, 640, 3840);
+        _viewportHeight = Math.Clamp(_environmentOptions.Viewport.Height, 480, 2160);
+        _interactionSimulator = interactionSimulator ?? new HumanInteractionSimulator(_environmentOptions.Behavior, _viewportWidth, _viewportHeight);
+        _browserFactory = browserFactory ?? new ComputerUseBrowserFactory(_environmentOptions, _logger);
     }
 
     public async Task InitializeAsync(CancellationToken cancellationToken = default)
@@ -362,22 +376,36 @@ You are an expert researcher controlling a browser to answer a query. You are cu
                 return;
             }
 
-            _playwright = await Playwright.CreateAsync().ConfigureAwait(false);
-            _browser = await _playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
-            {
-                Headless = true,
-                Args = new[] { $"--window-size={DisplayWidth},{DisplayHeight}", "--disable-extensions" }
-            }).ConfigureAwait(false);
-
-            _context = await _browser.NewContextAsync(new BrowserNewContextOptions
-            {
-                ViewportSize = new ViewportSize { Width = DisplayWidth, Height = DisplayHeight },
-                AcceptDownloads = true
-            }).ConfigureAwait(false);
-
-            _page = await _context.NewPageAsync().ConfigureAwait(false);
+            _browserSession = await _browserFactory.CreateAsync(cancellationToken).ConfigureAwait(false);
+            _playwright = _browserSession.Playwright;
+            _browser = _browserSession.Browser;
+            _context = _browserSession.Context;
+            _page = _browserSession.Page;
+            _activeProxy = _browserSession.ProxySelection;
+            _interactionSimulator.Reset();
             ApplyDefaultTimeouts();
-            // Use Google NCR (no country redirect) to reduce regional consent variance.
+
+            string requestedTimeZone = _activeProxy?.Endpoint?.PreferredTimeZoneId ?? _environmentOptions.PreferredTimeZoneId ?? TimeZoneInfo.Local.Id;
+            string resolvedTimeZone = _browserSession?.TimeZoneId ?? "UTC";
+
+            if (_activeProxy?.Endpoint is { } endpoint)
+            {
+                _logger.LogInformation(
+                    "Proxy engaged for session via {Proxy} (Locale={Locale}, TimeZone={TimeZone}, RequestedTimeZone={RequestedTimeZone}).",
+                    endpoint.Uri,
+                    endpoint.PreferredLocale ?? _environmentOptions.PreferredLocale ?? "default",
+                    resolvedTimeZone,
+                    string.IsNullOrWhiteSpace(requestedTimeZone) ? "(default)" : requestedTimeZone);
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "No proxy configured for session (Locale={Locale}, TimeZone={TimeZone}, RequestedTimeZone={RequestedTimeZone}).",
+                    _environmentOptions.PreferredLocale ?? "default",
+                    resolvedTimeZone,
+                    string.IsNullOrWhiteSpace(requestedTimeZone) ? "(default)" : requestedTimeZone);
+            }
+
             await _page.GotoAsync("https://www.google.com/ncr", new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded }).ConfigureAwait(false);
             _initialized = true;
         }
@@ -934,8 +962,8 @@ You are an expert researcher controlling a browser to answer a query. You are cu
             new JsonObject
             {
                 ["type"] = "computer_use_preview",
-                ["display_width"] = DisplayWidth,
-                ["display_height"] = DisplayHeight,
+                ["display_width"] = _viewportWidth,
+                ["display_height"] = _viewportHeight,
                 ["environment"] = "browser"
             }
         };
@@ -1867,19 +1895,15 @@ You are an expert researcher controlling a browser to answer a query. You are cu
                 await HandleClickAsync(action, coordinates, cancellationToken).ConfigureAwait(false);
                 break;
             case "double_click":
-                if (coordinates is not null)
-                {
-                    await _page.Mouse.DblClickAsync(coordinates.Value.X, coordinates.Value.Y).ConfigureAwait(false);
-                    await WaitForPotentialNavigationAsync(cancellationToken).ConfigureAwait(false);
-                }
+                await HandleDoubleClickAsync(action, coordinates, cancellationToken).ConfigureAwait(false);
                 break;
             case "scroll":
                 await HandleScrollAsync(action, coordinates, cancellationToken).ConfigureAwait(false);
                 break;
             case "move":
-                if (coordinates is not null)
+                if (_page is not null && coordinates is not null)
                 {
-                    await _page.Mouse.MoveAsync(coordinates.Value.X, coordinates.Value.Y).ConfigureAwait(false);
+                    await _interactionSimulator.MoveMouseAsync(_page, coordinates.Value, cancellationToken).ConfigureAwait(false);
                 }
                 break;
             case "keypress":
@@ -1887,9 +1911,9 @@ You are an expert researcher controlling a browser to answer a query. You are cu
                 await HandleKeyPressAsync(action.Keys, cancellationToken).ConfigureAwait(false);
                 break;
             case "type":
-                if (!string.IsNullOrWhiteSpace(action.Text))
+                if (_page is not null && !string.IsNullOrWhiteSpace(action.Text))
                 {
-                    await _page.Keyboard.TypeAsync(action.Text, new KeyboardTypeOptions { Delay = 25 }).ConfigureAwait(false);
+                    await _interactionSimulator.TypeAsync(_page.Keyboard, action.Text, cancellationToken).ConfigureAwait(false);
                 }
                 break;
             case "wait":
@@ -1931,7 +1955,7 @@ You are an expert researcher controlling a browser to answer a query. You are cu
 
         if (button == "wheel")
         {
-            await _page.Mouse.WheelAsync(0, (float)action.ScrollY).ConfigureAwait(false);
+            await _interactionSimulator.ScrollAsync(_page, 0, action.ScrollY, cancellationToken).ConfigureAwait(false);
             await WaitForVisualStabilityAsync(cancellationToken).ConfigureAwait(false);
             return;
         }
@@ -1941,7 +1965,8 @@ You are an expert researcher controlling a browser to answer a query. You are cu
             return;
         }
 
-        await _page.Mouse.ClickAsync(coordinates.Value.X, coordinates.Value.Y, new MouseClickOptions { Button = MapMouseButton(button) }).ConfigureAwait(false);
+        MouseButton mappedButton = MapMouseButton(button);
+        await _interactionSimulator.ClickAsync(_page, coordinates.Value, mappedButton, cancellationToken).ConfigureAwait(false);
         await WaitForPotentialNavigationAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -1954,10 +1979,10 @@ You are an expert researcher controlling a browser to answer a query. You are cu
 
         if (coordinates is not null)
         {
-            await _page.Mouse.MoveAsync(coordinates.Value.X, coordinates.Value.Y).ConfigureAwait(false);
+            await _interactionSimulator.MoveMouseAsync(_page, coordinates.Value, cancellationToken).ConfigureAwait(false);
         }
 
-        await _page.Mouse.WheelAsync((float)action.ScrollX, (float)action.ScrollY).ConfigureAwait(false);
+        await _interactionSimulator.ScrollAsync(_page, action.ScrollX, action.ScrollY, cancellationToken).ConfigureAwait(false);
         await WaitForVisualStabilityAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -1968,7 +1993,7 @@ You are an expert researcher controlling a browser to answer a query. You are cu
             return;
         }
 
-        var translated = keys
+        string[] translated = keys
             .Select(key => TranslateKey(key))
             .Where(value => !string.IsNullOrWhiteSpace(value))
             .ToArray();
@@ -1978,25 +2003,8 @@ You are an expert researcher controlling a browser to answer a query. You are cu
             return;
         }
 
-        if (translated.Length > 1)
-        {
-            foreach (string key in translated)
-            {
-                await _page.Keyboard.DownAsync(key).ConfigureAwait(false);
-            }
 
-            await Task.Delay(75).ConfigureAwait(false);
-
-            foreach (string key in translated.Reverse())
-            {
-                await _page.Keyboard.UpAsync(key).ConfigureAwait(false);
-            }
-        }
-        else
-        {
-            await _page.Keyboard.PressAsync(translated[0]).ConfigureAwait(false);
-        }
-
+        await _interactionSimulator.PressKeysAsync(_page.Keyboard, translated, cancellationToken).ConfigureAwait(false);
         bool hasEnter = translated.Any(key => string.Equals(key, "Enter", StringComparison.OrdinalIgnoreCase) || string.Equals(key, "NumpadEnter", StringComparison.OrdinalIgnoreCase));
         if (hasEnter)
         {
@@ -2008,6 +2016,31 @@ You are an expert researcher controlling a browser to answer a query. You are cu
         {
             await WaitForVisualStabilityAsync(cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    private async Task HandleDoubleClickAsync(ComputerUseAction action, (float X, float Y)? coordinates, CancellationToken cancellationToken)
+    {
+        if (_page is null)
+        {
+            return;
+        }
+
+        string button = action.Button?.ToLowerInvariant() ?? "left";
+        if (button is "back" or "forward" or "wheel")
+        {
+            await HandleClickAsync(action, coordinates, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        if (coordinates is null)
+        {
+            return;
+        }
+
+        MouseButton mappedButton = MapMouseButton(button);
+        await _interactionSimulator.MoveMouseAsync(_page, coordinates.Value, cancellationToken).ConfigureAwait(false);
+        await _page.Mouse.DblClickAsync(coordinates.Value.X, coordinates.Value.Y, new MouseDblClickOptions { Button = mappedButton }).ConfigureAwait(false);
+        await WaitForPotentialNavigationAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private static string TranslateKey(string key)
@@ -2662,15 +2695,15 @@ You are an expert researcher controlling a browser to answer a query. You are cu
         return (float)clamped;
     }
 
-    private static (float X, float Y)? ClampCoordinates(double? x, double? y)
+    private (float X, float Y)? ClampCoordinates(double? x, double? y)
     {
         if (x is null || y is null)
         {
             return null;
         }
 
-        float clampedX = (float)Math.Clamp(x.Value, 0, DisplayWidth);
-        float clampedY = (float)Math.Clamp(y.Value, 0, DisplayHeight);
+        float clampedX = (float)Math.Clamp(x.Value, 0, _viewportWidth);
+        float clampedY = (float)Math.Clamp(y.Value, 0, _viewportHeight);
         return (clampedX, clampedY);
     }
 
@@ -2697,7 +2730,16 @@ You are an expert researcher controlling a browser to answer a query. You are cu
             new TimelineEntry(DateTimeOffset.UtcNow, "session_start", new Dictionary<string, object?>
             {
                 ["query"] = query,
-                ["sessionId"] = _currentSessionId
+                ["sessionId"] = _currentSessionId,
+                ["viewport"] = new Dictionary<string, object?>
+                {
+                    ["width"] = _viewportWidth,
+                    ["height"] = _viewportHeight
+                },
+                ["proxy"] = _activeProxy?.Endpoint.Uri,
+                ["locale"] = _activeProxy?.Endpoint.PreferredLocale ?? _environmentOptions.PreferredLocale,
+                ["timeZone"] = _browserSession?.TimeZoneId ?? "UTC",
+                ["requestedTimeZone"] = _activeProxy?.Endpoint.PreferredTimeZoneId ?? _environmentOptions.PreferredTimeZoneId ?? TimeZoneInfo.Local.Id
             })
         };
         string root = Path.Combine(Environment.CurrentDirectory, "debug", "computer-use");
@@ -2753,58 +2795,75 @@ You are an expert researcher controlling a browser to answer a query. You are cu
 
     private async Task ResetBrowserSessionAsync()
     {
-        if (_page is not null)
+        if (_browserSession is not null)
         {
             try
             {
-                await _page.CloseAsync().ConfigureAwait(false);
+                await _browserSession.DisposeAsync().ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is PlaywrightException or TimeoutException or InvalidOperationException)
             {
-                _logger.LogDebug(ex, "Failed to close Playwright page during timeout recovery.");
+                _logger.LogDebug(ex, "Failed to dispose browser session during timeout recovery.");
             }
         }
-
-        if (_context is not null)
+        else
         {
-            try
+            if (_page is not null)
             {
-                await _context.CloseAsync().ConfigureAwait(false);
+                try
+                {
+                    await _page.CloseAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is PlaywrightException or TimeoutException or InvalidOperationException)
+                {
+                    _logger.LogDebug(ex, "Failed to close Playwright page during timeout recovery.");
+                }
             }
-            catch (Exception ex) when (ex is PlaywrightException or TimeoutException or InvalidOperationException)
+
+            if (_context is not null)
             {
-                _logger.LogDebug(ex, "Failed to close Playwright context during timeout recovery.");
+                try
+                {
+                    await _context.CloseAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is PlaywrightException or TimeoutException or InvalidOperationException)
+                {
+                    _logger.LogDebug(ex, "Failed to close Playwright context during timeout recovery.");
+                }
+            }
+
+            if (_browser is not null)
+            {
+                try
+                {
+                    await _browser.CloseAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is PlaywrightException or TimeoutException or InvalidOperationException)
+                {
+                    _logger.LogDebug(ex, "Failed to close Playwright browser during timeout recovery.");
+                }
+            }
+
+            if (_playwright is not null)
+            {
+                try
+                {
+                    _playwright.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Failed to dispose Playwright during timeout recovery.");
+                }
             }
         }
 
-        if (_browser is not null)
-        {
-            try
-            {
-                await _browser.CloseAsync().ConfigureAwait(false);
-            }
-            catch (Exception ex) when (ex is PlaywrightException or TimeoutException or InvalidOperationException)
-            {
-                _logger.LogDebug(ex, "Failed to close Playwright browser during timeout recovery.");
-            }
-        }
-
-        if (_playwright is not null)
-        {
-            try
-            {
-                _playwright.Dispose();
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "Failed to dispose Playwright during timeout recovery.");
-            }
-        }
-
+        _browserSession = null;
         _page = null;
         _context = null;
         _browser = null;
         _playwright = null;
+        _activeProxy = null;
+    _interactionSimulator.Reset();
         _initialized = false;
         _lastScreenshot = null;
         _currentSessionId = null;
@@ -2814,66 +2873,11 @@ You are an expert researcher controlling a browser to answer a query. You are cu
 
     public async ValueTask DisposeAsync()
     {
+        await ResetBrowserSessionAsync().ConfigureAwait(false);
+
         _operationLock.Dispose();
         _initializationLock.Dispose();
-
-        if (_page is not null)
-        {
-            try
-            {
-                await _page.CloseAsync().ConfigureAwait(false);
-            }
-            catch
-            {
-            }
-        }
-
-        if (_context is not null)
-        {
-            try
-            {
-                await _context.CloseAsync().ConfigureAwait(false);
-            }
-            catch
-            {
-            }
-        }
-
-        if (_browser is not null)
-        {
-            try
-            {
-                await _browser.CloseAsync().ConfigureAwait(false);
-            }
-            catch
-            {
-            }
-        }
-
-        if (_playwright is not null)
-        {
-            try
-            {
-                _playwright.Dispose();
-            }
-            catch
-            {
-            }
-        }
     }
-
-    private sealed record ComputerUseResponseState(string? ResponseId, ComputerCall? Call, bool Completed, string? SummaryFunctionCallId)
-    {
-        public ExplorationPayload? SummaryPayload { get; init; }
-
-        public string? SummaryRawJson { get; init; }
-
-        public string? SummaryResponseId { get; init; }
-
-        public IReadOnlyList<string>? FlaggedFunctionCallIds { get; init; }
-    }
-
-    private sealed record ComputerCall(string CallId, ComputerUseAction Action, IReadOnlyList<ComputerUseSafetyCheck> PendingSafetyChecks);
 
     private sealed record ComputerUseSafetyCheck(string Id, string Code, string Message);
 
@@ -2887,6 +2891,23 @@ You are an expert researcher controlling a browser to answer a query. You are cu
         IReadOnlyList<string> Keys,
         string? Text,
         double? DurationMs);
+
+    private sealed record ComputerCall(string CallId, ComputerUseAction Action, IReadOnlyList<ComputerUseSafetyCheck> PendingSafetyChecks);
+
+    private sealed record ComputerUseResponseState(
+        string? ResponseId,
+        ComputerCall? Call,
+        bool Completed,
+        string? SummaryFunctionCallId)
+    {
+        public ExplorationPayload? SummaryPayload { get; init; }
+
+        public string? SummaryRawJson { get; init; }
+
+        public string? SummaryResponseId { get; init; }
+
+        public IReadOnlyList<string>? FlaggedFunctionCallIds { get; init; }
+    }
 
     private readonly record struct ViewportSnapshot(double ScrollHeight, int PendingImages);
 

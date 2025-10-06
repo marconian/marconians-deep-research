@@ -104,6 +104,20 @@ public static class Settings
             }
         }
 
+        ComputerUseOptions computerUseOptions = configuration.GetSection("ComputerUse").Get<ComputerUseOptions>() ?? new();
+
+        string cacheDirectory = ResolveDirectory(configuration["CACHE_DIRECTORY"], Path.Combine("debug", "cache"));
+        string reportsDirectory = ResolveDirectory(configuration["REPORTS_DIRECTORY"], Path.Combine("debug", "reports"));
+
+        string profileDirectory = ResolveDirectory(
+            computerUseOptions.UserDataDirectory,
+            Path.Combine("debug", "cache", "computer-use-profile"));
+
+        computerUseOptions = computerUseOptions with
+        {
+            UserDataDirectory = profileDirectory
+        };
+
         var settings = new AppSettings
         {
             AzureOpenAiEndpoint = ReadRequired("AZURE_OPENAI_ENDPOINT"),
@@ -120,10 +134,11 @@ public static class Settings
             WebSearchProvider = provider,
             ComputerUseEnabled = computerUseEnabled,
             ComputerUseMode = computerUseMode,
-            CacheDirectory = ResolveDirectory(configuration["CACHE_DIRECTORY"], Path.Combine("debug", "cache")),
-            ReportsDirectory = ResolveDirectory(configuration["REPORTS_DIRECTORY"], Path.Combine("debug", "reports")),
+            CacheDirectory = cacheDirectory,
+    ReportsDirectory = reportsDirectory,
             PrimaryResearchObjective = configuration["PRIMARY_RESEARCH_OBJECTIVE"]?.Trim(),
-            AzureOpenAiReasoningEffortLevel = reasoningEffortLevel
+            AzureOpenAiReasoningEffortLevel = reasoningEffortLevel,
+            ComputerUse = computerUseOptions
         };
 
         if (missing.Count > 0)
@@ -173,6 +188,7 @@ public static class Settings
         public required string ReportsDirectory { get; init; }
         public string? PrimaryResearchObjective { get; init; }
         public string? AzureOpenAiReasoningEffortLevel { get; init; }
+        public ComputerUseOptions ComputerUse { get; init; } = new();
     }
 }
 
