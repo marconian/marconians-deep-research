@@ -2440,9 +2440,81 @@ You are an expert researcher controlling a browser to answer a query. You are cu
             _logger.LogDebug(ex, "Load-state wait failed while preparing non-DOM surface.");
         }
 
+        if (_currentSurfaceIsPdf)
+        {
+            await EnsurePdfViewerReadyAsync(cancellationToken).ConfigureAwait(false);
+        }
+
         try
         {
             await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    private async Task EnsurePdfViewerReadyAsync(CancellationToken cancellationToken)
+    {
+        if (_page is null || !_currentSurfaceIsPdf)
+        {
+            return;
+        }
+
+        try
+        {
+            await _page.WaitForFunctionAsync(
+                @"() => {
+                    const app = window.PDFViewerApplication;
+                    if (app) {
+                        if (app.initialized && app.pdfViewer && app.pdfViewer.pagesCount > 0) {
+                            return true;
+                        }
+
+                        if (typeof app.initializedPromise === 'object' && typeof app.initializedPromise.then === 'function') {
+                            return app.initialized;
+                        }
+
+                        if (app.pdfViewer && app.pdfViewer.pagesCount === 0) {
+                            return false;
+                        }
+                    }
+
+                    const embed = document.querySelector(""embed[type='application/pdf']"");
+                    if (embed) {
+                        return true;
+                    }
+
+                    const viewer = document.querySelector(""iframe[src*='.pdf']"");
+                    if (viewer) {
+                        return true;
+                    }
+
+                    const container = document.querySelector('.pdfViewer');
+                    if (container) {
+                        return container.children.length > 0;
+                    }
+
+                    return false;
+                }",
+                new PageWaitForFunctionOptions
+                {
+                    Timeout = 6000,
+                    PollingInterval = 100
+                }).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            _logger.LogDebug("Timed out waiting for PDF viewer readiness on {Url}; proceeding regardless.", _page.Url);
+        }
+        catch (PlaywrightException ex)
+        {
+            _logger.LogDebug(ex, "PDF viewer readiness wait failed due to Playwright error.");
+        }
+
+        try
+        {
+            await Task.Delay(250, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -2465,6 +2537,11 @@ You are an expert researcher controlling a browser to answer a query. You are cu
             catch (Exception ex) when (ex is PlaywrightException or TimeoutException)
             {
                 _logger.LogDebug(ex, "Load-state wait skipped DOM stability probe.");
+            }
+
+            if (_currentSurfaceIsPdf)
+            {
+                await EnsurePdfViewerReadyAsync(cancellationToken).ConfigureAwait(false);
             }
 
             await Task.Delay(150, cancellationToken).ConfigureAwait(false);

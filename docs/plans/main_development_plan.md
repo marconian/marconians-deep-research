@@ -107,7 +107,7 @@
 - [x] Update follow-up orchestration to funnel flagged web pages into the scraper and flagged PDFs into the Document Intelligence pipeline automatically.
 - [ ] Guard the scraper against binary responses and ensure file registry entries trigger downstream file reading.
 - [ ] Extend automated coverage to validate the new branching logic for pages versus PDFs.
-- [x] Harden computer-use browser flows to bypass DOM probing on PDF surfaces and maintain session stability (2025-10-06)
+- [x] Harden computer-use browser flows to bypass DOM probing on PDF surfaces, wait for viewer readiness, and maintain session stability (2025-10-06)
 
 ## M17 - Report Generation Flow Compliance
 - [x] Enforce hybrid search/exploration flow loops in `ResearcherAgent` across all providers.

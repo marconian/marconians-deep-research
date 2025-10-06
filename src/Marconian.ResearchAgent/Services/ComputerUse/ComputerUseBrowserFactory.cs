@@ -111,7 +111,48 @@ public sealed class ComputerUseBrowserFactory
         var stealthProfile = new StealthProfile(_options.Stealth, _logger);
         await stealthProfile.ApplyAsync(context, cancellationToken).ConfigureAwait(false);
 
-        IPage page = await context.NewPageAsync().ConfigureAwait(false);
+        IPage page;
+
+        try
+        {
+            var pages = context.Pages.ToArray();
+
+            if (pages.Length > 0)
+            {
+                page = pages[0];
+
+                if (page.IsClosed)
+                {
+                    page = await context.NewPageAsync().ConfigureAwait(false);
+                }
+
+                foreach (var extra in pages.Skip(1))
+                {
+                    try
+                    {
+                        await extra.CloseAsync(new PageCloseOptions { RunBeforeUnload = false }).ConfigureAwait(false);
+                    }
+                    catch (Exception ex) when (ex is PlaywrightException or InvalidOperationException or ObjectDisposedException)
+                    {
+                        _logger.LogDebug(ex, "Failed to close redundant startup tab; continuing with primary page.");
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug(ex, "Unexpected error closing redundant startup tab; ignoring.");
+                    }
+                }
+            }
+            else
+            {
+                page = await context.NewPageAsync().ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex) when (ex is PlaywrightException or InvalidOperationException or ObjectDisposedException)
+        {
+            _logger.LogDebug(ex, "Failed to reuse startup tab; creating a new page instance.");
+            page = await context.NewPageAsync().ConfigureAwait(false);
+        }
+
         await ApplyBaselineEmulationAsync(page).ConfigureAwait(false);
 
         _logger.LogInformation("Initialized Playwright session (Headless={Headless}, Persistent={Persistent}, Locale={Locale}, TimeZone={TimeZone}, RequestedTimeZone={RequestedTimeZone}, Proxy={Proxy}).",
