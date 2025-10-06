@@ -98,6 +98,19 @@ internal sealed class InteractiveResearchPlanner
                     {
                         history.Add(new("user", "Proceed with this plan using your recommended assumptions. No further clarifications available."));
                         response = await InvokePlannerAsync(history, cancellationToken).ConfigureAwait(false);
+
+                        if (response.Action == PlannerAction.PlanReady)
+                        {
+                            DisplayPlan(response, currentObjective);
+                            Console.WriteLine();
+                            Console.WriteLine("Plan accepted. Continuing with research.");
+                            return new PlannerOutcome(
+                                currentObjective,
+                                response.Summary,
+                                response.KeyQuestions,
+                                BuildContextHints(response));
+                        }
+
                         continue;
                     }
 
