@@ -29,6 +29,7 @@ using Marconian.ResearchAgent.Logging;
 using Marconian.ResearchAgent.Tracking;
 using Marconian.ResearchAgent.Utilities;
 using System.Threading;
+using Microsoft.Playwright;
 
 namespace Marconian.ResearchAgent;
 
@@ -156,6 +157,7 @@ internal static class Program
                     settings.AzureOpenAiComputerUseDeployment!,
                     sharedHttpClient,
                     loggerFactory.CreateLogger<ComputerUseSearchService>(),
+                    timeouts: settings.ComputerUseTimeouts,
                     environmentOptions: environment);
             }
 
@@ -524,39 +526,74 @@ internal static class Program
                     }
                 }
 
-                try
+                const int MaxDiagnosticAttempts = 2;
+                for (int attempt = 1; attempt <= MaxDiagnosticAttempts; attempt++)
                 {
-                    ComputerUseExplorationResult exploration = await (computerUseSearchService ?? computerUseServiceFactory!())
-                        .ExploreAsync(url, objective, cts.Token)
-                        .ConfigureAwait(false);
+                    ComputerUseSearchService explorer = computerUseSearchService ??= computerUseServiceFactory!();
 
-                    PrintExplorationReport(exploration);
-                    Console.WriteLine();
-                    Console.WriteLine("Diagnosis complete. Detailed timeline saved under debug/computer-use.");
-                    return 0;
+                    try
+                    {
+                        ComputerUseExplorationResult exploration = await explorer
+                            .ExploreAsync(url, objective, cts.Token)
+                            .ConfigureAwait(false);
+
+                        PrintExplorationReport(exploration);
+                        Console.WriteLine();
+                        Console.WriteLine("Diagnosis complete. Detailed timeline saved under debug/computer-use.");
+                        return 0;
+                    }
+                    catch (Exception ex) when (IsTargetClosedException(ex) && attempt < MaxDiagnosticAttempts && computerUseServiceFactory is not null)
+                    {
+                        logger.LogWarning(ex, "Computer-use diagnosis attempt {Attempt} encountered a closed browser for {Url}. Restarting session and retrying.", attempt, url);
+
+                        await explorer.DisposeAsync().ConfigureAwait(false);
+
+                        if (ReferenceEquals(computerUseSearchService, explorer))
+                        {
+                            computerUseSearchService = computerUseServiceFactory!();
+                        }
+
+                        continue;
+                    }
+                    catch (ComputerUseSearchBlockedException blocked)
+                    {
+                        logger.LogError(blocked, "Computer-use diagnosis blocked for {Url}", url);
+                        Console.Error.WriteLine($"Computer-use exploration blocked: {blocked.Message}");
+                        return 1;
+                    }
+                    catch (ComputerUseOperationTimeoutException timeout)
+                    {
+                        logger.LogError(timeout, "Computer-use diagnosis timed out for {Url}", url);
+                        Console.Error.WriteLine($"Computer-use exploration timed out: {timeout.Message}");
+                        return 1;
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex, "Computer-use diagnosis failed for {Url}", url);
+                        Console.Error.WriteLine($"Computer-use exploration failed: {ex.Message}");
+                        return 1;
+                    }
                 }
-                catch (ComputerUseSearchBlockedException blocked)
+            }
+
+            static bool IsTargetClosedException(Exception exception)
+            {
+                if (exception is PlaywrightException playwrightException)
                 {
-                    logger.LogError(blocked, "Computer-use diagnosis blocked for {Url}", url);
-                    Console.Error.WriteLine($"Computer-use exploration blocked: {blocked.Message}");
-                    return 1;
+                    string message = playwrightException.Message ?? string.Empty;
+                    if (message.Contains("Target page, context or browser has been closed", StringComparison.OrdinalIgnoreCase) ||
+                        message.Contains("Target closed", StringComparison.OrdinalIgnoreCase) ||
+                        message.Contains("Browser has been closed", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
                 }
-                catch (ComputerUseOperationTimeoutException timeout)
-                {
-                    logger.LogError(timeout, "Computer-use diagnosis timed out for {Url}", url);
-                    Console.Error.WriteLine($"Computer-use exploration timed out: {timeout.Message}");
-                    return 1;
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    logger.LogError(ex, "Computer-use diagnosis failed for {Url}", url);
-                    Console.Error.WriteLine($"Computer-use exploration failed: {ex.Message}");
-                    return 1;
-                }
+
+                return exception.InnerException is not null && IsTargetClosedException(exception.InnerException);
             }
 
             var orchestratorOptions = configuration.GetSection("Orchestrator").Get<OrchestratorOptions>() ?? new OrchestratorOptions();

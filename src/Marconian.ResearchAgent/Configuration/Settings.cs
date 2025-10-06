@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using Marconian.ResearchAgent.Services.ComputerUse;
 using Microsoft.Extensions.Configuration;
 
 namespace Marconian.ResearchAgent.Configuration;
@@ -105,6 +106,9 @@ public static class Settings
         }
 
         ComputerUseOptions computerUseOptions = configuration.GetSection("ComputerUse").Get<ComputerUseOptions>() ?? new();
+        ComputerUseTimeoutOptions computerUseTimeouts =
+            configuration.GetSection("ComputerUse:Timeouts").Get<ComputerUseTimeoutOptions>()
+            ?? ComputerUseTimeoutOptions.Default;
 
         string cacheDirectory = ResolveDirectory(configuration["CACHE_DIRECTORY"], Path.Combine("debug", "cache"));
         string reportsDirectory = ResolveDirectory(configuration["REPORTS_DIRECTORY"], Path.Combine("debug", "reports"));
@@ -138,7 +142,8 @@ public static class Settings
     ReportsDirectory = reportsDirectory,
             PrimaryResearchObjective = configuration["PRIMARY_RESEARCH_OBJECTIVE"]?.Trim(),
             AzureOpenAiReasoningEffortLevel = reasoningEffortLevel,
-            ComputerUse = computerUseOptions
+            ComputerUse = computerUseOptions,
+            ComputerUseTimeouts = computerUseTimeouts
         };
 
         if (missing.Count > 0)
@@ -189,6 +194,7 @@ public static class Settings
         public string? PrimaryResearchObjective { get; init; }
         public string? AzureOpenAiReasoningEffortLevel { get; init; }
         public ComputerUseOptions ComputerUse { get; init; } = new();
+        public ComputerUseTimeoutOptions ComputerUseTimeouts { get; init; } = ComputerUseTimeoutOptions.Default;
     }
 }
 
