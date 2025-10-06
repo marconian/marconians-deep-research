@@ -323,6 +323,8 @@ You are an expert researcher controlling a browser to answer a query. You are cu
     private List<TimelineEntry>? _timelineEntries;
     private string? _timelinePath;
     private EventHandler<IPage>? _contextPageHandler;
+    private bool _domInspectionEnabled = true;
+    private bool _currentSurfaceIsPdf;
 
     public ComputerUseSearchService(
         string endpoint,
@@ -409,7 +411,6 @@ You are an expert researcher controlling a browser to answer a query. You are cu
                     string.IsNullOrWhiteSpace(requestedTimeZone) ? "(default)" : requestedTimeZone);
             }
 
-            await _page.GotoAsync("https://www.google.com/ncr", new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded }).ConfigureAwait(false);
             _initialized = true;
         }
         finally
@@ -527,7 +528,7 @@ You are an expert researcher controlling a browser to answer a query. You are cu
                 throw new InvalidOperationException("Computer-use browser page was not initialized.");
             }
 
-            await NavigateToStartAsync(cancellationToken).ConfigureAwait(false);
+            await NavigateToSearchHomeAsync(cancellationToken).ConfigureAwait(false);
             var transcript = new List<string>();
             var acknowledgedFlaggedCallIds = new HashSet<string>(StringComparer.Ordinal);
             string? lastResponseId = null;
@@ -625,7 +626,7 @@ You are an expert researcher controlling a browser to answer a query. You are cu
 
                     try
                     {
-                        await NavigateToStartAsync(originalToken).ConfigureAwait(false);
+                        await ResetToNeutralPageAsync(originalToken).ConfigureAwait(false);
                     }
                     catch (Exception ex)
                     {
@@ -645,7 +646,7 @@ You are an expert researcher controlling a browser to answer a query. You are cu
         }
     }
 
-    private async Task NavigateToStartAsync(CancellationToken cancellationToken)
+    private async Task NavigateToSearchHomeAsync(CancellationToken cancellationToken)
     {
         if (_page is null)
         {
@@ -657,10 +658,130 @@ You are an expert researcher controlling a browser to answer a query. You are cu
             WaitUntil = WaitUntilState.NetworkIdle,
             Timeout = 20000
         }).ConfigureAwait(false);
+        UpdateDomInspectionState(_page.Url, false);
 
         await PreparePageForComputerUseAsync(cancellationToken).ConfigureAwait(false);
         await _page.BringToFrontAsync().ConfigureAwait(false);
         await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task ResetToNeutralPageAsync(CancellationToken cancellationToken)
+    {
+        if (_page is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await _page.GotoAsync("about:blank", new PageGotoOptions
+            {
+                WaitUntil = WaitUntilState.DOMContentLoaded,
+                Timeout = 5000
+            }).ConfigureAwait(false);
+            UpdateDomInspectionState(_page.Url, false);
+        }
+        catch (PlaywrightException ex)
+        {
+            _logger.LogDebug(ex, "Failed to navigate to neutral page; attempting reload.");
+            try
+            {
+                await _page.ReloadAsync(new PageReloadOptions
+                {
+                    WaitUntil = WaitUntilState.DOMContentLoaded,
+                    Timeout = 5000
+                }).ConfigureAwait(false);
+                UpdateDomInspectionState(_page.Url, false);
+            }
+            catch (Exception reloadEx)
+            {
+                _logger.LogDebug(reloadEx, "Failed to reload page after neutral navigation error.");
+            }
+        }
+
+        try
+        {
+            await _page.BringToFrontAsync().ConfigureAwait(false);
+        }
+        catch (PlaywrightException ex)
+        {
+            _logger.LogDebug(ex, "Failed to bring neutral page to front.");
+        }
+
+        try
+        {
+            await Task.Delay(150, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    private async Task<bool> NavigateToExplorationTargetAsync(string url, CancellationToken cancellationToken)
+    {
+        if (_page is null)
+        {
+            throw new InvalidOperationException("Computer-use browser page was not initialized.");
+        }
+
+        bool pdfCandidate = LooksLikePdf(url, null);
+
+        var gotoOptions = new PageGotoOptions
+        {
+            WaitUntil = pdfCandidate ? WaitUntilState.DOMContentLoaded : WaitUntilState.NetworkIdle,
+            Timeout = pdfCandidate ? 15000 : 20000
+        };
+
+        IResponse? response = null;
+
+        try
+        {
+            response = await _page.GotoAsync(url, gotoOptions).ConfigureAwait(false);
+        }
+        catch (TimeoutException ex) when (pdfCandidate)
+        {
+            _logger.LogDebug(ex, "PDF navigation to {Url} reached DOMContentLoaded timeout; continuing with best effort.", url);
+        }
+        catch (PlaywrightException ex) when (pdfCandidate)
+        {
+            _logger.LogDebug(ex, "PDF navigation to {Url} encountered a Playwright exception; continuing with best effort.", url);
+        }
+
+        bool isPdf = pdfCandidate;
+        string? resolvedContentType = null;
+
+        if (response is not null &&
+            response.Headers.TryGetValue("content-type", out var contentType) &&
+            contentType.IndexOf("pdf", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            isPdf = true;
+            resolvedContentType = contentType;
+        }
+
+        if (isPdf)
+        {
+            try
+            {
+                await _page.WaitForLoadStateAsync(LoadState.Load, new PageWaitForLoadStateOptions { Timeout = 5000 }).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is TimeoutException or PlaywrightException)
+            {
+                _logger.LogDebug(ex, "PDF load state wait timed out for {Url}; continuing with best effort.", url);
+            }
+
+            try
+            {
+                await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+
+        string? surfaceUrl = _page?.Url;
+        UpdateDomInspectionState(surfaceUrl ?? url, isPdf, resolvedContentType);
+
+        return isPdf;
     }
 
     private async Task<ComputerUseResponseState> SendInitialRequestAsync(string query, List<string> transcript, CancellationToken cancellationToken)
@@ -2268,16 +2389,33 @@ You are an expert researcher controlling a browser to answer a query. You are cu
             {
                 _logger.LogDebug("Switching to new browser tab at {Url}.", newest.Url);
                 _page = newest;
+                if (_page is not null)
+                {
+                    bool surfaceIsPdf = LooksLikePdf(_page.Url, null) || IsChromePdfViewer(_page.Url);
+                    UpdateDomInspectionState(_page.Url, surfaceIsPdf);
+                }
             }
+        }
+
+        if (_page is not null)
+        {
+            bool surfaceIsPdf = LooksLikePdf(_page.Url, null) || IsChromePdfViewer(_page.Url);
+            UpdateDomInspectionState(_page.Url, surfaceIsPdf);
         }
 
         await WaitForVisualStabilityAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task PreparePageForComputerUseAsync(CancellationToken cancellationToken)
+    private async Task PreparePageForComputerUseAsync(CancellationToken cancellationToken, bool skipDomPreparation = false)
     {
         if (_page is null)
         {
+            return;
+        }
+
+        if (skipDomPreparation || !_domInspectionEnabled)
+        {
+            await PrepareNonDomSurfaceAsync(cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -2286,10 +2424,50 @@ You are an expert researcher controlling a browser to answer a query. You are cu
         await WaitForVisualStabilityAsync(cancellationToken).ConfigureAwait(false);
     }
 
+    private async Task PrepareNonDomSurfaceAsync(CancellationToken cancellationToken)
+    {
+        if (_page is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await _page.WaitForLoadStateAsync(LoadState.Load, new PageWaitForLoadStateOptions { Timeout = 5000 }).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is PlaywrightException or TimeoutException)
+        {
+            _logger.LogDebug(ex, "Load-state wait failed while preparing non-DOM surface.");
+        }
+
+        try
+        {
+            await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
     private async Task WaitForVisualStabilityAsync(CancellationToken cancellationToken)
     {
         if (_page is null)
         {
+            return;
+        }
+
+        if (!_domInspectionEnabled)
+        {
+            try
+            {
+                await _page.WaitForLoadStateAsync(LoadState.Load, new PageWaitForLoadStateOptions { Timeout = 2000 }).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is PlaywrightException or TimeoutException)
+            {
+                _logger.LogDebug(ex, "Load-state wait skipped DOM stability probe.");
+            }
+
+            await Task.Delay(150, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -2599,6 +2777,11 @@ You are an expert researcher controlling a browser to answer a query. You are cu
             return;
         }
 
+        if (!_domInspectionEnabled)
+        {
+            return;
+        }
+
         await ThrowIfCaptchaDetectedAsync(query, cancellationToken).ConfigureAwait(false);
 
         bool hasResults = false;
@@ -2637,6 +2820,11 @@ You are an expert researcher controlling a browser to answer a query. You are cu
     private async Task DismissConsentAsync(CancellationToken cancellationToken)
     {
         if (_page is null)
+        {
+            return;
+        }
+
+        if (!_domInspectionEnabled)
         {
             return;
         }
@@ -2775,6 +2963,12 @@ You are an expert researcher controlling a browser to answer a query. You are cu
             return;
         }
 
+        if (!_domInspectionEnabled)
+        {
+            await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
     float serpTimeout = 4000;
         if (ShouldApplyTimeout(_timeouts.DefaultActionTimeout))
         {
@@ -2801,6 +2995,11 @@ You are an expert researcher controlling a browser to answer a query. You are cu
 
     private async Task ThrowIfCaptchaDetectedAsync(string query, CancellationToken cancellationToken)
     {
+        if (!_domInspectionEnabled)
+        {
+            return;
+        }
+
         if (!await IsCaptchaDetectedAsync().ConfigureAwait(false))
         {
             return;
@@ -2827,6 +3026,11 @@ You are an expert researcher controlling a browser to answer a query. You are cu
     private async Task<bool> IsCaptchaDetectedAsync()
     {
         if (_page is null)
+        {
+            return false;
+        }
+
+        if (!_domInspectionEnabled)
         {
             return false;
         }
@@ -2942,6 +3146,25 @@ You are an expert researcher controlling a browser to answer a query. You are cu
             : Path.Combine(root, $"{_currentSessionId}_timeline.json");
     }
 
+    private void UpdateDomInspectionState(string? url, bool isPdfSurface, string? contentType = null)
+    {
+        string normalizedUrl = url ?? string.Empty;
+        bool inferredPdf = LooksLikePdf(normalizedUrl, contentType);
+        bool viewerSurface = IsChromePdfViewer(normalizedUrl);
+        bool pdfSurface = isPdfSurface || inferredPdf || viewerSurface;
+        _currentSurfaceIsPdf = pdfSurface;
+        bool shouldEnable = !pdfSurface;
+
+        if (_domInspectionEnabled == shouldEnable)
+        {
+            return;
+        }
+
+        _domInspectionEnabled = shouldEnable;
+        string state = shouldEnable ? "enabled" : "disabled";
+        _logger.LogDebug("DOM inspection {State} for surface {Url}.", state, string.IsNullOrWhiteSpace(url) ? "(unknown)" : url);
+    }
+
     private void RecordTimelineEvent(string eventName, Dictionary<string, object?>? data = null)
     {
         if (_timelineEntries is null)
@@ -2959,6 +3182,15 @@ You are an expert researcher controlling a browser to answer a query. You are cu
             return;
         }
 
+        CancellationToken effectiveToken = cancellationToken;
+        bool cancellationRequested = cancellationToken.IsCancellationRequested;
+
+        if (cancellationRequested)
+        {
+            effectiveToken = CancellationToken.None;
+            _logger.LogDebug("Timeline persistence invoked with cancelled token; writing timeline for '{Query}' without cancellation support.", query);
+        }
+
         try
         {
             var serializerOptions = new JsonSerializerOptions(SerializerOptions)
@@ -2967,9 +3199,9 @@ You are an expert researcher controlling a browser to answer a query. You are cu
             };
 
             var payload = JsonSerializer.Serialize(_timelineEntries, serializerOptions);
-            await File.WriteAllTextAsync(_timelinePath, payload, cancellationToken).ConfigureAwait(false);
+            await File.WriteAllTextAsync(_timelinePath, payload, effectiveToken).ConfigureAwait(false);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (effectiveToken.CanBeCanceled && effectiveToken.IsCancellationRequested)
         {
             throw;
         }
@@ -3037,6 +3269,8 @@ You are an expert researcher controlling a browser to answer a query. You are cu
         _currentSessionId = null;
         _timelineEntries = null;
         _timelinePath = null;
+        _domInspectionEnabled = true;
+        _currentSurfaceIsPdf = false;
     }
 
     private async Task CloseContextPagesAsync(IBrowserContext context, IPage? primaryPage, string scenario)
@@ -3225,13 +3459,17 @@ You are an expert researcher controlling a browser to answer a query. You are cu
                 ["requiredFlaggedResources"] = requiredFlaggedResourceCount
             });
 
-            await _page.GotoAsync(url, new PageGotoOptions
+            bool targetIsPdf = await NavigateToExplorationTargetAsync(url, cancellationToken).ConfigureAwait(false);
+            RecordTimelineEvent("exploration_navigate_target", new Dictionary<string, object?>
             {
-                WaitUntil = WaitUntilState.NetworkIdle,
-                Timeout = 20000
-            }).ConfigureAwait(false);
-            await PreparePageForComputerUseAsync(cancellationToken).ConfigureAwait(false);
-            await ThrowIfCaptchaDetectedAsync(url, cancellationToken).ConfigureAwait(false);
+                ["url"] = url,
+                ["isPdf"] = targetIsPdf
+            });
+            await PreparePageForComputerUseAsync(cancellationToken, skipDomPreparation: targetIsPdf).ConfigureAwait(false);
+            if (!targetIsPdf)
+            {
+                await ThrowIfCaptchaDetectedAsync(url, cancellationToken).ConfigureAwait(false);
+            }
             await _page.BringToFrontAsync().ConfigureAwait(false);
             await Task.Delay(250, cancellationToken).ConfigureAwait(false);
 
@@ -4047,6 +4285,22 @@ You are an expert researcher controlling a browser to answer a query. You are cu
         }
 
         return false;
+    }
+
+    private static bool IsChromePdfViewer(string url)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return false;
+        }
+
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+        {
+            return false;
+        }
+
+        return string.Equals(uri.Scheme, "chrome-extension", StringComparison.OrdinalIgnoreCase) &&
+               uri.AbsolutePath.Contains(".pdf", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string? NormalizeNavigableUrl(string url, int depth = 0)
