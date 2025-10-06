@@ -2774,9 +2774,21 @@ You are an expert researcher controlling a browser to answer a query. You are cu
             return;
         }
 
+    float serpTimeout = 4000;
+        if (ShouldApplyTimeout(_timeouts.DefaultActionTimeout))
+        {
+            serpTimeout = ClampTimeout(_timeouts.DefaultActionTimeout, 1000, 120000);
+        }
+        else if (ShouldApplyTimeout(_timeouts.SearchOperationTimeout))
+        {
+            serpTimeout = ClampTimeout(_timeouts.SearchOperationTimeout, 1000, 300000);
+        }
+
         try
         {
-            await _page.WaitForSelectorAsync("li.b_algo, div.g", new PageWaitForSelectorOptions { Timeout = 4000 }).ConfigureAwait(false);
+            await _page.WaitForSelectorAsync(
+                "li.b_algo, div.g",
+                new PageWaitForSelectorOptions { Timeout = serpTimeout }).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is PlaywrightException or TimeoutException)
         {
