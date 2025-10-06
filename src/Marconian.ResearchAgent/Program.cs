@@ -28,6 +28,7 @@ using System.Collections.ObjectModel;
 using Marconian.ResearchAgent.Logging;
 using Marconian.ResearchAgent.Tracking;
 using Marconian.ResearchAgent.Utilities;
+using System.Threading;
 
 namespace Marconian.ResearchAgent;
 
@@ -93,6 +94,7 @@ internal static class Program
     ComputerUseSearchService? computerUseSearchService = null;
     PooledComputerUseExplorer? computerUseExplorerPool = null;
     Func<ComputerUseSearchService>? computerUseServiceFactory = null;
+    List<string>? pooledProfileDirectories = null;
         string? computerUseDisabledReason = null;
 
         ResearchFlowTracker? flowTracker = null;
@@ -571,9 +573,43 @@ internal static class Program
 
                 if (maxConcurrentSessions > 1)
                 {
+                    int instanceCounter = 0;
+                    string? poolProfileRoot = null;
+                    if (settings.ComputerUse.UsePersistentContext)
+                    {
+                        string baseProfileDirectory = settings.ComputerUse.UserDataDirectory ?? Path.Combine(Directory.GetCurrentDirectory(), "debug", "cache", "computer-use-profile");
+                        string normalizedBase = Path.GetFullPath(baseProfileDirectory);
+                        string directoryName = Path.GetDirectoryName(normalizedBase) ?? normalizedBase;
+                        poolProfileRoot = Path.Combine(directoryName, "pool");
+                        Directory.CreateDirectory(poolProfileRoot);
+                        pooledProfileDirectories = new List<string>();
+                    }
+
                     computerUseExplorerPool = new PooledComputerUseExplorer(
                         maxConcurrentSessions,
-                        () => computerUseServiceFactory(),
+                        () =>
+                        {
+                            ComputerUseOptions options = settings.ComputerUse;
+                            if (settings.ComputerUse.UsePersistentContext && poolProfileRoot is not null)
+                            {
+                                int instanceId = Interlocked.Increment(ref instanceCounter);
+                                string uniqueDirectory = Path.Combine(poolProfileRoot, $"navigator_{instanceId:D2}_{Guid.NewGuid():N}");
+                                Directory.CreateDirectory(uniqueDirectory);
+                                if (pooledProfileDirectories is not null)
+                                {
+                                    lock (pooledProfileDirectories)
+                                    {
+                                        pooledProfileDirectories.Add(uniqueDirectory);
+                                    }
+                                }
+                                options = options with
+                                {
+                                    UserDataDirectory = uniqueDirectory
+                                };
+                            }
+
+                            return CreateComputerUseService(options);
+                        },
                         loggerFactory.CreateLogger<PooledComputerUseExplorer>());
                     logger.LogInformation(
                         "Computer-use explorer pool initialized with capacity {Capacity} (NavigatorParallelism={Parallelism}).",
@@ -874,6 +910,31 @@ internal static class Program
             if (computerUseSearchService is not null)
             {
                 await computerUseSearchService.DisposeAsync().ConfigureAwait(false);
+            }
+
+            if (pooledProfileDirectories is not null)
+            {
+                List<string> snapshot;
+                lock (pooledProfileDirectories)
+                {
+                    snapshot = new List<string>(pooledProfileDirectories);
+                    pooledProfileDirectories.Clear();
+                }
+
+                foreach (string profileDirectory in snapshot)
+                {
+                    try
+                    {
+                        if (Directory.Exists(profileDirectory))
+                        {
+                            Directory.Delete(profileDirectory, recursive: true);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogDebug(ex, "Failed to clean pooled profile directory {Directory}", profileDirectory);
+                    }
+                }
             }
 
             if (flowTracker is not null)
