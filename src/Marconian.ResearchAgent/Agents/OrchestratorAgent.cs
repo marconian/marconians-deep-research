@@ -43,6 +43,7 @@ public sealed class OrchestratorAgent : IAgent
     private readonly ResearcherOptions _researcherOptions;
     private readonly ShortTermMemoryOptions _shortTermOptions;
     private readonly int _maxRevisionPasses;
+    private readonly ConcurrentDictionary<string, string> _sourceContentCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly JsonSerializerOptions _revisionOptions = new(JsonSerializerDefaults.Web)
     {
         PropertyNameCaseInsensitive = true
@@ -102,12 +103,14 @@ public sealed class OrchestratorAgent : IAgent
                 MaxResearchPasses = options.MaxResearchPasses,
                 MaxFollowupQuestions = options.MaxFollowupQuestions,
                 MaxSectionEvidenceCharacters = options.MaxSectionEvidenceCharacters,
+                MaxSourceAttachmentCharacters = options.MaxSourceAttachmentCharacters,
                 MaxReportRevisionPasses = options.MaxReportRevisionPasses
             };
 
         resolved.MaxResearchPasses = Math.Max(1, resolved.MaxResearchPasses);
         resolved.MaxFollowupQuestions = Math.Max(0, resolved.MaxFollowupQuestions);
         resolved.MaxSectionEvidenceCharacters = Math.Max(500, resolved.MaxSectionEvidenceCharacters);
+        resolved.MaxSourceAttachmentCharacters = Math.Max(1000, resolved.MaxSourceAttachmentCharacters);
         resolved.MaxReportRevisionPasses = Math.Max(0, resolved.MaxReportRevisionPasses);
         return resolved;
     }
@@ -1370,11 +1373,24 @@ public sealed class OrchestratorAgent : IAgent
     {
         var contexts = new Dictionary<string, SectionDraftContext>(StringComparer.OrdinalIgnoreCase);
 
+        string? ResolveSummary(string? sectionId)
+        {
+            if (string.IsNullOrWhiteSpace(sectionId))
+            {
+                return null;
+            }
+
+            return sectionLookup.TryGetValue(sectionId, out var plan)
+                ? plan.Summary
+                : null;
+        }
+
         void Traverse(
             ReportLayoutNode node,
             List<string> path,
             ReportLayoutNode? parent,
-            IReadOnlyList<ReportLayoutNode> siblings)
+            IReadOnlyList<ReportLayoutNode> siblings,
+            int index)
         {
             var nextPath = new List<string>(path)
             {
@@ -1388,6 +1404,9 @@ public sealed class OrchestratorAgent : IAgent
             {
                 parentSummary = parentPlan.Summary;
             }
+
+            ReportLayoutNode? previousNode = index > 0 ? siblings[index - 1] : null;
+            ReportLayoutNode? nextNode = index + 1 < siblings.Count ? siblings[index + 1] : null;
 
             var siblingTitles = siblings
                 .Where(static s => !string.IsNullOrWhiteSpace(s.Title))
@@ -1411,18 +1430,26 @@ public sealed class OrchestratorAgent : IAgent
                     parentSectionId,
                     parentSummary,
                     siblingTitles,
-                    childTitles);
+                    childTitles,
+                    previousNode?.SectionId,
+                    previousNode?.Title,
+                    ResolveSummary(previousNode?.SectionId),
+                    nextNode?.SectionId,
+                    nextNode?.Title,
+                    ResolveSummary(nextNode?.SectionId));
             }
 
-            foreach (var child in node.Children)
+            for (int childIndex = 0; childIndex < node.Children.Count; childIndex++)
             {
-                Traverse(child, nextPath, node, node.Children);
+                var child = node.Children[childIndex];
+                Traverse(child, nextPath, node, node.Children, childIndex);
             }
         }
 
-        foreach (var root in layout)
+        for (int index = 0; index < layout.Count; index++)
         {
-            Traverse(root, new List<string>(), null, layout);
+            var root = layout[index];
+            Traverse(root, new List<string>(), null, layout, index);
         }
 
         return contexts;
@@ -1467,6 +1494,10 @@ public sealed class OrchestratorAgent : IAgent
         {
             citationTagPairs.Add(($"S{index + 1}", citations[index]));
         }
+
+        IReadOnlyList<SourceAttachment> sourceAttachments = citationTagPairs.Count == 0
+            ? Array.Empty<SourceAttachment>()
+            : await BuildSourceAttachmentsAsync(rootTask, citationTagPairs, cancellationToken).ConfigureAwait(false);
 
         var promptBuilder = new StringBuilder();
         promptBuilder.AppendLine(string.Format(
@@ -1530,6 +1561,65 @@ public sealed class OrchestratorAgent : IAgent
                     promptBuilder.Append("- ");
                     promptBuilder.AppendLine(child);
                 }
+            }
+
+            bool contextHeaderWritten = false;
+            void EnsureContextHeader()
+            {
+                if (contextHeaderWritten)
+                {
+                    return;
+                }
+
+                promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.OutlineImmediateContextHeader);
+                contextHeaderWritten = true;
+            }
+
+            if (!string.IsNullOrWhiteSpace(context.PreviousSectionId) || !string.IsNullOrWhiteSpace(context.PreviousTitle))
+            {
+                var previousDraft = priorDrafts
+                    .LastOrDefault(draft => string.Equals(draft.SectionId, context.PreviousSectionId, StringComparison.OrdinalIgnoreCase));
+
+                if (previousDraft is not null)
+                {
+                    EnsureContextHeader();
+                    promptBuilder.AppendLine(string.Format(
+                        CultureInfo.InvariantCulture,
+                        SystemPrompts.Templates.Orchestrator.OutlinePreviousSectionDraftLine,
+                        previousDraft.Title,
+                        SummarizeForPrompt(previousDraft.Content, 360)));
+                }
+                else if (!string.IsNullOrWhiteSpace(context.PreviousSummary))
+                {
+                    EnsureContextHeader();
+                    string previousTitle = string.IsNullOrWhiteSpace(context.PreviousTitle)
+                        ? "Previous section"
+                        : context.PreviousTitle.Trim();
+
+                    promptBuilder.AppendLine(string.Format(
+                        CultureInfo.InvariantCulture,
+                        SystemPrompts.Templates.Orchestrator.OutlinePreviousSectionPlanLine,
+                        previousTitle,
+                        context.PreviousSummary));
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(context.NextTitle) || !string.IsNullOrWhiteSpace(context.NextSummary))
+            {
+                EnsureContextHeader();
+                string nextTitle = string.IsNullOrWhiteSpace(context.NextTitle)
+                    ? "Upcoming section"
+                    : context.NextTitle.Trim();
+                string nextSummary = string.IsNullOrWhiteSpace(context.NextSummary)
+                    ? "(no summary provided)"
+                    : context.NextSummary.Trim();
+
+                promptBuilder.AppendLine(string.Format(
+                    CultureInfo.InvariantCulture,
+                    SystemPrompts.Templates.Orchestrator.OutlineNextSectionPlanLine,
+                    nextTitle,
+                    nextSummary));
+                promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.OutlineNextSectionReminderLine);
             }
         }
 
@@ -1603,6 +1693,25 @@ public sealed class OrchestratorAgent : IAgent
                 }
             }
 
+            if (sourceAttachments.Count > 0)
+            {
+                promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.SectionSourceContentHeader);
+                foreach (var attachment in sourceAttachments)
+                {
+                    string attachmentTitle = !string.IsNullOrWhiteSpace(attachment.Citation.Title)
+                        ? attachment.Citation.Title!.Trim()
+                        : attachment.Citation.SourceId;
+
+                    promptBuilder.AppendLine(string.Format(
+                        CultureInfo.InvariantCulture,
+                        SystemPrompts.Templates.Orchestrator.SectionSourceContentEntryHeader,
+                        attachment.Tag,
+                        attachmentTitle));
+                    promptBuilder.AppendLine(attachment.Content);
+                    promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.SectionSourceContentDivider);
+                }
+            }
+
             promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.SectionSourcesInstruction);
         }
 
@@ -1657,6 +1766,89 @@ public sealed class OrchestratorAgent : IAgent
         };
     }
 
+    private async Task<IReadOnlyList<SourceAttachment>> BuildSourceAttachmentsAsync(
+        AgentTask rootTask,
+        IReadOnlyList<(string Tag, SourceCitation Citation)> citationTagPairs,
+        CancellationToken cancellationToken)
+    {
+        const int MaxAttachments = 4;
+
+        var topPairs = citationTagPairs
+            .Where(pair => pair.Citation is not null)
+            .Take(MaxAttachments)
+            .ToList();
+
+        if (topPairs.Count == 0)
+        {
+            return Array.Empty<SourceAttachment>();
+        }
+
+        var missingIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var pair in topPairs)
+        {
+            string? sourceId = pair.Citation.SourceId;
+            if (string.IsNullOrWhiteSpace(sourceId))
+            {
+                continue;
+            }
+
+            if (!_sourceContentCache.ContainsKey(sourceId))
+            {
+                missingIds.Add(sourceId);
+            }
+        }
+
+        if (missingIds.Count > 0)
+        {
+            var fetched = await _longTermMemoryManager
+                .GetSourceDocumentsAsync(
+                    rootTask.ResearchSessionId,
+                    missingIds,
+                    _options.MaxSourceAttachmentCharacters,
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            foreach (var kvp in fetched)
+            {
+                if (!string.IsNullOrWhiteSpace(kvp.Value))
+                {
+                    _sourceContentCache[kvp.Key] = kvp.Value.Trim();
+                }
+            }
+        }
+
+        var attachments = new List<SourceAttachment>(topPairs.Count);
+        foreach (var pair in topPairs)
+        {
+            string? sourceId = pair.Citation.SourceId;
+            string? content = null;
+
+            if (!string.IsNullOrWhiteSpace(sourceId) && _sourceContentCache.TryGetValue(sourceId, out var cached))
+            {
+                content = cached;
+            }
+
+            if (string.IsNullOrWhiteSpace(content))
+            {
+                if (!string.IsNullOrWhiteSpace(pair.Citation.Snippet))
+                {
+                    content = pair.Citation.Snippet!.Trim();
+                }
+                else
+                {
+                    continue;
+                }
+            }
+
+            attachments.Add(new SourceAttachment(
+                pair.Tag,
+                pair.Citation,
+                TrimToLength(content, _options.MaxSourceAttachmentCharacters)));
+        }
+
+        return attachments;
+    }
+
     private static string RenderLayoutSummary(IReadOnlyList<ReportLayoutNode> layout)
     {
         if (layout.Count == 0)
@@ -1705,6 +1897,16 @@ public sealed class OrchestratorAgent : IAgent
         }
 
         return normalized[..maxLength] + "…";
+    }
+
+    private static string TrimToLength(string content, int maxLength)
+    {
+        if (string.IsNullOrEmpty(content) || content.Length <= maxLength)
+        {
+            return content;
+        }
+
+        return content[..maxLength] + "…";
     }
 
     private static bool ShouldCreateSectionForNode(string title, string? parentTitle)
@@ -2450,7 +2652,15 @@ public sealed class OrchestratorAgent : IAgent
         string? ParentSectionId,
         string? ParentSummary,
         IReadOnlyList<string> SiblingTitles,
-        IReadOnlyList<string> ChildTitles);
+        IReadOnlyList<string> ChildTitles,
+        string? PreviousSectionId,
+        string? PreviousTitle,
+        string? PreviousSummary,
+        string? NextSectionId,
+        string? NextTitle,
+        string? NextSummary);
+
+    private sealed record SourceAttachment(string Tag, SourceCitation Citation, string Content);
 }
 
 

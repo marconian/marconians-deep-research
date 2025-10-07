@@ -7,7 +7,7 @@ public static class SystemPrompts
         public const string PlanningStrategist = "You are a strategist decomposing complex research projects into parallelizable branches.";
         public const string SynthesisAuthor = "You are a master synthesizer, weaving disparate research findings into a compelling and cohesive narrative. Your writing is engaging, insightful, and tells a clear story. Use citations to ground your narrative in evidence, but prioritize flow and readability. Conclude with a summary of your overall confidence in the conclusions.";
         public const string OutlineEditor = "You are a veteran research editor who designs structured report outlines grounded in provided evidence.";
-        public const string SectionAuthor = "You are an expert author, crafting a specific section of a larger research report. Write a polished, engaging narrative (2-4 paragraphs) that explains the significance of the evidence. Your tone is authoritative yet accessible. Ensure smooth transitions to parent and child topics, and write as if for an intelligent audience that needs key points explained, not just stated. Do not include headings or citation brackets; return only the body text.";
+        public const string SectionAuthor = "You are a world-class author, responsible for drafting a single, specific section of a larger research report. Your task is to write a polished, engaging, and context-aware narrative (typically 2-4 paragraphs) that explains the significance of the provided evidence. Your writing style must adapt to the research objective. For technical or implementation-focused topics, your prose should be precise, in-depth, and may include formatted code examples. For historical or qualitative topics, your narrative should be more descriptive and story-driven. In all cases, maintain an authoritative yet accessible tone, ensuring smooth transitions to parent and child topics. Write for an intelligent audience that needs key points explained, not just stated. Do not include headings or citation brackets; return only the body text for the section.";
         public const string ReportEditor = "You are an editor that refines Markdown research reports with precise, line-targeted edits.";
     }
 
@@ -60,11 +60,19 @@ public static class SystemPrompts
             public const string OutlineSynthesisContextHeader = "Overall synthesis context:";
             public const string OutlineEvidenceHeader = "Evidence:";
             public const string OutlineNoEvidence = "(No direct evidence; provide contextual overview.)";
+            public const string OutlineImmediateContextHeader = "Surrounding sections for continuity:";
+            public const string OutlinePreviousSectionDraftLine = "Previous drafted section \"{0}\": {1}";
+            public const string OutlinePreviousSectionPlanLine = "Previous planned section \"{0}\": {1}";
+            public const string OutlineNextSectionPlanLine = "Next planned section \"{0}\": {1}";
+            public const string OutlineNextSectionReminderLine = "Ensure a smooth transition into the next section.";
             public const string SectionSourcesHeader = "Sources for this section (use the tags below in your narrative):";
             public const string SectionSourceLine = "- {0}: {1}";
             public const string SectionSourceDetails = "    URL: {0}";
             public const string SectionSourceSnippet = "    Notes: {0}";
             public const string SectionSourcesInstruction = "When citing a source in the narrative, append the matching tag in the format <<ref:TAG>> immediately after the supporting sentence.";
+            public const string SectionSourceContentHeader = "Source excerpts (verbatim content for technical depth):";
+            public const string SectionSourceContentEntryHeader = "<<ref:{0}>> {1}";
+            public const string SectionSourceContentDivider = "---";
             public const string SectionWritingInstruction = "Write a polished Markdown narrative (2-4 paragraphs) for this section that stays consistent with the overall outline and surrounding sections. Incorporate transitions to the parent and child topics when appropriate, stay factual, and only use the supplied evidence. Use the provided citation tags (<<ref:TAG>>) exactly where evidence is applied. Do not include headings. Return only the body text.";
             public const string ReportLinesHeader = "Existing report lines:";
             public const string ReportRevisionInstruction = "Suggest up to three targeted edits to improve clarity, add missing citations, or fix structural issues. Return a JSON array of objects with properties 'action' ('replace' | 'insert_before' | 'insert_after'), 'line' (1-based) and 'content'. If no changes are needed, return an empty JSON array.";

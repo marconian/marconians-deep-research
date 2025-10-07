@@ -345,6 +345,99 @@ public sealed class LongTermMemoryManager
         return await _cosmosMemoryService.QuerySimilarAsync(researchSessionId, embedding, limit, cancellationToken).ConfigureAwait(false);
     }
 
+    public async Task<IReadOnlyDictionary<string, string>> GetSourceDocumentsAsync(
+        string researchSessionId,
+        IReadOnlyCollection<string> sourceIds,
+        int maxCharactersPerSource,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(researchSessionId) || sourceIds.Count == 0)
+        {
+            return new Dictionary<string, string>();
+        }
+
+        var normalizedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string rawId in sourceIds)
+        {
+            if (string.IsNullOrWhiteSpace(rawId))
+            {
+                continue;
+            }
+
+            normalizedIds.Add(rawId.Trim());
+        }
+
+        if (normalizedIds.Count == 0)
+        {
+            return new Dictionary<string, string>();
+        }
+
+        int safeLimit = Math.Clamp(normalizedIds.Count * 200, 1000, 6000);
+        IReadOnlyList<MemoryRecord> records = await _cosmosMemoryService
+            .QueryBySessionAsync(researchSessionId, safeLimit, cancellationToken)
+            .ConfigureAwait(false);
+
+        var aggregate = new Dictionary<string, StringBuilder>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var record in records)
+        {
+            if (record.Sources.Count == 0)
+            {
+                continue;
+            }
+
+            string chunk = record.Content?.Trim() ?? string.Empty;
+            if (chunk.Length == 0)
+            {
+                continue;
+            }
+
+            foreach (var source in record.Sources)
+            {
+                if (string.IsNullOrWhiteSpace(source.SourceId) || !normalizedIds.Contains(source.SourceId))
+                {
+                    continue;
+                }
+
+                if (!aggregate.TryGetValue(source.SourceId, out var builder))
+                {
+                    builder = new StringBuilder();
+                    aggregate[source.SourceId] = builder;
+                }
+
+                if (builder.Length >= maxCharactersPerSource)
+                {
+                    continue;
+                }
+
+                if (builder.Length > 0)
+                {
+                    builder.AppendLine();
+                    builder.AppendLine();
+                }
+
+                int remaining = Math.Max(0, maxCharactersPerSource - builder.Length);
+                if (remaining == 0)
+                {
+                    continue;
+                }
+
+                if (chunk.Length > remaining)
+                {
+                    builder.Append(chunk.AsSpan(0, remaining));
+                    continue;
+                }
+
+                builder.Append(chunk);
+            }
+        }
+
+        return aggregate.ToDictionary(
+            pair => pair.Key,
+            pair => pair.Value.ToString(),
+            StringComparer.OrdinalIgnoreCase);
+    }
+
     public async Task UpsertBranchStateAsync(
         string researchSessionId,
         string branchId,
