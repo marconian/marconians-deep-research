@@ -21,6 +21,7 @@ using Marconian.ResearchAgent.Synthesis;
 using Marconian.ResearchAgent.Tools;
 using Marconian.ResearchAgent.Tracking;
 using Marconian.ResearchAgent.Utilities;
+using Marconian.ResearchAgent.Streaming;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -43,6 +44,7 @@ public sealed class OrchestratorAgent : IAgent
     private readonly ResearcherOptions _researcherOptions;
     private readonly ShortTermMemoryOptions _shortTermOptions;
     private readonly int _maxRevisionPasses;
+    private readonly IThoughtEventPublisher _thoughtPublisher;
     private readonly ConcurrentDictionary<string, string> _sourceContentCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly JsonSerializerOptions _revisionOptions = new(JsonSerializerDefaults.Web)
     {
@@ -63,7 +65,8 @@ public sealed class OrchestratorAgent : IAgent
         string? reportsDirectory = null,
         OrchestratorOptions? orchestratorOptions = null,
         ResearcherOptions? researcherOptions = null,
-        ShortTermMemoryOptions? shortTermMemoryOptions = null)
+    ShortTermMemoryOptions? shortTermMemoryOptions = null,
+    IThoughtEventPublisher? thoughtPublisher = null)
     {
         _openAiService = openAiService ?? throw new ArgumentNullException(nameof(openAiService));
         _longTermMemoryManager = longTermMemoryManager ?? throw new ArgumentNullException(nameof(longTermMemoryManager));
@@ -92,7 +95,80 @@ public sealed class OrchestratorAgent : IAgent
                 CacheTtlHours = shortTermMemoryOptions.CacheTtlHours
             };
         _maxRevisionPasses = Math.Max(0, _options.MaxReportRevisionPasses);
+        _thoughtPublisher = thoughtPublisher ?? NullThoughtEventPublisher.Instance;
     }
+
+    private void PublishThought(string phase, string detail, ThoughtSeverity severity = ThoughtSeverity.Info, Guid? correlationId = null)
+    {
+        if (string.IsNullOrWhiteSpace(detail))
+        {
+            return;
+        }
+
+    _thoughtPublisher.Publish(phase, nameof(OrchestratorAgent), LimitDetail(detail), severity, correlationId);
+    }
+
+    private void PublishBranchThought(string branchId, string detail, ThoughtSeverity severity = ThoughtSeverity.Info)
+    {
+        if (string.IsNullOrWhiteSpace(detail))
+        {
+            return;
+        }
+
+        string phase = string.IsNullOrWhiteSpace(branchId)
+            ? "Research"
+            : $"Research/{branchId}";
+        _thoughtPublisher.Publish(phase, nameof(OrchestratorAgent), LimitDetail(detail), severity, null);
+    }
+
+    private Task<string> StreamCompletionAsync(
+        string phase,
+        OpenAiChatRequest request,
+        CancellationToken cancellationToken,
+        Guid? correlationId = null,
+        ThoughtSeverity severity = ThoughtSeverity.Info)
+    {
+        return ThoughtStreamingHelper.StreamCompletionAsync(
+            _openAiService,
+            request,
+            _thoughtPublisher,
+            phase,
+            nameof(OrchestratorAgent),
+            correlationId,
+            severity,
+            cancellationToken,
+            detail => LimitDetail(detail));
+    }
+
+    private Task<string> StreamBranchCompletionAsync(
+        string branchId,
+        OpenAiChatRequest request,
+        CancellationToken cancellationToken,
+        ThoughtSeverity severity = ThoughtSeverity.Info)
+    {
+        string phase = string.IsNullOrWhiteSpace(branchId)
+            ? "Research"
+            : $"Research/{branchId}";
+
+        Guid? correlationId = Guid.TryParse(branchId, out Guid parsed)
+            ? parsed
+            : null;
+
+        return StreamCompletionAsync(phase, request, cancellationToken, correlationId, severity);
+    }
+
+    private static string LimitDetail(string value, int maxLength = 240)
+    {
+        if (string.IsNullOrWhiteSpace(value) || value.Length <= maxLength)
+        {
+            return value;
+        }
+
+        return value[..maxLength].TrimEnd() + "…";
+    }
+
+    private static Guid? TryParseGuid(string? value)
+        => Guid.TryParse(value, out Guid parsed) ? parsed : null;
 
     private static OrchestratorOptions SanitizeOrchestratorOptions(OrchestratorOptions? options)
     {
@@ -996,15 +1072,23 @@ public sealed class OrchestratorAgent : IAgent
             DeploymentName: _chatDeploymentName,
             MaxOutputTokens: 350);
 
-        string response = await _openAiService.GenerateTextAsync(request, cancellationToken).ConfigureAwait(false);
+    string response = await StreamCompletionAsync("Planning", request, cancellationToken, TryParseGuid(task.TaskId)).ConfigureAwait(false);
         if (!TryParseContinuationDecision(response, out var decision))
         {
             bool defaultContinue = plan.Branches.Any(static branch => branch.Status == ResearchBranchStatus.Pending)
                 && aggregation.Findings.Count < plan.Branches.Count;
 
+            PublishThought("Planning", defaultContinue
+                ? "Continuation decision fallback: continuing with remaining pending branches."
+                : "Continuation decision fallback: stopping additional research.");
             return new ResearchContinuationDecision(defaultContinue, Array.Empty<string>());
         }
 
+        PublishThought(
+            "Planning",
+            decision.ShouldContinue
+                ? $"Continuation approved. New questions: {string.Join("; ", decision.NewQuestions.Take(3))}"
+                : "Continuation declined. Proceeding to synthesis.");
         return decision;
     }
 
@@ -1017,6 +1101,7 @@ public sealed class OrchestratorAgent : IAgent
             if (plannerPlan.Branches.Count > 0)
             {
                 _logger.LogInformation("Using planner-provided plan with {BranchCount} branches.", plannerPlan.Branches.Count);
+                PublishThought("Planning", $"Adopted planner context with {plannerPlan.Branches.Count} branch questions.");
                 return plannerPlan;
             }
         }
@@ -1035,12 +1120,19 @@ public sealed class OrchestratorAgent : IAgent
             DeploymentName: _chatDeploymentName,
             MaxOutputTokens: 300);
 
-        _logger.LogDebug("Requesting research plan for objective '{Objective}'.", task.Objective);
-        string response = await _openAiService.GenerateTextAsync(request, cancellationToken).ConfigureAwait(false);
+    PublishThought("Planning", $"Requesting research plan for '{task.Objective}'.");
+    _logger.LogDebug("Requesting research plan for objective '{Objective}'.", task.Objective);
+    string response = await StreamCompletionAsync("Planning", request, cancellationToken, TryParseGuid(task.TaskId)).ConfigureAwait(false);
         var branchQuestions = ParseQuestions(response);
         if (branchQuestions.Count == 0)
         {
             branchQuestions.Add(task.Objective ?? string.Empty);
+            PublishThought("Planning", "Planner returned no branch suggestions; defaulting to objective as a single branch.", ThoughtSeverity.Warning);
+        }
+        else
+        {
+            string preview = string.Join("; ", branchQuestions.Take(3));
+            PublishThought("Planning", $"Initial branch questions: {preview}");
         }
 
         var generatedPlan = new ResearchPlan
@@ -1058,7 +1150,9 @@ public sealed class OrchestratorAgent : IAgent
             PlannerContextApplied = false
         };
 
-        return ApplyPlannerContext(generatedPlan, plannerContext);
+        var resolvedPlan = ApplyPlannerContext(generatedPlan, plannerContext);
+        PublishThought("Planning", $"Plan ready with {resolvedPlan.Branches.Count} branches.");
+        return resolvedPlan;
     }
 
     private async Task<List<ResearchBranchResult>> ExecuteBranchesAsync(AgentTask task, ResearchPlan plan, CancellationToken cancellationToken)
@@ -1071,6 +1165,7 @@ public sealed class OrchestratorAgent : IAgent
             branchTasks.Add(Task.Run(async () =>
             {
                 _flowTracker?.RecordBranchStarted(branch.BranchId);
+                PublishBranchThought(branch.BranchId, $"Starting branch: {branch.Question}");
                 await _longTermMemoryManager.UpsertBranchStateAsync(
                     task.ResearchSessionId,
                     branch.BranchId,
@@ -1106,6 +1201,17 @@ public sealed class OrchestratorAgent : IAgent
 
                     AgentExecutionResult result = await researcher.ExecuteTaskAsync(branchTask, cancellationToken).ConfigureAwait(false);
                     _flowTracker?.RecordBranchCompleted(branch.BranchId, result.Success, result.Summary);
+                    if (result.Success)
+                    {
+                        string summaryDetail = string.IsNullOrWhiteSpace(result.Summary)
+                            ? "Completed successfully."
+                            : $"Completed successfully. Summary: {result.Summary}";
+                        PublishBranchThought(branch.BranchId, summaryDetail);
+                    }
+                    else
+                    {
+                        PublishBranchThought(branch.BranchId, "Branch completed with errors; reviewing findings.", ThoughtSeverity.Warning);
+                    }
 
                     branch.Status = result.Success ? ResearchBranchStatus.Completed : ResearchBranchStatus.Failed;
 
@@ -1136,6 +1242,7 @@ public sealed class OrchestratorAgent : IAgent
                 {
                     branch.Status = ResearchBranchStatus.Failed;
                     _logger.LogError(ex, "Branch {BranchId} failed.", branch.BranchId);
+                    PublishBranchThought(branch.BranchId, $"Exception encountered: {ex.Message}", ThoughtSeverity.Error);
                     _flowTracker?.RecordBranchNote(branch.BranchId, $"Exception: {ex.Message}");
                     _flowTracker?.RecordBranchCompleted(branch.BranchId, false, ex.Message);
 
@@ -1188,6 +1295,8 @@ public sealed class OrchestratorAgent : IAgent
             evidenceBuilder.Insert(0, BuildPlannerContextForPrompt(plannerDetails) + "\n\n");
         }
 
+        PublishThought("Synthesis", "Compiling aggregated findings into narrative synthesis.");
+
         var request = new OpenAiChatRequest(
             SystemPrompt: SystemPrompts.Orchestrator.SynthesisAuthor,
             Messages: new[]
@@ -1203,7 +1312,17 @@ public sealed class OrchestratorAgent : IAgent
             DeploymentName: _chatDeploymentName,
             MaxOutputTokens: 600);
 
-        return await _openAiService.GenerateTextAsync(request, cancellationToken).ConfigureAwait(false);
+    string synthesis = await StreamCompletionAsync("Synthesis", request, cancellationToken, TryParseGuid(rootTask.TaskId)).ConfigureAwait(false);
+        if (!string.IsNullOrWhiteSpace(synthesis))
+        {
+            PublishThought("Synthesis", $"Synthesis draft prepared ({Math.Min(synthesis.Length, 240)} chars preview).");
+        }
+        else
+        {
+            PublishThought("Synthesis", "Synthesis draft was empty.", ThoughtSeverity.Warning);
+        }
+
+        return synthesis;
     }
 
     private async Task<ReportOutline> GenerateOutlineAsync(
@@ -1254,6 +1373,8 @@ public sealed class OrchestratorAgent : IAgent
 
         promptBuilder.AppendLine(SystemPrompts.Templates.Orchestrator.OutlineInstruction);
 
+        PublishThought("Outline", "Requesting structured report outline from synthesis.");
+
         var request = new OpenAiChatRequest(
             SystemPrompt: SystemPrompts.Orchestrator.OutlineEditor,
             Messages: new[]
@@ -1264,10 +1385,15 @@ public sealed class OrchestratorAgent : IAgent
             MaxOutputTokens: 500,
             JsonSchemaFormat: OutlineSchemaFormat);
 
-        string response = await _openAiService.GenerateTextAsync(request, cancellationToken).ConfigureAwait(false);
+    string response = await StreamCompletionAsync("Outline", request, cancellationToken, TryParseGuid(rootTask.TaskId)).ConfigureAwait(false);
         if (!TryParseOutline(response, rootTask.Objective ?? string.Empty, findings, out var outline))
         {
+            PublishThought("Outline", "LLM outline parsing failed; using fallback.", ThoughtSeverity.Warning);
             outline = BuildFallbackOutline(rootTask.Objective ?? string.Empty, findings);
+        }
+        else
+        {
+            PublishThought("Outline", $"Outline ready with {outline.Sections.Count} sections.");
         }
 
         return outline;
@@ -1333,6 +1459,7 @@ public sealed class OrchestratorAgent : IAgent
             drafts.Add(draft);
             draftedSectionIds.Add(sectionPlan.SectionId);
             priorDrafts.Add(draft);
+            PublishThought("SectionDraft", $"Drafted '{draft.Title}' ({draft.Content?.Length ?? 0} chars).");
         }
 
         foreach (var section in outline.Sections)
@@ -1362,6 +1489,7 @@ public sealed class OrchestratorAgent : IAgent
                 .ConfigureAwait(false);
             drafts.Add(draft);
             priorDrafts.Add(draft);
+            PublishThought("SectionDraft", $"Drafted '{draft.Title}' ({draft.Content?.Length ?? 0} chars).");
         }
 
         return drafts;
@@ -1727,7 +1855,7 @@ public sealed class OrchestratorAgent : IAgent
             DeploymentName: _chatDeploymentName,
             MaxOutputTokens: 600);
 
-        string content = await _openAiService.GenerateTextAsync(request, cancellationToken).ConfigureAwait(false);
+    string content = await StreamCompletionAsync("SectionDraft", request, cancellationToken, TryParseGuid(sectionPlan.SectionId)).ConfigureAwait(false);
         if (string.IsNullOrWhiteSpace(content))
         {
             var fallbackSegments = new List<string>();
@@ -1982,7 +2110,7 @@ public sealed class OrchestratorAgent : IAgent
                 DeploymentName: _chatDeploymentName,
                 MaxOutputTokens: 400);
 
-            string response = await _openAiService.GenerateTextAsync(request, cancellationToken).ConfigureAwait(false);
+            string response = await StreamCompletionAsync("ReportRevision", request, cancellationToken, TryParseGuid(rootTask.TaskId)).ConfigureAwait(false);
             if (!TryParseReportInstructions(response, out var instructions) || instructions.Count == 0)
             {
                 _logger.LogDebug("Report revision pass {Pass} produced no actionable instructions.", pass);

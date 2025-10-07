@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using Marconian.ResearchAgent.Services.ComputerUse;
+using Marconian.ResearchAgent.Streaming;
 using Microsoft.Extensions.Configuration;
 
 namespace Marconian.ResearchAgent.Configuration;
@@ -109,6 +110,7 @@ public static class Settings
         ComputerUseTimeoutOptions computerUseTimeouts =
             configuration.GetSection("ComputerUse:Timeouts").Get<ComputerUseTimeoutOptions>()
             ?? ComputerUseTimeoutOptions.Default;
+        ConsoleStreamingOptions consoleStreamingOptions = configuration.GetSection("ConsoleStreaming").Get<ConsoleStreamingOptions>() ?? new();
 
         string cacheDirectory = ResolveDirectory(configuration["CACHE_DIRECTORY"], Path.Combine("debug", "cache"));
         string reportsDirectory = ResolveDirectory(configuration["REPORTS_DIRECTORY"], Path.Combine("debug", "reports"));
@@ -139,11 +141,12 @@ public static class Settings
             ComputerUseEnabled = computerUseEnabled,
             ComputerUseMode = computerUseMode,
             CacheDirectory = cacheDirectory,
-    ReportsDirectory = reportsDirectory,
+        ReportsDirectory = reportsDirectory,
             PrimaryResearchObjective = configuration["PRIMARY_RESEARCH_OBJECTIVE"]?.Trim(),
             AzureOpenAiReasoningEffortLevel = reasoningEffortLevel,
             ComputerUse = computerUseOptions,
-            ComputerUseTimeouts = computerUseTimeouts
+        ComputerUseTimeouts = computerUseTimeouts,
+        ConsoleStreaming = consoleStreamingOptions
         };
 
         if (missing.Count > 0)
@@ -195,6 +198,7 @@ public static class Settings
         public string? AzureOpenAiReasoningEffortLevel { get; init; }
         public ComputerUseOptions ComputerUse { get; init; } = new();
         public ComputerUseTimeoutOptions ComputerUseTimeouts { get; init; } = ComputerUseTimeoutOptions.Default;
+        public ConsoleStreamingOptions ConsoleStreaming { get; init; } = new();
     }
 }
 

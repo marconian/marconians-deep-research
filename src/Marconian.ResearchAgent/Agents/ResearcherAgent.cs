@@ -18,6 +18,7 @@ using Marconian.ResearchAgent.Services.OpenAI;
 using Marconian.ResearchAgent.Services.OpenAI.Models;
 using Marconian.ResearchAgent.Tools;
 using Marconian.ResearchAgent.Tracking;
+using Marconian.ResearchAgent.Streaming;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -36,6 +37,7 @@ public sealed class ResearcherAgent : IAgent
     private readonly ResearcherOptions _options;
     private readonly ShortTermMemoryOptions _shortTermOptions;
     private readonly ResearcherParallelismOptions _parallelismOptions;
+    private readonly IThoughtEventPublisher _thoughtPublisher;
 
     public ResearcherAgent(
         IAzureOpenAiService openAiService,
@@ -46,8 +48,9 @@ public sealed class ResearcherAgent : IAgent
         ResearchFlowTracker? flowTracker = null,
         ILogger<ResearcherAgent>? logger = null,
         ILogger<ShortTermMemoryManager>? shortTermLogger = null,
-        ResearcherOptions? options = null,
-        ShortTermMemoryOptions? shortTermOptions = null)
+    ResearcherOptions? options = null,
+    ShortTermMemoryOptions? shortTermOptions = null,
+    IThoughtEventPublisher? thoughtPublisher = null)
     {
         _openAiService = openAiService ?? throw new ArgumentNullException(nameof(openAiService));
         _longTermMemoryManager = longTermMemoryManager ?? throw new ArgumentNullException(nameof(longTermMemoryManager));
@@ -62,6 +65,7 @@ public sealed class ResearcherAgent : IAgent
         _options = SanitizeOptions(options);
         _shortTermOptions = SanitizeShortTermOptions(shortTermOptions);
         _parallelismOptions = _options.Parallelism;
+    _thoughtPublisher = thoughtPublisher ?? NullThoughtEventPublisher.Instance;
     }
 
     private static ResearcherOptions SanitizeOptions(ResearcherOptions? options)
@@ -88,6 +92,61 @@ public sealed class ResearcherAgent : IAgent
         resolved.RelatedMemoryTake = Math.Max(0, resolved.RelatedMemoryTake);
         resolved.Parallelism = SanitizeParallelism(resolved.Parallelism);
         return resolved;
+    }
+
+    private void PublishThought(AgentTask task, string phaseSuffix, string detail, ThoughtSeverity severity = ThoughtSeverity.Info)
+    {
+        if (!_thoughtPublisher.IsEnabled || string.IsNullOrWhiteSpace(detail))
+        {
+            return;
+        }
+
+        string phase = string.IsNullOrWhiteSpace(phaseSuffix)
+            ? "Research"
+            : $"Research/{phaseSuffix}";
+
+        Guid? correlation = Guid.TryParse(task.TaskId, out Guid parsed)
+            ? parsed
+            : null;
+
+        _thoughtPublisher.Publish(phase, nameof(ResearcherAgent), LimitDetail(detail), severity, correlation);
+    }
+
+    private Task<string> StreamCompletionAsync(
+        AgentTask task,
+        string phaseSuffix,
+        OpenAiChatRequest request,
+        CancellationToken cancellationToken,
+        ThoughtSeverity severity = ThoughtSeverity.Info)
+    {
+        string phase = string.IsNullOrWhiteSpace(phaseSuffix)
+            ? "Research"
+            : $"Research/{phaseSuffix}";
+
+        Guid? correlation = Guid.TryParse(task.TaskId, out Guid parsed)
+            ? parsed
+            : null;
+
+        return ThoughtStreamingHelper.StreamCompletionAsync(
+            _openAiService,
+            request,
+            _thoughtPublisher,
+            phase,
+            nameof(ResearcherAgent),
+            correlation,
+            severity,
+            cancellationToken,
+            detail => LimitDetail(detail));
+    }
+
+    private static string LimitDetail(string value, int maxLength = 240)
+    {
+        if (string.IsNullOrWhiteSpace(value) || value.Length <= maxLength)
+        {
+            return value;
+        }
+
+        return value[..maxLength].TrimEnd() + "…";
     }
 
     private static ResearcherParallelismOptions SanitizeParallelism(ResearcherParallelismOptions? options)
@@ -145,6 +204,7 @@ public sealed class ResearcherAgent : IAgent
         ArgumentNullException.ThrowIfNull(task);
 
         _logger.LogInformation("Researcher {TaskId} starting objective '{Objective}'.", task.TaskId, task.Objective);
+        PublishThought(task, "Setup", $"Starting branch research for '{task.Objective}'.");
 
         var shortTermMemory = new ShortTermMemoryManager(
             agentId: task.TaskId,
@@ -179,6 +239,7 @@ public sealed class ResearcherAgent : IAgent
             await AppendToShortTermAsync(shortTermMemory, shortTermLock, "memory", memorySummary, cancellationToken).ConfigureAwait(false);
             _flowTracker?.RecordBranchNote(task.TaskId, $"Loaded {relatedMemories.Count} related memories.");
             _logger.LogDebug("Loaded {Count} related memories into short-term context for task {TaskId}.", relatedMemories.Count, task.TaskId);
+            PublishThought(task, "Setup", $"Preloaded {relatedMemories.Count} related memories.");
         }
 
         var executedQueryOrder = new List<string>();
@@ -202,6 +263,7 @@ public sealed class ResearcherAgent : IAgent
                 {
                     executedQueryOrder.Add(query);
                     await AppendToShortTermAsync(shortTermMemory, shortTermLock, "assistant", $"---\nSearch iteration {iteration}: {query}", cancellationToken).ConfigureAwait(false);
+                    PublishThought(task, "Search", $"Iteration {iteration}: querying '{query}'.");
 
                     await RunSearchIterationAsync(
                         task,
@@ -242,6 +304,7 @@ public sealed class ResearcherAgent : IAgent
                     if (!string.IsNullOrWhiteSpace(candidate))
                     {
                         await AppendToShortTermAsync(shortTermMemory, shortTermLock, "assistant", $"Queuing additional search: {candidate} ({decision.Reason ?? "no reason provided"}).", cancellationToken).ConfigureAwait(false);
+                        PublishThought(task, "Search", $"Planner suggested follow-up query '{candidate}'.");
                         nextQuery = candidate;
                         continue;
                     }
@@ -250,6 +313,7 @@ public sealed class ResearcherAgent : IAgent
                 if (!string.IsNullOrWhiteSpace(decision.Reason))
                 {
                     await AppendToShortTermAsync(shortTermMemory, shortTermLock, "assistant", $"Stopping search iterations: {decision.Reason}", cancellationToken).ConfigureAwait(false);
+                    PublishThought(task, "Search", $"Halting search loop: {decision.Reason}.");
                 }
 
                 nextQuery = null;
@@ -258,6 +322,7 @@ public sealed class ResearcherAgent : IAgent
         else
         {
             await AppendToShortTermAsync(shortTermMemory, shortTermLock, "assistant", "Search tool unavailable; proceeding with provided materials only.", cancellationToken).ConfigureAwait(false);
+            PublishThought(task, "Search", "Search tool unavailable; relying on existing context.", ThoughtSeverity.Warning);
         }
 
         if ((task.Parameters.ContainsKey("imageFileId") || task.Parameters.ContainsKey("imageUrl")) && TryGetTool<ImageReaderTool>(out var imageReader))
@@ -272,7 +337,7 @@ public sealed class ResearcherAgent : IAgent
                 imageParams["url"] = imageUrl;
             }
 
-            await ExecuteToolAsync(
+            ToolExecutionResult imageResult = await ExecuteToolAsync(
                 task,
                 imageReader,
                 CreateContext(task, imageParams),
@@ -283,10 +348,20 @@ public sealed class ResearcherAgent : IAgent
                 toolOutputsLock,
                 errorsLock,
                 cancellationToken).ConfigureAwait(false);
+
+            if (imageResult.Success)
+            {
+                PublishThought(task, "Exploration", "Processed image reference for additional context.");
+            }
+            else
+            {
+                PublishThought(task, "Exploration", $"Image processing failed: {imageResult.ErrorMessage ?? "unknown error"}.", ThoughtSeverity.Warning);
+            }
         }
 
         string aggregatedEvidence = BuildEvidenceSummary(toolOutputs, relatedMemories);
-    await AppendToShortTermAsync(shortTermMemory, shortTermLock, "assistant", aggregatedEvidence, cancellationToken).ConfigureAwait(false);
+        await AppendToShortTermAsync(shortTermMemory, shortTermLock, "assistant", aggregatedEvidence, cancellationToken).ConfigureAwait(false);
+        PublishThought(task, "Synthesis", $"Aggregated evidence snapshot ({aggregatedEvidence.Length} chars).");
 
         var synthesisRequest = new OpenAiChatRequest(
             SystemPrompt: SystemPrompts.Researcher.Analyst,
@@ -303,10 +378,11 @@ public sealed class ResearcherAgent : IAgent
             DeploymentName: _chatDeploymentName,
             MaxOutputTokens: 400);
 
-        string summary = await _openAiService.GenerateTextAsync(synthesisRequest, cancellationToken).ConfigureAwait(false);
-    await AppendToShortTermAsync(shortTermMemory, shortTermLock, "assistant", summary, cancellationToken).ConfigureAwait(false);
+    string summary = await StreamCompletionAsync(task, "Synthesis", synthesisRequest, cancellationToken).ConfigureAwait(false);
+        await AppendToShortTermAsync(shortTermMemory, shortTermLock, "assistant", summary, cancellationToken).ConfigureAwait(false);
 
         double confidence = InferConfidence(summary);
+        PublishThought(task, "Synthesis", $"Generated summary (~{summary.Length} chars) with confidence {confidence:F2}.");
         var finding = new ResearchFinding
         {
             Title = task.Objective ?? string.Empty,
@@ -348,6 +424,7 @@ public sealed class ResearcherAgent : IAgent
         {
             await AppendToShortTermAsync(shortTermMemory, shortTermLock, "assistant", "Search capability unavailable; stopping iteration early.", cancellationToken).ConfigureAwait(false);
             _logger.LogWarning("Search tool not registered; cannot execute iteration {Iteration} for task {TaskId}.", iteration, task.TaskId);
+            PublishThought(task, "Search", "Search tool unavailable; stopping iteration early.", ThoughtSeverity.Error);
             return;
         }
 
@@ -366,6 +443,15 @@ public sealed class ResearcherAgent : IAgent
             errorsLock,
             cancellationToken).ConfigureAwait(false);
 
+        if (searchResult.Success)
+        {
+            PublishThought(task, "Search", $"Search '{query}' returned {searchResult.Citations.Count} citations.");
+        }
+        else
+        {
+            PublishThought(task, "Search", $"Search '{query}' failed: {searchResult.ErrorMessage ?? "unknown error"}.", ThoughtSeverity.Warning);
+        }
+
         if (!searchResult.Success)
         {
             await AppendToShortTermAsync(shortTermMemory, shortTermLock, "assistant", $"Iteration {iteration} search for '{query}' failed: {searchResult.ErrorMessage ?? "unknown error"}.", cancellationToken).ConfigureAwait(false);
@@ -380,6 +466,7 @@ public sealed class ResearcherAgent : IAgent
         if (baseCitations.Count == 0)
         {
             await AppendToShortTermAsync(shortTermMemory, shortTermLock, "assistant", "Search returned no actionable results; moving to next iteration.", cancellationToken).ConfigureAwait(false);
+            PublishThought(task, "Search", "Search returned no actionable results.", ThoughtSeverity.Warning);
             return;
         }
 
@@ -410,6 +497,7 @@ public sealed class ResearcherAgent : IAgent
 
             await AppendToShortTermAsync(shortTermMemory, shortTermLock, "assistant", selectionMessage, cancellationToken).ConfigureAwait(false);
             _flowTracker?.RecordBranchNote(task.TaskId, selectionMessage);
+            PublishThought(task, "Search", selectionMessage);
 
             int navigatorDegree = Math.Max(1, _parallelismOptions.NavigatorDegreeOfParallelism);
             using var navigatorSemaphore = new SemaphoreSlim(navigatorDegree, navigatorDegree);
@@ -486,6 +574,7 @@ public sealed class ResearcherAgent : IAgent
             const string message = "Computer-use navigator unavailable; will proceed directly to scraping and downloads.";
             await AppendToShortTermAsync(shortTermMemory, shortTermLock, "assistant", message, cancellationToken).ConfigureAwait(false);
             _flowTracker?.RecordBranchNote(task.TaskId, message);
+            PublishThought(task, "Exploration", message, ThoughtSeverity.Warning);
         }
 
         var splitCitations = SplitCitations(citationsForFollowUp);
@@ -521,6 +610,7 @@ public sealed class ResearcherAgent : IAgent
             string flaggedSummary = noteBuilder.ToString().TrimEnd();
             await AppendToShortTermAsync(shortTermMemory, shortTermLock, "assistant", flaggedSummary, cancellationToken).ConfigureAwait(false);
             _flowTracker?.RecordBranchNote(task.TaskId, flaggedSummary);
+            PublishThought(task, "Exploration", flaggedSummary);
         }
 
         var flaggedPageCitations = new List<SourceCitation>();
@@ -583,6 +673,11 @@ public sealed class ResearcherAgent : IAgent
                 scraperTasks.Add(ProcessScrapeAsync(citation));
             }
 
+            if (scrapeCandidates.Count > 0)
+            {
+                PublishThought(task, "Exploration", $"Queued {scrapeCandidates.Count} page(s) for scraping.");
+            }
+
             await Task.WhenAll(scraperTasks).ConfigureAwait(false);
 
             async Task ProcessScrapeAsync(SourceCitation citation)
@@ -600,7 +695,7 @@ public sealed class ResearcherAgent : IAgent
                         scrapeParameters["render"] = renderFlag;
                     }
 
-                    await ExecuteToolAsync(
+                    ToolExecutionResult scrapeResult = await ExecuteToolAsync(
                         task,
                         scraperTool,
                         CreateContext(task, scrapeParameters),
@@ -611,6 +706,15 @@ public sealed class ResearcherAgent : IAgent
                         toolOutputsLock,
                         errorsLock,
                         cancellationToken).ConfigureAwait(false);
+
+                    if (scrapeResult.Success)
+                    {
+                        PublishThought(task, "Exploration", $"Scraped {citation.Title ?? citation.Url}.");
+                    }
+                    else
+                    {
+                        PublishThought(task, "Exploration", $"Failed to scrape {citation.Url}: {scrapeResult.ErrorMessage ?? "unknown error"}.", ThoughtSeverity.Warning);
+                    }
                 }
                 finally
                 {
@@ -707,6 +811,11 @@ public sealed class ResearcherAgent : IAgent
                 fileReaderTasks.Add(ProcessFileReadAsync(request));
             }
 
+            if (fileReadRequests.Count > 0)
+            {
+                PublishThought(task, "Exploration", $"Queued {fileReadRequests.Count} file(s) for detailed reading.");
+            }
+
             await Task.WhenAll(fileReaderTasks).ConfigureAwait(false);
 
             async Task ProcessFileReadAsync(Dictionary<string, string> request)
@@ -714,7 +823,7 @@ public sealed class ResearcherAgent : IAgent
                 await fileReaderSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
                 try
                 {
-                    await ExecuteToolAsync(
+                    ToolExecutionResult fileReadResult = await ExecuteToolAsync(
                         task,
                         fileReader,
                         CreateContext(task, request),
@@ -725,6 +834,22 @@ public sealed class ResearcherAgent : IAgent
                         toolOutputsLock,
                         errorsLock,
                         cancellationToken).ConfigureAwait(false);
+
+                    string requestDescriptor =
+                        request.TryGetValue("url", out var url) && !string.IsNullOrWhiteSpace(url)
+                            ? url
+                            : request.TryGetValue("fileId", out var fileId) && !string.IsNullOrWhiteSpace(fileId)
+                                ? $"fileId:{fileId}"
+                                : "file";
+
+                    if (fileReadResult.Success)
+                    {
+                        PublishThought(task, "Exploration", $"Read {requestDescriptor} successfully.");
+                    }
+                    else
+                    {
+                        PublishThought(task, "Exploration", $"Failed to read {requestDescriptor}: {fileReadResult.ErrorMessage ?? "unknown error"}.", ThoughtSeverity.Warning);
+                    }
                 }
                 finally
                 {
@@ -781,8 +906,16 @@ public sealed class ResearcherAgent : IAgent
             DeploymentName: _chatDeploymentName,
             MaxOutputTokens: 300);
 
-        string response = await _openAiService.GenerateTextAsync(decisionRequest, cancellationToken).ConfigureAwait(false);
-        return ParseIterationDecision(response);
+    string response = await StreamCompletionAsync(task, "Search", decisionRequest, cancellationToken).ConfigureAwait(false);
+        var decision = ParseIterationDecision(response);
+
+        string decisionDetail = decision.Action == IterationAction.Continue
+            ? $"Supervisor proposed {decision.Queries.Count} follow-up quer{(decision.Queries.Count == 1 ? "y" : "ies")}."
+            : $"Supervisor advised stopping: {decision.Reason ?? "no reason provided"}.";
+
+        PublishThought(task, "Search", decisionDetail);
+
+        return decision;
     }
 
     private IterationDecision ParseIterationDecision(string response)
@@ -1180,7 +1313,7 @@ public sealed class ResearcherAgent : IAgent
             DeploymentName: _chatDeploymentName,
             MaxOutputTokens: 350);
 
-        string response = await _openAiService.GenerateTextAsync(selectionRequest, cancellationToken).ConfigureAwait(false);
+    string response = await StreamCompletionAsync(task, "Search", selectionRequest, cancellationToken).ConfigureAwait(false);
         ParsedSelection parsed = ParseSelectionResponse(response, searchResult.Citations.Count);
 
         var chosen = new List<SourceCitation>();

@@ -9,6 +9,7 @@ using Marconian.ResearchAgent.Models.Research;
 using Marconian.ResearchAgent.Services.Cosmos;
 using Marconian.ResearchAgent.Services.OpenAI;
 using Marconian.ResearchAgent.Services.OpenAI.Models;
+using Marconian.ResearchAgent.Streaming;
 using Marconian.ResearchAgent.Tools;
 using Moq;
 using NUnit.Framework;
@@ -44,7 +45,8 @@ public sealed class OrchestratorAgentTests
                 NullLogger<OrchestratorAgent>.Instance,
                 NullLoggerFactory.Instance,
                 cacheService: null,
-                reportsDirectory: reportsDir);
+                reportsDirectory: reportsDir,
+                thoughtPublisher: NullThoughtEventPublisher.Instance);
 
             var task = new AgentTask
             {
@@ -100,7 +102,8 @@ public sealed class OrchestratorAgentTests
                 cacheService: null,
                 reportsDirectory: reportsDir,
                 orchestratorOptions: null,
-                researcherOptions: researcherOptions);
+                researcherOptions: researcherOptions,
+                thoughtPublisher: NullThoughtEventPublisher.Instance);
 
             var field = typeof(OrchestratorAgent).GetField("_researcherOptions", BindingFlags.NonPublic | BindingFlags.Instance);
             Assert.That(field, Is.Not.Null);
@@ -164,7 +167,8 @@ public sealed class OrchestratorAgentTests
                 NullLoggerFactory.Instance,
                 cacheService: null,
                 reportsDirectory: reportsDir,
-                orchestratorOptions: new OrchestratorOptions { MaxReportRevisionPasses = 0 });
+                orchestratorOptions: new OrchestratorOptions { MaxReportRevisionPasses = 0 },
+                thoughtPublisher: NullThoughtEventPublisher.Instance);
 
             var task = new AgentTask
             {

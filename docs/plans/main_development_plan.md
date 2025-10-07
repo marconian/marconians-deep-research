@@ -150,6 +150,12 @@
 - [x] Configure cache directory path in appsettings.local.json for local development
 - [x] Add report output directory setting and wire default usage when CLI args omitted
 
+## M20 - Console Streaming UX Polish
+- [x] Audit direct console output usage and categorize messaging vs interactive prompts (2025-10-07)
+ - [x] Route session lifecycle/status messages through the thought publisher while preserving CLI fallback (2025-10-07)
+- [ ] Replace remaining status-only console writes with a streaming-aware emitter that respects disabled streaming and interactive flows
+- [ ] Re-run validation (tests + build) after console routing changes
+
 
 
 

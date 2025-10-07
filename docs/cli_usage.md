@@ -9,6 +9,32 @@ This reference explains how to operate the Marconian deep research agent from th
 
 > **Tip:** Use the `--help` switch at any time to print the latest usage block that matches the compiled application.
 
+## Console Streaming & Summaries
+
+Real-time console streaming is enabled by default. Toggle it explicitly at launch with:
+
+- `--stream-console` – Force streaming on even if disabled in configuration.
+- `--no-stream-console` – Run the session without live thought streaming.
+
+Streaming behavior can be customized in `appsettings.json` (or environment-specific overrides) under the `ConsoleStreaming` section:
+
+```jsonc
+"ConsoleStreaming": {
+  "Enabled": true,
+  "BatchSize": 5,
+  "SummaryInterval": "00:00:02",
+  "UseSummarizer": true,
+  "UseLlmSummarizer": false,
+  "SummarizerModel": null,
+  "SummarizerMinInterval": "00:00:05",
+  "SummarizerMaxTokens": 200
+}
+```
+
+- Set `UseLlmSummarizer` to `true` to let the new **Console Summarizer Agent** condense streaming thoughts with Azure OpenAI. When no `SummarizerModel` is supplied, the primary chat deployment is used.
+- `SummarizerMinInterval` throttles LLM summarization frequency; the hub falls back to a deterministic summary when rate-limited or on errors.
+- `SummarizerMaxTokens` bounds the LLM response length. Set it to `0` (or omit) to use the 200-token default.
+
 ## Planner Integration
 
 When you start a new session without the `--skip-planner` flag, the interactive research planner runs first. It asks the LLM to draft a plan, capture context hints, and confirm you are satisfied before handing off to the orchestrator. Both interactive and non-interactive flows capture the planner outcome so that context hints follow the session into execution. Set `--skip-planner` to jump directly to agent execution (a `PlannerSkipped: true` hint is stored for downstream pipelines).

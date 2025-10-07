@@ -8,6 +8,7 @@ using System.Threading.Tasks;
 using Marconian.ResearchAgent.Configuration;
 using Marconian.ResearchAgent.Services.OpenAI;
 using Marconian.ResearchAgent.Services.OpenAI.Models;
+using Marconian.ResearchAgent.Streaming;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -50,17 +51,53 @@ internal sealed class InteractiveResearchPlanner
     private readonly IAzureOpenAiService _openAiService;
     private readonly string _chatDeploymentName;
     private readonly ILogger<InteractiveResearchPlanner> _logger;
+    private readonly IThoughtEventPublisher _thoughtPublisher;
+    private const string PlannerPhase = "Planning";
 
     public InteractiveResearchPlanner(
         IAzureOpenAiService openAiService,
         string chatDeploymentName,
-        ILogger<InteractiveResearchPlanner>? logger = null)
+        ILogger<InteractiveResearchPlanner>? logger = null,
+        IThoughtEventPublisher? thoughtPublisher = null)
     {
         _openAiService = openAiService ?? throw new ArgumentNullException(nameof(openAiService));
         _chatDeploymentName = string.IsNullOrWhiteSpace(chatDeploymentName)
             ? throw new ArgumentException("Chat deployment name must be provided.", nameof(chatDeploymentName))
             : chatDeploymentName;
         _logger = logger ?? NullLogger<InteractiveResearchPlanner>.Instance;
+        _thoughtPublisher = thoughtPublisher ?? NullThoughtEventPublisher.Instance;
+    }
+
+    private void PublishThought(string detail, ThoughtSeverity severity = ThoughtSeverity.Info)
+    {
+        if (string.IsNullOrWhiteSpace(detail))
+        {
+            return;
+        }
+
+        _thoughtPublisher.Publish(PlannerPhase, nameof(InteractiveResearchPlanner), LimitDetail(detail), severity, null);
+    }
+
+    private Task<string> StreamPlannerCompletionAsync(OpenAiChatRequest request, CancellationToken cancellationToken)
+        => ThoughtStreamingHelper.StreamCompletionAsync(
+            _openAiService,
+            request,
+            _thoughtPublisher,
+            PlannerPhase,
+            nameof(InteractiveResearchPlanner),
+            correlationId: null,
+            severity: ThoughtSeverity.Info,
+            cancellationToken: cancellationToken,
+            detailFormatter: detail => LimitDetail(detail));
+
+    private static string LimitDetail(string value, int maxLength = 220)
+    {
+        if (string.IsNullOrWhiteSpace(value) || value.Length <= maxLength)
+        {
+            return value;
+        }
+
+        return value[..maxLength].TrimEnd() + "…";
     }
 
     public async Task<PlannerOutcome?> RunAsync(string objective, CancellationToken cancellationToken)
@@ -71,6 +108,7 @@ internal sealed class InteractiveResearchPlanner
         }
 
         string currentObjective = objective.Trim();
+        PublishThought($"Interactive planner engaged for '{currentObjective}'.");
         var history = new List<OpenAiChatMessage>
         {
             new("user", $"Research objective: {currentObjective}")
@@ -91,6 +129,7 @@ internal sealed class InteractiveResearchPlanner
                     if (string.IsNullOrWhiteSpace(clarification))
                     {
                         Console.WriteLine("Planner cancelled. Returning to menu.");
+                        PublishThought("Planner cancelled by user during clarification phase.", ThoughtSeverity.Warning);
                         return null;
                     }
 
@@ -104,6 +143,7 @@ internal sealed class InteractiveResearchPlanner
                             DisplayPlan(response, currentObjective);
                             Console.WriteLine();
                             Console.WriteLine("Plan accepted. Continuing with research.");
+                            PublishThought($"Plan accepted after clarification with {response.ProposedPlan.Count} steps.");
                             return new PlannerOutcome(
                                 currentObjective,
                                 response.Summary,
@@ -127,6 +167,7 @@ internal sealed class InteractiveResearchPlanner
                     {
                         case "c":
                         case "confirm":
+                            PublishThought($"Plan confirmed interactively with {response.ProposedPlan.Count} steps.");
                             return new PlannerOutcome(
                                 currentObjective,
                                 response.Summary,
@@ -162,6 +203,7 @@ internal sealed class InteractiveResearchPlanner
                         case "a":
                         case "abort":
                             Console.WriteLine("Planner aborted at user request.");
+                            PublishThought("Planner aborted at user request.", ThoughtSeverity.Warning);
                             return null;
                         default:
                             Console.WriteLine("Unrecognized action. Please choose C, R, E, or A.");
@@ -170,6 +212,7 @@ internal sealed class InteractiveResearchPlanner
 
                 case PlannerAction.Abort:
                     Console.WriteLine("Planner aborted due to insufficient detail.");
+                    PublishThought("Planner aborted due to insufficient detail.", ThoughtSeverity.Warning);
                     return null;
 
                 default:
@@ -186,6 +229,7 @@ internal sealed class InteractiveResearchPlanner
         }
 
         string trimmedObjective = objective.Trim();
+        PublishThought($"Non-interactive planner invoked for '{trimmedObjective}'.");
         var history = new List<OpenAiChatMessage>
         {
             new("user", $"Research objective: {trimmedObjective}. Provide a concise plan and key questions.")
@@ -200,9 +244,11 @@ internal sealed class InteractiveResearchPlanner
 
         if (response.Action == PlannerAction.Abort)
         {
+            PublishThought("Planner could not produce a plan for the provided objective.", ThoughtSeverity.Warning);
             throw new InvalidOperationException("Planner could not produce a plan for the provided objective.");
         }
 
+        PublishThought($"Planner completed non-interactive pass with {response.ProposedPlan.Count} steps.");
         return new PlannerOutcome(trimmedObjective, response.Summary, response.KeyQuestions, BuildContextHints(response));
     }
 
@@ -214,9 +260,11 @@ internal sealed class InteractiveResearchPlanner
             _chatDeploymentName,
             JsonSchemaFormat: new OpenAiChatJsonSchemaFormat("planner_response", PlannerResponseSchema));
 
-        string response = await _openAiService.GenerateTextAsync(request, cancellationToken).ConfigureAwait(false);
-        _logger.LogTrace("Planner response payload: {Payload}", response);
-        return PlannerResponse.Parse(response);
+    string response = await StreamPlannerCompletionAsync(request, cancellationToken).ConfigureAwait(false);
+    _logger.LogTrace("Planner response payload: {Payload}", response);
+    PlannerResponse parsed = PlannerResponse.Parse(response);
+    PublishThought($"Planner action: {parsed.Action} (Summary preview: {LimitDetail(parsed.Summary ?? string.Empty, 120)})");
+    return parsed;
     }
 
     private static IReadOnlyList<string> BuildContextHints(PlannerResponse response)

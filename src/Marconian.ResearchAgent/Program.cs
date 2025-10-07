@@ -30,6 +30,7 @@ using Marconian.ResearchAgent.Tracking;
 using Marconian.ResearchAgent.Utilities;
 using System.Threading;
 using Microsoft.Playwright;
+using Marconian.ResearchAgent.Streaming;
 
 namespace Marconian.ResearchAgent;
 
@@ -40,6 +41,8 @@ internal static class Program
     private sealed record SessionInfo(string SessionId, string Objective, string Status, DateTimeOffset CreatedAtUtc, DateTimeOffset UpdatedAtUtc, MemoryRecord Record);
 
     private sealed record DiagnosisOutcome(int Index, ComputerUseExplorationResult? Result, Exception? Exception);
+
+    private static ConsoleStatusRouter StatusRouter { get; set; } = ConsoleStatusRouter.Disabled;
 
     private enum MenuAction
     {
@@ -61,15 +64,13 @@ internal static class Program
         {
             builder.SetMinimumLevel(LogLevel.Information);
             builder.AddFilter("Marconian.ResearchAgent", LogLevel.Debug);
-            builder.AddSimpleConsole(options =>
-            {
-                options.TimestampFormat = "HH:mm:ss ";
-                options.SingleLine = true;
-            });
+            builder.AddDebug();
             builder.AddFileLogger(fileLoggerPath, LogLevel.Debug);
         });
 
-        ILogger logger = loggerFactory.CreateLogger("Marconian");
+    ILogger logger = loggerFactory.CreateLogger("Marconian");
+    ConsoleStreamHub? consoleStreamHub = null;
+    IThoughtEventPublisher thoughtPublisher = NullThoughtEventPublisher.Instance;
 
         UnhandledExceptionEventHandler unhandledExceptionHandler = (_, eventArgs) =>
         {
@@ -82,11 +83,12 @@ internal static class Program
 
         using var cts = new CancellationTokenSource();
         ConsoleCancelEventHandler cancelHandler = (_, eventArgs) =>
-        {
+                StatusRouter.Error($"No session found with ID '{options.DeleteSessionId}'.", phase: "CLI", actor: "Sessions", alwaysWriteToConsole: true);
             eventArgs.Cancel = true;
             if (!cts.IsCancellationRequested)
             {
                 logger.LogWarning("Cancellation requested. Attempting graceful shutdown...");
+                _ = thoughtPublisher.FlushAsync(CancellationToken.None);
                 cts.Cancel();
             }
         };
@@ -114,7 +116,7 @@ internal static class Program
             catch (InvalidOperationException ex)
             {
                 logger.LogError(ex, "Configuration validation failed.");
-                Console.Error.WriteLine(ex.Message);
+                StatusRouter.Error(ex.Message, phase: "Startup", actor: "Configuration");
                 return 1;
             }
 
@@ -122,6 +124,60 @@ internal static class Program
             {
                 await RunCosmosDiagnosticsAsync(settings, loggerFactory, logger, cts.Token).ConfigureAwait(false);
                 return 0;
+            }
+
+            CommandLineOptions options = CommandLineOptions.Parse(args);
+
+            if (options.ShowHelp)
+            {
+                PrintUsage(StatusRouter);
+                return 0;
+            }
+
+            var openAiService = new AzureOpenAiService(settings, loggerFactory.CreateLogger<AzureOpenAiService>());
+
+            var consoleStreamingOptions = settings.ConsoleStreaming ?? new ConsoleStreamingOptions();
+            if (options.StreamConsoleEnabled.HasValue)
+            {
+                consoleStreamingOptions.Enabled = options.StreamConsoleEnabled.Value;
+            }
+            IConsoleStreamSummarizer summarizer = new DefaultConsoleStreamSummarizer();
+            if (consoleStreamingOptions.UseSummarizer && consoleStreamingOptions.UseLlmSummarizer)
+            {
+                string summarizerDeployment = string.IsNullOrWhiteSpace(consoleStreamingOptions.SummarizerModel)
+                    ? settings.AzureOpenAiChatDeployment
+                    : consoleStreamingOptions.SummarizerModel!;
+
+                logger.LogInformation(
+                    string.IsNullOrWhiteSpace(consoleStreamingOptions.SummarizerModel)
+                        ? "Console streaming summarizer using default chat deployment {Deployment}."
+                        : "Console streaming summarizer using configured deployment {Deployment}.",
+                    summarizerDeployment);
+
+                summarizer = new ConsoleSummarizerAgent(
+                    openAiService,
+                    summarizerDeployment,
+                    consoleStreamingOptions,
+                    loggerFactory.CreateLogger<ConsoleSummarizerAgent>());
+            }
+            await using var consoleStreamHubLifetime = new ConsoleStreamHub(
+                consoleStreamingOptions,
+                summarizer,
+                new ConsoleStreamWriter(),
+                loggerFactory.CreateLogger<ConsoleStreamHub>());
+            consoleStreamHub = consoleStreamHubLifetime;
+            thoughtPublisher = consoleStreamHubLifetime.IsEnabled
+                ? new ConsoleThoughtEventPublisher(consoleStreamHubLifetime, loggerFactory.CreateLogger<ConsoleThoughtEventPublisher>())
+                : NullThoughtEventPublisher.Instance;
+            var statusRouter = new ConsoleStatusRouter(
+                thoughtPublisher,
+                consoleStreamHubLifetime.IsEnabled,
+                loggerFactory.CreateLogger<ConsoleStatusRouter>());
+            StatusRouter = statusRouter;
+
+            if (!consoleStreamHubLifetime.IsEnabled)
+            {
+                logger.LogInformation("Console streaming is disabled via configuration.");
             }
 
             logger.LogInformation("Initializing Cosmos DB client.");
@@ -133,7 +189,6 @@ internal static class Program
 
             flowTracker = new ResearchFlowTracker(loggerFactory.CreateLogger<ResearchFlowTracker>());
 
-            var openAiService = new AzureOpenAiService(settings, loggerFactory.CreateLogger<AzureOpenAiService>());
             var documentService = new DocumentIntelligenceService(settings, loggerFactory.CreateLogger<DocumentIntelligenceService>());
             var fileRegistryService = new FileRegistryService();
             using var sharedHttpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
@@ -199,7 +254,7 @@ internal static class Program
                 if (settings.WebSearchProvider == WebSearchProvider.ComputerUse && settings.ComputerUseMode == ComputerUseMode.Full)
                 {
                     logger.LogError("Computer-use mode is set to Full but the runtime is unavailable: {Reason}", computerUseDisabledReason);
-                    Console.Error.WriteLine($"Computer-use provider unavailable: {computerUseDisabledReason}");
+                    statusRouter.Error($"Computer-use provider unavailable: {computerUseDisabledReason}", phase: "Startup", actor: "ComputerUse");
                     return 1;
                 }
 
@@ -229,14 +284,6 @@ internal static class Program
                     ? WebSearchProvider.GoogleApi
                     : WebSearchProvider.ComputerUse;
 
-            CommandLineOptions options = CommandLineOptions.Parse(args);
-
-            if (options.ShowHelp)
-            {
-                PrintUsage();
-                return 0;
-            }
-
             string? resumeSessionId = options.ResumeSessionId;
             string? providedQuery = options.Query;
             string? reportDirectoryArgument = options.ReportsDirectory;
@@ -259,14 +306,14 @@ internal static class Program
             if (options.ListSessions && otherOperationsRequested)
             {
                 logger.LogError("--list-sessions cannot be combined with other operations.");
-                Console.Error.WriteLine("--list-sessions cannot be combined with other operations.");
+                statusRouter.Error("--list-sessions cannot be combined with other operations.", phase: "CLI", actor: "Arguments");
                 return 1;
             }
 
             if (options.HasDeleteRequest && otherOperationsRequested)
             {
                 logger.LogError("Delete operations cannot be combined with other research actions.");
-                Console.Error.WriteLine("Delete operations cannot be combined with other research actions.");
+                statusRouter.Error("Delete operations cannot be combined with other research actions.", phase: "CLI", actor: "Arguments");
                 return 1;
             }
 
@@ -278,7 +325,7 @@ internal static class Program
                 if (!string.IsNullOrWhiteSpace(dumpSessionId) || !string.IsNullOrWhiteSpace(diagnoseComputerUseArgument))
                 {
                     logger.LogError("--diagnostics-mode cannot be combined with dump or computer-use diagnosis operations.");
-                    Console.Error.WriteLine("--diagnostics-mode cannot be combined with dump or computer-use diagnosis operations.");
+                    statusRouter.Error("--diagnostics-mode cannot be combined with dump or computer-use diagnosis operations.", phase: "CLI", actor: "Arguments");
                     return 1;
                 }
 
@@ -299,7 +346,7 @@ internal static class Program
                 if (!string.IsNullOrWhiteSpace(dumpSessionId) || !string.IsNullOrWhiteSpace(diagnoseComputerUseArgument))
                 {
                     logger.LogError("--report-session cannot be combined with dump or diagnostic operations.");
-                    Console.Error.WriteLine("--report-session cannot be combined with dump or diagnostic operations.");
+                    statusRouter.Error("--report-session cannot be combined with dump or diagnostic operations.", phase: "CLI", actor: "Arguments");
                     return 1;
                 }
 
@@ -323,7 +370,7 @@ internal static class Program
                 if (string.IsNullOrWhiteSpace(diagnosticsSessionId))
                 {
                     logger.LogError("--diagnostics-mode requires --resume or --report-session to specify a session id.");
-                    Console.Error.WriteLine("--diagnostics-mode requires --resume or --report-session to specify a session id.");
+                    statusRouter.Error("--diagnostics-mode requires --resume or --report-session to specify a session id.", phase: "CLI", actor: "Arguments");
                     return 1;
                 }
             }
@@ -381,7 +428,7 @@ internal static class Program
                 {
                     string reason = computerUseDisabledReason ?? "Computer-use automation is not available in the current configuration.";
                     logger.LogError("Cannot run computer-use diagnosis: {Reason}", reason);
-                    Console.Error.WriteLine($"Cannot run computer-use diagnosis: {reason}");
+                    statusRouter.Error($"Cannot run computer-use diagnosis: {reason}", phase: "ComputerUse", actor: "Diagnosis", alwaysWriteToConsole: true);
                     return 1;
                 }
 
@@ -393,20 +440,20 @@ internal static class Program
                 if (string.IsNullOrWhiteSpace(url))
                 {
                     logger.LogError("Invalid --diagnose-computer-use argument. Provide a URL followed by an optional objective separated by a pipe (|).");
-                    Console.Error.WriteLine("Invalid --diagnose-computer-use argument. Expected format: \"https://example.com|optional objective\"");
+                    statusRouter.Error("Invalid --diagnose-computer-use argument. Expected format: \"https://example.com|optional objective\"", phase: "ComputerUse", actor: "Diagnosis", alwaysWriteToConsole: true);
                     return 1;
                 }
 
-                Console.WriteLine($"Running computer-use diagnosis for: {url}");
+                statusRouter.Info($"Running computer-use diagnosis for: {url}", phase: "ComputerUse", actor: "Diagnosis", alwaysWriteToConsole: true);
                 if (!string.IsNullOrWhiteSpace(objective))
                 {
-                    Console.WriteLine($"Objective: {objective}");
+                    statusRouter.Info($"Objective: {objective}", phase: "ComputerUse", actor: "Diagnosis", alwaysWriteToConsole: true);
                 }
 
                 int requestedConcurrency = Math.Clamp(options.DiagnoseComputerUseConcurrency, 1, 16);
                 if (requestedConcurrency > 1 && computerUseServiceFactory is not null)
                 {
-                    Console.WriteLine($"Launching {requestedConcurrency} concurrent sessions...");
+                    statusRouter.Info($"Launching {requestedConcurrency} concurrent sessions...", phase: "ComputerUse", actor: "Diagnosis", alwaysWriteToConsole: true);
                     var extraServices = new List<ComputerUseSearchService>();
                     var temporaryProfiles = new List<string>();
                     string? baseProfileDirectory = settings.ComputerUse.UserDataDirectory;
@@ -480,16 +527,16 @@ internal static class Program
                             {
                                 case ComputerUseSearchBlockedException blockedEx:
                                     logger.LogError(blockedEx, "Computer-use diagnosis #{Index} blocked for {Url}", outcome.Index, url);
-                                    Console.Error.WriteLine($"Session #{outcome.Index} blocked: {blockedEx.Message}");
+                                    statusRouter.Error($"Session #{outcome.Index} blocked: {blockedEx.Message}", phase: "ComputerUse", actor: "Diagnosis", alwaysWriteToConsole: true);
                                     break;
                                 case ComputerUseOperationTimeoutException timeoutEx:
                                     logger.LogError(timeoutEx, "Computer-use diagnosis #{Index} timed out for {Url}", outcome.Index, url);
-                                    Console.Error.WriteLine($"Session #{outcome.Index} timed out: {timeoutEx.Message}");
+                                    statusRouter.Error($"Session #{outcome.Index} timed out: {timeoutEx.Message}", phase: "ComputerUse", actor: "Diagnosis", alwaysWriteToConsole: true);
                                     break;
                                 default:
                                     Exception exception = outcome.Exception!;
                                     logger.LogError(exception, "Computer-use diagnosis #{Index} failed for {Url}", outcome.Index, url);
-                                    Console.Error.WriteLine($"Session #{outcome.Index} failed: {exception.Message}");
+                                    statusRouter.Error($"Session #{outcome.Index} failed: {exception.Message}", phase: "ComputerUse", actor: "Diagnosis", alwaysWriteToConsole: true);
                                     break;
                             }
                         }
@@ -497,7 +544,7 @@ internal static class Program
                         if (anySuccess)
                         {
                             Console.WriteLine();
-                            Console.WriteLine("Diagnosis complete. Detailed timelines saved under debug/computer-use.");
+                            statusRouter.Info("Diagnosis complete. Detailed timelines saved under debug/computer-use.", phase: "ComputerUse", actor: "Diagnosis", alwaysWriteToConsole: true);
                         }
 
                         return anyFailure ? 1 : 0;
@@ -539,7 +586,7 @@ internal static class Program
 
                         PrintExplorationReport(exploration);
                         Console.WriteLine();
-                        Console.WriteLine("Diagnosis complete. Detailed timeline saved under debug/computer-use.");
+                        statusRouter.Info("Diagnosis complete. Detailed timeline saved under debug/computer-use.", phase: "ComputerUse", actor: "Diagnosis", alwaysWriteToConsole: true);
                         return 0;
                     }
                     catch (Exception ex) when (IsTargetClosedException(ex) && attempt < MaxDiagnosticAttempts && computerUseServiceFactory is not null)
@@ -558,13 +605,13 @@ internal static class Program
                     catch (ComputerUseSearchBlockedException blocked)
                     {
                         logger.LogError(blocked, "Computer-use diagnosis blocked for {Url}", url);
-                        Console.Error.WriteLine($"Computer-use exploration blocked: {blocked.Message}");
+                        statusRouter.Error($"Computer-use exploration blocked: {blocked.Message}", phase: "ComputerUse", actor: "Diagnosis", alwaysWriteToConsole: true);
                         return 1;
                     }
                     catch (ComputerUseOperationTimeoutException timeout)
                     {
                         logger.LogError(timeout, "Computer-use diagnosis timed out for {Url}", url);
-                        Console.Error.WriteLine($"Computer-use exploration timed out: {timeout.Message}");
+                        statusRouter.Error($"Computer-use exploration timed out: {timeout.Message}", phase: "ComputerUse", actor: "Diagnosis", alwaysWriteToConsole: true);
                         return 1;
                     }
                     catch (OperationCanceledException)
@@ -574,7 +621,7 @@ internal static class Program
                     catch (Exception ex)
                     {
                         logger.LogError(ex, "Computer-use diagnosis failed for {Url}", url);
-                        Console.Error.WriteLine($"Computer-use exploration failed: {ex.Message}");
+                        statusRouter.Error($"Computer-use exploration failed: {ex.Message}", phase: "ComputerUse", actor: "Diagnosis", alwaysWriteToConsole: true);
                         return 1;
                     }
                 }
@@ -695,7 +742,8 @@ internal static class Program
             var planner = new InteractiveResearchPlanner(
                 openAiService,
                 settings.AzureOpenAiChatDeployment,
-                loggerFactory.CreateLogger<InteractiveResearchPlanner>());
+                loggerFactory.CreateLogger<InteractiveResearchPlanner>(),
+                thoughtPublisher);
 
             var orchestrator = new OrchestratorAgent(
                 openAiService,
@@ -708,7 +756,8 @@ internal static class Program
                 reportsDirectory: reportDirectory,
                 orchestratorOptions: orchestratorOptions,
                 researcherOptions: researcherOptions,
-                shortTermMemoryOptions: shortTermOptions);
+                shortTermMemoryOptions: shortTermOptions,
+                thoughtPublisher: thoughtPublisher);
 
             logger.LogInformation("Loading existing research sessions from Cosmos DB.");
             var existingSessionRecords = await cosmosService.QueryByTypeAsync(SessionRecordType, 100, cts.Token).ConfigureAwait(false);
@@ -739,7 +788,7 @@ internal static class Program
                 else
                 {
                     logger.LogError("Requested session {SessionId} not found.", resumeSessionId);
-                    Console.Error.WriteLine($"No session found with ID '{resumeSessionId}'.");
+                    statusRouter.Error($"No session found with ID '{resumeSessionId}'.", phase: "CLI", actor: "Sessions", alwaysWriteToConsole: true);
                     return 1;
                 }
             }
@@ -816,7 +865,7 @@ internal static class Program
             if (string.IsNullOrWhiteSpace(researchObjective))
             {
                 logger.LogError("No research objective provided. Exiting.");
-                Console.Error.WriteLine("No research objective provided. Exiting.");
+                statusRouter.Error("No research objective provided. Exiting.", phase: "CLI", actor: "Objective", alwaysWriteToConsole: true);
                 return 1;
             }
 
@@ -824,7 +873,7 @@ internal static class Program
             if (researchObjective.Length == 0)
             {
                 logger.LogError("Empty research objective after trimming input. Exiting.");
-                Console.Error.WriteLine("No research objective provided. Exiting.");
+                statusRouter.Error("No research objective provided. Exiting.", phase: "CLI", actor: "Objective", alwaysWriteToConsole: true);
                 return 1;
             }
 
@@ -881,7 +930,7 @@ internal static class Program
                 logger.LogInformation("Regenerating report for session {SessionId} using stored findings.", sessionId);
             }
 
-            Console.WriteLine(sessionMessage);
+            statusRouter.Info(sessionMessage, phase: "Session", actor: "Lifecycle", alwaysWriteToConsole: true);
 
             if (reportOnlyMode)
             {
@@ -905,18 +954,24 @@ internal static class Program
             await cosmosService.UpsertRecordAsync(sessionRecord, cts.Token).ConfigureAwait(false);
 
             Console.WriteLine();
-            Console.WriteLine(executionResult.Success ? "Research completed successfully." : "Research completed with errors.");
-            Console.WriteLine(executionResult.Summary);
+            string completionMessage = executionResult.Success
+                ? "Research completed successfully."
+                : "Research completed with errors.";
+            statusRouter.Info(completionMessage, phase: "Session", actor: "Completion", alwaysWriteToConsole: true);
+            if (!string.IsNullOrWhiteSpace(executionResult.Summary))
+            {
+                statusRouter.Publish(executionResult.Summary, ThoughtSeverity.Info, phase: "Session", actor: "Summary", alwaysWriteToConsole: true);
+            }
             if (executionResult.Metadata.TryGetValue("reportPath", out var finalReportPath) && !string.IsNullOrWhiteSpace(finalReportPath))
             {
-                Console.WriteLine($"Report saved to: {finalReportPath}");
+                statusRouter.Info($"Report saved to: {finalReportPath}", phase: "Session", actor: "Reports", alwaysWriteToConsole: true);
             }
 
             if (!executionResult.Success)
             {
                 foreach (var error in executionResult.Errors)
                 {
-                    Console.WriteLine($" - {error}");
+                    statusRouter.Error($" - {error}", phase: "Session", actor: "Errors", alwaysWriteToConsole: true);
                     logger.LogError("Execution error: {Error}", error);
                 }
             }
@@ -927,13 +982,13 @@ internal static class Program
         catch (OperationCanceledException)
         {
             logger.LogWarning("Execution cancelled by request.");
-            Console.Error.WriteLine("Operation cancelled.");
+            StatusRouter.Error("Operation cancelled.", phase: "Session", actor: "Lifecycle", alwaysWriteToConsole: true);
             return 1;
         }
         catch (Exception ex)
         {
             logger.LogCritical(ex, "Fatal error executing research workflow.");
-            Console.Error.WriteLine("Fatal error encountered. Check logs for details.");
+            StatusRouter.Error("Fatal error encountered. Check logs for details.", phase: "Session", actor: "Lifecycle", alwaysWriteToConsole: true);
             return 1;
         }
 
@@ -978,6 +1033,8 @@ internal static class Program
             {
                 await flowTracker.SaveAsync().ConfigureAwait(false);
             }
+
+            await thoughtPublisher.FlushAsync(CancellationToken.None).ConfigureAwait(false);
 
             Console.CancelKeyPress -= cancelHandler;
             AppDomain.CurrentDomain.UnhandledException -= unhandledExceptionHandler;
@@ -1141,7 +1198,7 @@ internal static class Program
         if (string.IsNullOrWhiteSpace(diagnosticsMode))
         {
             diagnosticsLogger.LogError("Diagnostics mode flag was empty.");
-            Console.Error.WriteLine("Diagnostics mode flag cannot be empty.");
+            StatusRouter.Error("Diagnostics mode flag cannot be empty.", phase: "Diagnostics", actor: "CLI", alwaysWriteToConsole: true);
             return 1;
         }
 
@@ -1178,7 +1235,7 @@ internal static class Program
 
             default:
                 diagnosticsLogger.LogError("Unknown diagnostics mode: {Mode}", diagnosticsMode);
-                Console.Error.WriteLine($"Unknown diagnostics mode: {diagnosticsMode}");
+                StatusRouter.Error($"Unknown diagnostics mode: {diagnosticsMode}", phase: "Diagnostics", actor: "CLI", alwaysWriteToConsole: true);
                 return 1;
         }
     }
@@ -1196,8 +1253,10 @@ internal static class Program
         return SourceCitationDeduplicator.Deduplicate(allCitations);
     }
 
-    private static void PrintUsage()
+    private static void PrintUsage(ConsoleStatusRouter statusRouter)
     {
+        statusRouter.Info("Displaying CLI usage.", phase: "CLI", actor: "Help");
+
         Console.WriteLine("Usage: dotnet run [options]");
         Console.WriteLine();
         Console.WriteLine("Options:");
@@ -1220,6 +1279,8 @@ internal static class Program
         Console.WriteLine("  --skip-planner                Skip the interactive research planner pre-check.");
         Console.WriteLine("  --list-sessions               List stored sessions and exit.");
         Console.WriteLine("  --cosmos-diagnostics          Run Cosmos DB diagnostics and exit.");
+        Console.WriteLine("  --stream-console              Force-enable console streaming for this run.");
+        Console.WriteLine("  --no-stream-console           Disable console streaming for this run.");
         Console.WriteLine("  --help, -h                    Show this message and exit.");
     }
 
@@ -1770,20 +1831,20 @@ internal static class Program
             Console.WriteLine("  3) Regenerate completed report");
             Console.WriteLine("  4) Delete sessions");
             Console.WriteLine("  5) Exit console");
-            Console.Write("Choice: ");
-
+                        Console.WriteLine();
+                        statusRouter.Info("Diagnosis complete. Detailed timeline saved under debug/computer-use.", phase: "ComputerUse", actor: "Diagnosis", alwaysWriteToConsole: true);
             string? input = (await ReadLineAsync(cancellationToken).ConfigureAwait(false))?.Trim().ToLowerInvariant();
             switch (input)
             {
                 case "1":
                 case "start":
-                case "n":
+                        statusRouter.Error($"Computer-use exploration blocked: {blocked.Message}", phase: "ComputerUse", actor: "Diagnosis", alwaysWriteToConsole: true);
                     Console.Write("Enter a research objective: ");
                     string? objective = (await ReadLineAsync(cancellationToken).ConfigureAwait(false))?.Trim();
                     if (string.IsNullOrWhiteSpace(objective))
                     {
                         Console.WriteLine("Objective cannot be empty.");
-                        continue;
+                        statusRouter.Error($"Computer-use exploration timed out: {timeout.Message}", phase: "ComputerUse", actor: "Diagnosis", alwaysWriteToConsole: true);
                     }
 
                     if (skipPlanner)
@@ -1793,7 +1854,7 @@ internal static class Program
                         return new MenuSelection(MenuAction.StartNew, null, skippedOutcome);
                     }
 
-                    PlannerOutcome? plannerOutcome = await planner.RunAsync(objective, cancellationToken).ConfigureAwait(false);
+                        statusRouter.Error($"Computer-use exploration failed: {ex.Message}", phase: "ComputerUse", actor: "Diagnosis", alwaysWriteToConsole: true);
                     if (plannerOutcome is null)
                     {
                         Console.WriteLine("Planner cancelled. Returning to menu.");
@@ -2256,7 +2317,7 @@ internal static class Program
             if (match is null)
             {
                 logger.LogError("Session {SessionId} not found for deletion.", options.DeleteSessionId);
-                Console.Error.WriteLine($"No session found with ID '{options.DeleteSessionId}'.");
+                StatusRouter.Error($"No session found with ID '{options.DeleteSessionId}'.", phase: "CLI", actor: "Sessions", alwaysWriteToConsole: true);
                 return 1;
             }
 

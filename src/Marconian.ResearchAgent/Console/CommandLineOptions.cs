@@ -38,6 +38,8 @@ internal sealed class CommandLineOptions
 
     public bool ShowHelp { get; set; }
 
+    public bool? StreamConsoleEnabled { get; set; }
+
     public bool HasDeleteRequest => DeleteAll || DeleteIncomplete || !string.IsNullOrWhiteSpace(DeleteSessionId);
 
     public bool HasInteractiveOperation =>
@@ -144,6 +146,12 @@ internal sealed class CommandLineOptions
                     break;
                 case "--list-sessions":
                     options.ListSessions = true;
+                    break;
+                case "--stream-console":
+                    options.StreamConsoleEnabled = true;
+                    break;
+                case "--no-stream-console":
+                    options.StreamConsoleEnabled = false;
                     break;
                 case "--help":
                 case "-h":
