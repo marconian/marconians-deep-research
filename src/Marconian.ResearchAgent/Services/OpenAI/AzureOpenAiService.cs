@@ -1,5 +1,6 @@
 using System.Collections;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -24,7 +25,8 @@ public sealed class AzureOpenAiService : IAzureOpenAiService
     private readonly string _chatDeploymentName;
     private readonly string _embeddingDeploymentName;
     private readonly ILogger<AzureOpenAiService> _logger;
-    private readonly ChatReasoningEffortLevel? _reasoningEffortLevel;
+    private readonly IReadOnlyDictionary<string, ChatReasoningEffortLevel?> _reasoningEffortByDeployment;
+    private readonly ChatReasoningEffortLevel? _defaultReasoningEffortLevel;
 
     public AzureOpenAiService(Settings.AppSettings settings, ILogger<AzureOpenAiService>? logger = null)
     {
@@ -38,16 +40,16 @@ public sealed class AzureOpenAiService : IAzureOpenAiService
     _chatClients.TryAdd(_chatDeploymentName, defaultChatClient);
     _embeddingsClient = _client.GetEmbeddingClient(_embeddingDeploymentName);
 
-        if (!string.IsNullOrWhiteSpace(settings.AzureOpenAiReasoningEffortLevel))
+        _reasoningEffortByDeployment = BuildReasoningEffortMap(settings);
+
+        if (_reasoningEffortByDeployment.TryGetValue(_chatDeploymentName, out var stageEffort))
         {
-            if (TryResolveReasoningEffortLevel(settings.AzureOpenAiReasoningEffortLevel, out var parsedLevel))
-            {
-                _reasoningEffortLevel = parsedLevel;
-            }
-            else
-            {
-                _logger.LogWarning("Unknown Azure OpenAI reasoning effort level '{ReasoningEffortLevel}'. Falling back to service default.", settings.AzureOpenAiReasoningEffortLevel);
-            }
+            _defaultReasoningEffortLevel = stageEffort;
+        }
+        else if (!string.IsNullOrWhiteSpace(settings.AzureOpenAiReasoningEffortLevel) &&
+                 TryResolveReasoningEffortLevel(settings.AzureOpenAiReasoningEffortLevel, out var parsedLevel))
+        {
+            _defaultReasoningEffortLevel = parsedLevel;
         }
     }
 
@@ -55,8 +57,9 @@ public sealed class AzureOpenAiService : IAzureOpenAiService
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        var (messages, options) = PrepareChatRequest(request);
-        string deployment = ResolveDeployment(request);
+    var (messages, options) = PrepareChatRequest(request);
+    string deployment = ResolveDeployment(request);
+    ConfigureReasoning(options, deployment);
         ChatClient chatClient = GetChatClient(deployment);
 
         try
@@ -80,8 +83,9 @@ public sealed class AzureOpenAiService : IAzureOpenAiService
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(onChunk);
 
-        var (messages, options) = PrepareChatRequest(request);
-        string deployment = ResolveDeployment(request);
+    var (messages, options) = PrepareChatRequest(request);
+    string deployment = ResolveDeployment(request);
+    ConfigureReasoning(options, deployment);
         ChatClient chatClient = GetChatClient(deployment);
 
         try
@@ -233,11 +237,6 @@ public sealed class AzureOpenAiService : IAzureOpenAiService
                 jsonSchemaIsStrict: request.JsonSchemaFormat.Strict);
         }
 
-        if (_reasoningEffortLevel is { } configuredEffortLevel)
-        {
-            options.ReasoningEffortLevel = configuredEffortLevel;
-        }
-
         return (messages, options);
     }
 
@@ -320,6 +319,68 @@ public sealed class AzureOpenAiService : IAzureOpenAiService
                 effortLevel = default;
                 return false;
         }
+    }
+
+    private void ConfigureReasoning(ChatCompletionOptions options, string deployment)
+    {
+        if (options is null)
+        {
+            return;
+        }
+
+        if (_reasoningEffortByDeployment.TryGetValue(deployment, out var stageEffortLevel))
+        {
+            if (stageEffortLevel.HasValue)
+            {
+                options.ReasoningEffortLevel = stageEffortLevel.Value;
+            }
+
+            return;
+        }
+
+        if (_defaultReasoningEffortLevel.HasValue &&
+            string.Equals(deployment, _chatDeploymentName, StringComparison.OrdinalIgnoreCase))
+        {
+            options.ReasoningEffortLevel = _defaultReasoningEffortLevel.Value;
+        }
+    }
+
+    private IReadOnlyDictionary<string, ChatReasoningEffortLevel?> BuildReasoningEffortMap(Settings.AppSettings settings)
+    {
+        if (settings.AzureOpenAiDeploymentReasoningLevels is null || settings.AzureOpenAiDeploymentReasoningLevels.Count == 0)
+        {
+            return new Dictionary<string, ChatReasoningEffortLevel?>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        var map = new Dictionary<string, ChatReasoningEffortLevel?>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var entry in settings.AzureOpenAiDeploymentReasoningLevels)
+        {
+            if (string.IsNullOrWhiteSpace(entry.Key))
+            {
+                continue;
+            }
+
+            if (entry.Value is null)
+            {
+                map[entry.Key] = null;
+                continue;
+            }
+
+            if (TryResolveReasoningEffortLevel(entry.Value, out var parsedLevel))
+            {
+                map[entry.Key] = parsedLevel;
+            }
+            else
+            {
+                _logger.LogWarning(
+                    "Unknown Azure OpenAI reasoning effort level '{ReasoningEffortLevel}' configured for deployment '{Deployment}'. Skipping explicit reasoning configuration.",
+                    entry.Value,
+                    entry.Key);
+            }
+        }
+
+        return map;
     }
 }
 #pragma warning restore OPENAI001

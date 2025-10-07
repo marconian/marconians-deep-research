@@ -37,6 +37,7 @@ namespace Marconian.ResearchAgent;
 internal static class Program
 {
     private const string SessionRecordType = "session_metadata";
+    private const string UxStageName = "Ux";
 
     private sealed record SessionInfo(string SessionId, string Objective, string Status, DateTimeOffset CreatedAtUtc, DateTimeOffset UpdatedAtUtc, MemoryRecord Record);
 
@@ -58,7 +59,11 @@ internal static class Program
     {
         bool cosmosDiagnostics = args.Any(argument => string.Equals(argument, "--cosmos-diagnostics", StringComparison.OrdinalIgnoreCase));
         string defaultReportDirectory;
-        string fileLoggerPath = Path.Combine(Directory.GetCurrentDirectory(), "debug", "logs", "marconian.log");
+        IConfigurationRoot configuration = Settings.BuildConfiguration();
+
+        string logsDirectory = ResolvePath(configuration["Storage:LogsDirectory"] ?? configuration["LOGS_DIRECTORY"], Path.Combine("debug", "logs"));
+        Directory.CreateDirectory(logsDirectory);
+        string fileLoggerPath = Path.Combine(logsDirectory, "marconian.log");
 
         using ILoggerFactory loggerFactory = LoggerFactory.Create(builder =>
         {
@@ -68,9 +73,9 @@ internal static class Program
             builder.AddFileLogger(fileLoggerPath, LogLevel.Debug);
         });
 
-    ILogger logger = loggerFactory.CreateLogger("Marconian");
-    ConsoleStreamHub? consoleStreamHub = null;
-    IThoughtEventPublisher thoughtPublisher = NullThoughtEventPublisher.Instance;
+        ILogger logger = loggerFactory.CreateLogger("Marconian");
+        ConsoleStreamHub? consoleStreamHub = null;
+        IThoughtEventPublisher thoughtPublisher = NullThoughtEventPublisher.Instance;
 
         UnhandledExceptionEventHandler unhandledExceptionHandler = (_, eventArgs) =>
         {
@@ -83,7 +88,7 @@ internal static class Program
 
         using var cts = new CancellationTokenSource();
         ConsoleCancelEventHandler cancelHandler = (_, eventArgs) =>
-                StatusRouter.Error($"No session found with ID '{options.DeleteSessionId}'.", phase: "CLI", actor: "Sessions", alwaysWriteToConsole: true);
+        {
             eventArgs.Cancel = true;
             if (!cts.IsCancellationRequested)
             {
@@ -103,14 +108,13 @@ internal static class Program
         ResearchFlowTracker? flowTracker = null;
         try
         {
-
-            IConfigurationRoot configuration = Settings.BuildConfiguration();
             Settings.AppSettings settings;
             try
             {
                 settings = Settings.LoadAndValidate(configuration);
                 defaultReportDirectory = settings.ReportsDirectory;
                 Directory.CreateDirectory(defaultReportDirectory);
+                Directory.CreateDirectory(settings.LogsDirectory);
                 logger.LogInformation("Configuration loaded successfully.");
             }
             catch (InvalidOperationException ex)
@@ -144,15 +148,24 @@ internal static class Program
             IConsoleStreamSummarizer summarizer = new DefaultConsoleStreamSummarizer();
             if (consoleStreamingOptions.UseSummarizer && consoleStreamingOptions.UseLlmSummarizer)
             {
-                string summarizerDeployment = string.IsNullOrWhiteSpace(consoleStreamingOptions.SummarizerModel)
-                    ? settings.AzureOpenAiChatDeployment
-                    : consoleStreamingOptions.SummarizerModel!;
+                bool summarizerModelConfigured = !string.IsNullOrWhiteSpace(consoleStreamingOptions.SummarizerModel);
+                string summarizerDeployment = summarizerModelConfigured
+                    ? consoleStreamingOptions.SummarizerModel!
+                    : settings.ResolveStageDeployment(UxStageName, settings.AzureOpenAiChatDeployment);
 
-                logger.LogInformation(
-                    string.IsNullOrWhiteSpace(consoleStreamingOptions.SummarizerModel)
-                        ? "Console streaming summarizer using default chat deployment {Deployment}."
-                        : "Console streaming summarizer using configured deployment {Deployment}.",
-                    summarizerDeployment);
+                if (!summarizerModelConfigured)
+                {
+                    consoleStreamingOptions.SummarizerModel = summarizerDeployment;
+                    logger.LogInformation(
+                        "Console streaming summarizer using UX stage deployment {Deployment}.",
+                        summarizerDeployment);
+                }
+                else
+                {
+                    logger.LogInformation(
+                        "Console streaming summarizer using configured deployment {Deployment}.",
+                        summarizerDeployment);
+                }
 
                 summarizer = new ConsoleSummarizerAgent(
                     openAiService,
@@ -1041,6 +1054,22 @@ internal static class Program
         }
     }
 
+    private static string ResolvePath(string? configuredPath, string defaultRelativePath)
+    {
+        if (string.IsNullOrWhiteSpace(configuredPath))
+        {
+            return Path.GetFullPath(Path.Combine(Directory.GetCurrentDirectory(), defaultRelativePath));
+        }
+
+        string trimmed = configuredPath.Trim();
+        if (Path.IsPathRooted(trimmed))
+        {
+            return trimmed;
+        }
+
+        return Path.GetFullPath(Path.Combine(Directory.GetCurrentDirectory(), trimmed));
+    }
+
 
     private static IReadOnlyList<string> ParseDumpTypes(string? dumpType)
     {
@@ -1831,20 +1860,17 @@ internal static class Program
             Console.WriteLine("  3) Regenerate completed report");
             Console.WriteLine("  4) Delete sessions");
             Console.WriteLine("  5) Exit console");
-                        Console.WriteLine();
-                        statusRouter.Info("Diagnosis complete. Detailed timeline saved under debug/computer-use.", phase: "ComputerUse", actor: "Diagnosis", alwaysWriteToConsole: true);
             string? input = (await ReadLineAsync(cancellationToken).ConfigureAwait(false))?.Trim().ToLowerInvariant();
             switch (input)
             {
                 case "1":
                 case "start":
-                        statusRouter.Error($"Computer-use exploration blocked: {blocked.Message}", phase: "ComputerUse", actor: "Diagnosis", alwaysWriteToConsole: true);
                     Console.Write("Enter a research objective: ");
                     string? objective = (await ReadLineAsync(cancellationToken).ConfigureAwait(false))?.Trim();
                     if (string.IsNullOrWhiteSpace(objective))
                     {
                         Console.WriteLine("Objective cannot be empty.");
-                        statusRouter.Error($"Computer-use exploration timed out: {timeout.Message}", phase: "ComputerUse", actor: "Diagnosis", alwaysWriteToConsole: true);
+                        continue;
                     }
 
                     if (skipPlanner)
@@ -1854,7 +1880,7 @@ internal static class Program
                         return new MenuSelection(MenuAction.StartNew, null, skippedOutcome);
                     }
 
-                        statusRouter.Error($"Computer-use exploration failed: {ex.Message}", phase: "ComputerUse", actor: "Diagnosis", alwaysWriteToConsole: true);
+                    PlannerOutcome? plannerOutcome = await planner.RunAsync(objective, cancellationToken).ConfigureAwait(false);
                     if (plannerOutcome is null)
                     {
                         Console.WriteLine("Planner cancelled. Returning to menu.");
